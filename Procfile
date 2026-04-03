@@ -1,0 +1,1 @@
+worker: python meaty_token_bot.py
