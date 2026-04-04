@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import sqlite3
 from dataclasses import dataclass
 from typing import Optional
@@ -12,6 +13,7 @@ from discord.ext import commands
 # =========================================================
 # Meaty Token Bot - Slash Command Casino / Token Tracker
 # + Madden standings from shared Postgres
+# + Weekly matchup channel creation from Postgres schedule
 # =========================================================
 # Setup:
 # 1) pip install -U -r requirements.txt
@@ -355,6 +357,83 @@ def fetch_standings_rows():
                 JOIN teams t ON t.team_id = s.team_id
                 ORDER BY s.wins DESC, s.win_pct DESC, s.pts_for DESC, t.team_name ASC
                 """
+            )
+            return cur.fetchall()
+
+
+def slugify_channel_name(value: str) -> str:
+    value = value.lower().strip()
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    value = re.sub(r"-+", "-", value).strip("-")
+    return value or "team"
+
+
+def normalize_team_name(value: str) -> str:
+    value = value.lower().strip()
+    value = value.replace("&", "and")
+    value = re.sub(r"[^a-z0-9]+", "", value)
+    return value
+
+
+def member_matches_team(member: discord.Member, team_name: str) -> bool:
+    team_norm = normalize_team_name(team_name)
+
+    possible_names = [
+        member.display_name or "",
+        member.name or "",
+        getattr(member, "global_name", "") or "",
+    ]
+
+    for raw_name in possible_names:
+        raw_norm = normalize_team_name(raw_name)
+        if not raw_norm:
+            continue
+        if team_norm == raw_norm:
+            return True
+        if team_norm in raw_norm:
+            return True
+
+    return False
+
+
+def find_member_for_team(guild: discord.Guild, team_name: str) -> Optional[discord.Member]:
+    matches = [member for member in guild.members if member_matches_team(member, team_name)]
+
+    if len(matches) == 1:
+        return matches[0]
+
+    exact_display_matches = [
+        member
+        for member in guild.members
+        if normalize_team_name(member.display_name or "") == normalize_team_name(team_name)
+    ]
+    if len(exact_display_matches) == 1:
+        return exact_display_matches[0]
+
+    return None
+
+
+def fetch_games_for_week(week: int):
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    g.game_id,
+                    g.week,
+                    g.stage_index,
+                    g.status,
+                    away.team_name AS away_team_name,
+                    home.team_name AS home_team_name,
+                    g.away_team_id,
+                    g.home_team_id
+                FROM games g
+                JOIN teams away ON away.team_id = g.away_team_id
+                JOIN teams home ON home.team_id = g.home_team_id
+                WHERE g.week = %s
+                ORDER BY g.game_id ASC
+                """,
+                (week,),
             )
             return cur.fetchall()
 
@@ -1118,6 +1197,109 @@ async def postoverview(interaction: discord.Interaction):
     await send_log_message(
         f"📌 ADMIN: {interaction.user.mention} posted the token overview in {interaction.channel.mention}.",
         embed=embed,
+    )
+
+
+@bot.tree.command(name="create_week_channels", description="Admin: create one matchup channel per game for a week.")
+@admin_only()
+@app_commands.describe(
+    week="Week number from the games table (preseason week 1 appears to be week 0)",
+    category_name="Optional category name to create/use",
+)
+async def create_week_channels(
+    interaction: discord.Interaction,
+    week: int,
+    category_name: Optional[str] = None,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        games = fetch_games_for_week(week)
+    except Exception as exc:
+        await interaction.followup.send(f"Failed to load games for week {week}: {exc}", ephemeral=True)
+        return
+
+    if not games:
+        await interaction.followup.send(f"No games found for week {week}.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    category_title = category_name or f"Week {week} Games"
+
+    existing_category = discord.utils.get(guild.categories, name=category_title)
+    if existing_category is None:
+        existing_category = await guild.create_category(category_title)
+
+    created_channels = []
+    skipped_channels = []
+
+    for game in games:
+        game_id = game[0]
+        game_week = game[1]
+        stage_index = game[2]
+        status = game[3]
+        away_team_name = game[4]
+        home_team_name = game[5]
+
+        channel_name = f"wk{game_week}-{slugify_channel_name(away_team_name)}-vs-{slugify_channel_name(home_team_name)}"
+        channel_name = channel_name[:100]
+
+        existing_channel = discord.utils.get(guild.text_channels, name=channel_name)
+        if existing_channel is not None:
+            skipped_channels.append(f"{channel_name} (already exists)")
+            continue
+
+        away_member = find_member_for_team(guild, away_team_name)
+        home_member = find_member_for_team(guild, home_team_name)
+
+        channel = await guild.create_text_channel(
+            name=channel_name,
+            category=existing_category,
+            topic=f"Game ID {game_id} | Week {game_week} | Stage {stage_index} | Status {status}",
+        )
+
+        mention_parts = []
+        if away_member is not None:
+            mention_parts.append(away_member.mention)
+        else:
+            mention_parts.append(f"**{away_team_name}** (no Discord match found)")
+
+        if home_member is not None:
+            mention_parts.append(home_member.mention)
+        else:
+            mention_parts.append(f"**{home_team_name}** (no Discord match found)")
+
+        message_lines = [
+            f"🏈 **Week {game_week} Matchup**",
+            f"**Away:** {away_team_name}",
+            f"**Home:** {home_team_name}",
+            "",
+            f"{mention_parts[0]} vs {mention_parts[1]}",
+            "",
+            "Use this channel to schedule your game.",
+        ]
+
+        await channel.send("\n".join(message_lines))
+        created_channels.append(channel_name)
+
+    summary_lines = [
+        f"Created **{len(created_channels)}** channel(s) for week **{week}** in **{category_title}**."
+    ]
+
+    if skipped_channels:
+        summary_lines.append("")
+        summary_lines.append("Skipped:")
+        summary_lines.extend(f"- {name}" for name in skipped_channels[:20])
+
+    await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
+
+    await send_log_message(
+        f"📅 SCHEDULE: {interaction.user.mention} created week {week} matchup channels. "
+        f"Created: {len(created_channels)} | Skipped: {len(skipped_channels)}"
     )
 
 
