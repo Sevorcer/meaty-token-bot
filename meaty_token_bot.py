@@ -7,6 +7,7 @@ from typing import Optional
 
 import discord
 import psycopg
+from psycopg.rows import dict_row
 from discord import app_commands
 from discord.ext import commands
 
@@ -15,14 +16,7 @@ from discord.ext import commands
 # + Madden standings from shared Postgres
 # + Weekly matchup channel creation from Postgres schedule
 # + Automatic top 2 Games of the Week
-# =========================================================
-# Setup:
-# 1) pip install -U -r requirements.txt
-# 2) Set DISCORD_BOT_TOKEN to your bot token
-# 3) Optional: set GUILD_IDS to comma-separated server IDs for fast testing
-# 4) Optional: set LOG_CHANNEL_ID for audit logging
-# 5) Optional: set DATABASE_URL for Madden data (Railway Postgres)
-# 6) Run: py meaty_token_bot.py
+# + Season stat leaders
 # =========================================================
 
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
@@ -30,6 +24,7 @@ GUILD_IDS_RAW = os.getenv("GUILD_IDS") or os.getenv("GUILD_ID", "")
 GUILD_IDS = [int(x.strip()) for x in GUILD_IDS_RAW.split(",") if x.strip()]
 TOKEN_DB_PATH = os.getenv("MEATY_TOKEN_DB", "meaty_tokens.db")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+LEADERS_CHANNEL_ID = int(os.getenv("LEADERS_CHANNEL_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 ADMIN_ROLE_NAMES = {"Commissioner", "Admin", "COMMISH"}
@@ -333,7 +328,7 @@ def roulette_spin() -> tuple[int, str]:
 def get_pg_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set.")
-    return psycopg.connect(DATABASE_URL)
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def fetch_standings_rows():
@@ -451,13 +446,13 @@ def fetch_games_for_week(week: int):
 
 
 def compute_matchup_score(game_row) -> float:
-    away_wins = game_row[8] or 0
-    away_win_pct = float(game_row[11] or 0)
-    away_ovr = game_row[12] or 0
+    away_wins = game_row["away_wins"] or 0
+    away_win_pct = float(game_row["away_win_pct"] or 0)
+    away_ovr = game_row["away_ovr"] or 0
 
-    home_wins = game_row[13] or 0
-    home_win_pct = float(game_row[16] or 0)
-    home_ovr = game_row[17] or 0
+    home_wins = game_row["home_wins"] or 0
+    home_win_pct = float(game_row["home_win_pct"] or 0)
+    home_ovr = game_row["home_ovr"] or 0
 
     both_good_bonus = 0
     if away_win_pct >= 0.500 and home_win_pct >= 0.500:
@@ -476,6 +471,106 @@ def compute_matchup_score(game_row) -> float:
     )
 
 
+def fetch_top_passing_leaders(limit: int = 5):
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    pps.roster_id,
+                    COALESCE(MAX(players.full_name), MAX(pps.full_name)) AS player_name,
+                    COALESCE(MAX(teams.team_name), 'Unknown Team') AS team_name,
+                    SUM(COALESCE(pps.pass_yds, 0)) AS total_pass_yds
+                FROM player_passing_stats pps
+                LEFT JOIN players ON players.roster_id = pps.roster_id
+                LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, pps.team_id)
+                GROUP BY pps.roster_id
+                ORDER BY total_pass_yds DESC, player_name ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+
+
+def fetch_top_rushing_leaders(limit: int = 5):
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    prs.roster_id,
+                    COALESCE(MAX(players.full_name), MAX(prs.full_name)) AS player_name,
+                    COALESCE(MAX(teams.team_name), 'Unknown Team') AS team_name,
+                    SUM(COALESCE(prs.rush_yds, 0)) AS total_rush_yds
+                FROM player_rushing_stats prs
+                LEFT JOIN players ON players.roster_id = prs.roster_id
+                LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, prs.team_id)
+                GROUP BY prs.roster_id
+                ORDER BY total_rush_yds DESC, player_name ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+
+
+def fetch_top_sack_leaders(limit: int = 5):
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    pds.roster_id,
+                    COALESCE(MAX(players.full_name), MAX(pds.full_name)) AS player_name,
+                    COALESCE(MAX(teams.team_name), 'Unknown Team') AS team_name,
+                    SUM(COALESCE(pds.def_sacks, 0)) AS total_sacks
+                FROM player_defense_stats pds
+                LEFT JOIN players ON players.roster_id = pds.roster_id
+                LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, pds.team_id)
+                GROUP BY pds.roster_id
+                ORDER BY total_sacks DESC, player_name ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+
+
+def fetch_top_interception_leaders(limit: int = 5):
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    pds.roster_id,
+                    COALESCE(MAX(players.full_name), MAX(pds.full_name)) AS player_name,
+                    COALESCE(MAX(teams.team_name), 'Unknown Team') AS team_name,
+                    SUM(COALESCE(pds.def_ints, 0)) AS total_ints
+                FROM player_defense_stats pds
+                LEFT JOIN players ON players.roster_id = pds.roster_id
+                LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, pds.team_id)
+                GROUP BY pds.roster_id
+                ORDER BY total_ints DESC, player_name ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+
+
+def format_leader_lines(rows, stat_key: str, stat_label: str):
+    if not rows:
+        return [f"No data found for {stat_label.lower()}."]
+    lines = []
+    for idx, row in enumerate(rows, start=1):
+        player_name = row.get("player_name", "Unknown")
+        team_name = row.get("team_name", "Unknown Team")
+        stat_value = row.get(stat_key, 0)
+        lines.append(f"{idx}. {player_name} ({team_name}) — {stat_value}")
+    return lines
+
+
 @dataclass
 class PrizeResult:
     title: str
@@ -492,6 +587,7 @@ class PrizeResult:
 async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
     print(f"LOG_CHANNEL_ID: {LOG_CHANNEL_ID}")
+    print(f"LEADERS_CHANNEL_ID: {LEADERS_CHANNEL_ID}")
     print(f"DATABASE_URL set: {'yes' if DATABASE_URL else 'no'}")
     try:
         if GUILD_IDS:
@@ -544,16 +640,16 @@ async def standings(interaction: discord.Interaction):
 
     lines = []
     for idx, row in enumerate(rows, start=1):
-        team_name = row[0]
-        wins = row[4]
-        losses = row[5]
-        ties = row[6]
-        win_pct = row[7] or 0
-        seed = row[8] or 0
-        team_ovr = row[3] or 0
-        pts_for = row[9] or 0
-        pts_against = row[10] or 0
-        turnover_diff = row[11] or 0
+        team_name = row["team_name"]
+        wins = row["wins"]
+        losses = row["losses"]
+        ties = row["ties"]
+        win_pct = row["win_pct"] or 0
+        seed = row["seed"] or 0
+        team_ovr = row["team_ovr"] or 0
+        pts_for = row["pts_for"] or 0
+        pts_against = row["pts_against"] or 0
+        turnover_diff = row["turnover_diff"] or 0
 
         lines.append(
             f"**{idx}. {team_name}** ({wins}-{losses}-{ties}) | "
@@ -1272,24 +1368,21 @@ async def create_week_channels(
     if existing_category is None:
         existing_category = await guild.create_category(category_title)
 
-    scored_games = []
-    for game in games:
-        scored_games.append((game, compute_matchup_score(game)))
-
+    scored_games = [(game, compute_matchup_score(game)) for game in games]
     scored_games.sort(key=lambda item: item[1], reverse=True)
-    gotw_game_ids = {game[0] for game, _score in scored_games[:2]}
+    gotw_game_ids = {game["game_id"] for game, _score in scored_games[:2]}
 
     created_channels = []
     skipped_channels = []
     gotw_created = []
 
     for game in games:
-        game_id = game[0]
-        game_week = game[1]
-        stage_index = game[2]
-        status = game[3]
-        away_team_name = game[4]
-        home_team_name = game[5]
+        game_id = game["game_id"]
+        game_week = game["week"]
+        stage_index = game["stage_index"]
+        status = game["status"]
+        away_team_name = game["away_team_name"]
+        home_team_name = game["home_team_name"]
 
         is_gotw = game_id in gotw_game_ids
 
@@ -1364,6 +1457,73 @@ async def create_week_channels(
     await send_log_message(
         f"📅 SCHEDULE: {interaction.user.mention} created week {week} matchup channels. "
         f"Created: {len(created_channels)} | GOTW: {len(gotw_created)} | Skipped: {len(skipped_channels)}"
+    )
+
+
+@bot.tree.command(name="post_season_leaders", description="Admin: post current season stat leaders.")
+@admin_only()
+@app_commands.describe(channel="Optional channel to post in. Defaults to LEADERS_CHANNEL_ID or current channel.")
+async def post_season_leaders(
+    interaction: discord.Interaction,
+    channel: Optional[discord.TextChannel] = None,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        passing_rows = fetch_top_passing_leaders()
+        rushing_rows = fetch_top_rushing_leaders()
+        sack_rows = fetch_top_sack_leaders()
+        interception_rows = fetch_top_interception_leaders()
+    except Exception as exc:
+        await interaction.followup.send(f"Failed to load season leaders: {exc}", ephemeral=True)
+        return
+
+    target_channel = channel
+    if target_channel is None and LEADERS_CHANNEL_ID:
+        target_channel = interaction.guild.get_channel(LEADERS_CHANNEL_ID) if interaction.guild else None
+        if target_channel is None:
+            try:
+                fetched = await bot.fetch_channel(LEADERS_CHANNEL_ID)
+                if isinstance(fetched, discord.TextChannel):
+                    target_channel = fetched
+            except Exception:
+                target_channel = None
+
+    if target_channel is None:
+        if isinstance(interaction.channel, discord.TextChannel):
+            target_channel = interaction.channel
+        else:
+            await interaction.followup.send(
+                "No target channel found. Provide a channel or set LEADERS_CHANNEL_ID.",
+                ephemeral=True,
+            )
+            return
+
+    sections = [
+        ("🏈 Passing Yards", format_leader_lines(passing_rows, "total_pass_yds", "Passing Yards")),
+        ("🏃 Rushing Yards", format_leader_lines(rushing_rows, "total_rush_yds", "Rushing Yards")),
+        ("💥 Sacks", format_leader_lines(sack_rows, "total_sacks", "Sacks")),
+        ("🖐️ Interceptions", format_leader_lines(interception_rows, "total_ints", "Interceptions")),
+    ]
+
+    embed = discord.Embed(
+        title="📊 Season Stat Leaders",
+        description="Top 5 current season leaders",
+        color=0x5865F2,
+    )
+
+    for title, lines in sections:
+        embed.add_field(name=title, value="\n".join(lines), inline=False)
+
+    await target_channel.send(embed=embed)
+
+    await interaction.followup.send(
+        f"Posted season leaders in {target_channel.mention}.",
+        ephemeral=True,
+    )
+
+    await send_log_message(
+        f"📊 LEADERS: {interaction.user.mention} posted season leaders in {target_channel.mention}."
     )
 
 
