@@ -185,6 +185,7 @@ class TokenDatabase:
             conn.commit()
 
     def update_casino_result(self, user: discord.abc.User, won: bool):
+        self.ensure_user(user)
         with self.connect() as conn:
             cur = conn.cursor()
             field = "casino_wins" if won else "casino_losses"
@@ -198,6 +199,7 @@ class TokenDatabase:
             return cur.fetchall()
 
     def recent_ledger(self, user: discord.abc.User, limit: int = 10):
+        self.ensure_user(user)
         with self.connect() as conn:
             cur = conn.cursor()
             cur.execute(
@@ -448,20 +450,22 @@ async def standings(interaction: discord.Interaction):
     for line in lines:
         line_len = len(line) + 1
         if current_len + line_len > 3800:
-            chunks.append("
-".join(current))
+            chunks.append("\n".join(current))
             current = [line]
             current_len = line_len
         else:
             current.append(line)
             current_len += line_len
     if current:
-        chunks.append("
-".join(current))
+        chunks.append("\n".join(current))
 
-    await interaction.response.send_message(embed=build_embed("🏈 League Standings", chunks[0], 0x5865F2))
+    await interaction.response.send_message(
+        embed=build_embed("🏈 League Standings", chunks[0], 0x5865F2)
+    )
     for page_num, chunk in enumerate(chunks[1:], start=2):
-        await interaction.followup.send(embed=build_embed(f"🏈 League Standings (Page {page_num})", chunk, 0x5865F2))
+        await interaction.followup.send(
+            embed=build_embed(f"🏈 League Standings (Page {page_num})", chunk, 0x5865F2)
+        )
 
 
 @bot.tree.command(name="balance", description="Check your token balance.")
@@ -472,16 +476,11 @@ async def balance(interaction: discord.Interaction, user: Optional[discord.Membe
     embed = build_embed(
         f"💰 {target.display_name}'s Token Balance",
         (
-            f"**Balance:** {fmt_tokens(row['balance'])}
-"
-            f"**Total Earned:** {fmt_tokens(row['total_earned'])}
-"
-            f"**Total Spent:** {fmt_tokens(row['total_spent'])}
-"
-            f"**Casino Wins:** {row['casino_wins']}
-"
-            f"**Casino Losses:** {row['casino_losses']}
-"
+            f"**Balance:** {fmt_tokens(row['balance'])}\n"
+            f"**Total Earned:** {fmt_tokens(row['total_earned'])}\n"
+            f"**Total Spent:** {fmt_tokens(row['total_spent'])}\n"
+            f"**Casino Wins:** {row['casino_wins']}\n"
+            f"**Casino Losses:** {row['casino_losses']}\n"
             f"**Bounties Claimed:** {row['bounty_wins']}"
         ),
         0x57F287,
@@ -509,20 +508,20 @@ async def leaderboard(interaction: discord.Interaction):
     for line in lines:
         line_len = len(line) + 1
         if current_len + line_len > 3800:
-            chunks.append("
-".join(current))
+            chunks.append("\n".join(current))
             current = [line]
             current_len = line_len
         else:
             current.append(line)
             current_len += line_len
     if current:
-        chunks.append("
-".join(current))
+        chunks.append("\n".join(current))
 
     await interaction.response.send_message(embed=build_embed("🏆 Token Leaderboard", chunks[0], 0xFEE75C))
     for page_num, chunk in enumerate(chunks[1:], start=2):
-        await interaction.followup.send(embed=build_embed(f"🏆 Token Leaderboard (Page {page_num})", chunk, 0xFEE75C))
+        await interaction.followup.send(
+            embed=build_embed(f"🏆 Token Leaderboard (Page {page_num})", chunk, 0xFEE75C)
+        )
 
 
 @bot.tree.command(name="history", description="Show your most recent token activity.")
@@ -537,10 +536,15 @@ async def history(interaction: discord.Interaction, user: Optional[discord.Membe
     lines = []
     for row in rows:
         sign = "+" if row["amount"] >= 0 else ""
-        lines.append(f"`{row['created_at']}` {sign}{fmt_tokens(row['amount'])} — {row['reason']} ({row['category']})")
+        lines.append(
+            f"`{row['created_at']}` {sign}{fmt_tokens(row['amount'])} — {row['reason']} ({row['category']})"
+        )
 
-    embed = build_embed(f"📜 {target.display_name}'s Recent Token History", "
-".join(lines), 0x5865F2)
+    embed = build_embed(
+        f"📜 {target.display_name}'s Recent Token History",
+        "\n".join(lines),
+        0x5865F2,
+    )
     await interaction.response.send_message(embed=embed, ephemeral=(target == interaction.user))
 
 
@@ -549,12 +553,9 @@ async def shop(interaction: discord.Interaction):
     embed = build_embed(
         "🛒 Token Shop",
         (
-            f"**{ATTRIBUTE_COST}** — 1 attribute point *(attribute caps still apply)*
-"
-            f"**{NAME_CHANGE_COST}** — Player name change
-"
-            f"**{ROOKIE_REVEAL_COST}** — Rookie dev reveal
-"
+            f"**{ATTRIBUTE_COST}** — 1 attribute point *(attribute caps still apply)*\n"
+            f"**{NAME_CHANGE_COST}** — Player name change\n"
+            f"**{ROOKIE_REVEAL_COST}** — Rookie dev reveal\n"
             f"**{DEV_OPPORTUNITY_COST}** — Dev opportunity"
         ),
         0xEB459E,
@@ -630,7 +631,10 @@ async def buy_devopportunity(interaction: discord.Interaction, player_name: str)
 async def wheel(interaction: discord.Interaction):
     ok = TOKEN_DB.spend_tokens(interaction.user, PRIZE_WHEEL_COST, "Prize Wheel spin", "casino")
     if not ok:
-        await interaction.response.send_message(f"You need **{PRIZE_WHEEL_COST}** tokens to spin the Prize Wheel.", ephemeral=True)
+        await interaction.response.send_message(
+            f"You need **{PRIZE_WHEEL_COST}** tokens to spin the Prize Wheel.",
+            ephemeral=True,
+        )
         return
 
     roll = random.randint(1, 100)
@@ -641,9 +645,19 @@ async def wheel(interaction: discord.Interaction):
     elif roll <= 72:
         result = PrizeResult("+2 Tokens", "Solid hit. You won back the cost of the spin.", payout=2, won=True)
     elif roll <= 84:
-        result = PrizeResult("Free Name Change", "You won a cosmetic voucher. Commissioner can honor this manually.", won=True, bonus_note="Free Name Change Voucher")
+        result = PrizeResult(
+            "Free Name Change",
+            "You won a cosmetic voucher. Commissioner can honor this manually.",
+            won=True,
+            bonus_note="Free Name Change Voucher",
+        )
     elif roll <= 93:
-        result = PrizeResult("Free Rookie Dev Reveal", "Big hit. Commissioner can honor this manually.", won=True, bonus_note="Free Rookie Dev Reveal Voucher")
+        result = PrizeResult(
+            "Free Rookie Dev Reveal",
+            "Big hit. Commissioner can honor this manually.",
+            won=True,
+            bonus_note="Free Rookie Dev Reveal Voucher",
+        )
     else:
         result = PrizeResult("Jackpot", "Huge spin. The wheel pays out +4 tokens.", payout=4, won=True)
 
@@ -651,13 +665,10 @@ async def wheel(interaction: discord.Interaction):
         TOKEN_DB.add_tokens(interaction.user, result.payout, f"Prize Wheel reward: {result.title}", "casino")
     TOKEN_DB.update_casino_result(interaction.user, result.won)
 
-    extra = f"
-
-**Manual Bonus To Honor:** {result.bonus_note}" if result.bonus_note else ""
+    extra = f"\n\n**Manual Bonus To Honor:** {result.bonus_note}" if result.bonus_note else ""
     embed = build_embed(
         f"🎡 Prize Wheel — {result.title}",
-        f"**Cost:** {PRIZE_WHEEL_COST} tokens
-{result.description}{extra}",
+        f"**Cost:** {PRIZE_WHEEL_COST} tokens\n{result.description}{extra}",
         0xFEE75C if result.won else 0xED4245,
     )
     await interaction.response.send_message(embed=embed)
@@ -672,7 +683,10 @@ async def wheel(interaction: discord.Interaction):
 async def boomorbust(interaction: discord.Interaction, player_name: str):
     ok = TOKEN_DB.spend_tokens(interaction.user, BOOM_OR_BUST_COST, f"Boom or Bust on {player_name}", "casino")
     if not ok:
-        await interaction.response.send_message(f"You need **{BOOM_OR_BUST_COST}** tokens to use Boom or Bust.", ephemeral=True)
+        await interaction.response.send_message(
+            f"You need **{BOOM_OR_BUST_COST}** tokens to use Boom or Bust.",
+            ephemeral=True,
+        )
         return
 
     hit = random.randint(1, 100) <= 45
@@ -680,9 +694,7 @@ async def boomorbust(interaction: discord.Interaction, player_name: str):
 
     if hit:
         desc = (
-            f"**BOOM.** {player_name} hit the upside roll.
-
-"
+            f"**BOOM.** {player_name} hit the upside roll.\n\n"
             "Commissioner reward suggestion: approve a modest player boost or 1-2 selected attribute points."
         )
         color = 0x57F287
@@ -692,8 +704,7 @@ async def boomorbust(interaction: discord.Interaction, player_name: str):
         color = 0xED4245
         title = "💀 Boom or Bust — BUST"
 
-    embed = build_embed(title, f"**Cost:** {BOOM_OR_BUST_COST} tokens
-{desc}", color)
+    embed = build_embed(title, f"**Cost:** {BOOM_OR_BUST_COST} tokens\n{desc}", color)
     await interaction.response.send_message(embed=embed)
     await send_log_message(
         f"💥 BOOM OR BUST: {interaction.user.mention} used Boom or Bust on **{player_name}** for **{BOOM_OR_BUST_COST}** tokens.",
@@ -705,7 +716,10 @@ async def boomorbust(interaction: discord.Interaction, player_name: str):
 async def mysterycrate(interaction: discord.Interaction):
     ok = TOKEN_DB.spend_tokens(interaction.user, MYSTERY_CRATE_COST, "Mystery Crate purchase", "casino")
     if not ok:
-        await interaction.response.send_message(f"You need **{MYSTERY_CRATE_COST}** tokens to open a Mystery Crate.", ephemeral=True)
+        await interaction.response.send_message(
+            f"You need **{MYSTERY_CRATE_COST}** tokens to open a Mystery Crate.",
+            ephemeral=True,
+        )
         return
 
     roll = random.randint(1, 100)
@@ -746,13 +760,10 @@ async def mysterycrate(interaction: discord.Interaction):
         TOKEN_DB.add_tokens(interaction.user, payout, f"Mystery Crate reward: {title}", "casino")
     TOKEN_DB.update_casino_result(interaction.user, won)
 
-    extra = f"
-
-**Manual Bonus To Honor:** {bonus_note}" if bonus_note else ""
+    extra = f"\n\n**Manual Bonus To Honor:** {bonus_note}" if bonus_note else ""
     embed = build_embed(
         f"📦 Mystery Crate — {title}",
-        f"**Cost:** {MYSTERY_CRATE_COST} tokens
-{desc}{extra}",
+        f"**Cost:** {MYSTERY_CRATE_COST} tokens\n{desc}{extra}",
         0x5865F2 if won else 0xED4245,
     )
     await interaction.response.send_message(embed=embed)
@@ -786,29 +797,47 @@ async def roulette(interaction: discord.Interaction, bet_type: app_commands.Choi
 
     normalized = value.strip().lower()
     if bet_type.value == "color" and normalized not in {"red", "black"}:
-        await interaction.response.send_message("For color bets, value must be **red** or **black**.", ephemeral=True)
+        await interaction.response.send_message(
+            "For color bets, value must be **red** or **black**.",
+            ephemeral=True,
+        )
         return
     if bet_type.value == "parity" and normalized not in {"odd", "even"}:
-        await interaction.response.send_message("For parity bets, value must be **odd** or **even**.", ephemeral=True)
+        await interaction.response.send_message(
+            "For parity bets, value must be **odd** or **even**.",
+            ephemeral=True,
+        )
         return
     if bet_type.value == "range" and normalized not in {"low", "high"}:
-        await interaction.response.send_message("For range bets, value must be **low** or **high**.", ephemeral=True)
+        await interaction.response.send_message(
+            "For range bets, value must be **low** or **high**.",
+            ephemeral=True,
+        )
         return
     if bet_type.value == "number":
         try:
             chosen_number = int(normalized)
         except ValueError:
-            await interaction.response.send_message("For number bets, value must be a whole number from **0** to **36**.", ephemeral=True)
+            await interaction.response.send_message(
+                "For number bets, value must be a whole number from **0** to **36**.",
+                ephemeral=True,
+            )
             return
         if not 0 <= chosen_number <= 36:
-            await interaction.response.send_message("For number bets, value must be between **0** and **36**.", ephemeral=True)
+            await interaction.response.send_message(
+                "For number bets, value must be between **0** and **36**.",
+                ephemeral=True,
+            )
             return
     else:
         chosen_number = None
 
     ok = TOKEN_DB.spend_tokens(interaction.user, amount, f"Roulette bet: {bet_type.value}={normalized}", "casino")
     if not ok:
-        await interaction.response.send_message("You do not have enough tokens for that roulette bet.", ephemeral=True)
+        await interaction.response.send_message(
+            "You do not have enough tokens for that roulette bet.",
+            ephemeral=True,
+        )
         return
 
     number, color = roulette_spin()
@@ -841,12 +870,9 @@ async def roulette(interaction: discord.Interaction, bet_type: app_commands.Choi
     TOKEN_DB.update_casino_result(interaction.user, won)
 
     result_text = (
-        f"**Wheel Result:** {number} ({color})
-"
-        f"**Your Bet:** {bet_type.value} = {normalized}
-"
-        f"**Bet Amount:** {fmt_tokens(amount)} tokens
-"
+        f"**Wheel Result:** {number} ({color})\n"
+        f"**Your Bet:** {bet_type.value} = {normalized}\n"
+        f"**Bet Amount:** {fmt_tokens(amount)} tokens\n"
     )
     if won:
         result_text += f"**Outcome:** WIN — paid **{fmt_tokens(payout)}** tokens"
@@ -875,16 +901,12 @@ async def bounties(interaction: discord.Interaction):
     lines = []
     for row in rows[:15]:
         lines.append(
-            f"**#{row['id']} — {row['title']}**
-"
-            f"Reward: **{fmt_tokens(row['reward'])}** tokens
-"
+            f"**#{row['id']} — {row['title']}**\n"
+            f"Reward: **{fmt_tokens(row['reward'])}** tokens\n"
             f"{row['description']}"
         )
 
-    embed = build_embed("🎯 Active Bounties", "
-
-".join(lines), 0xFEE75C)
+    embed = build_embed("🎯 Active Bounties", "\n\n".join(lines), 0xFEE75C)
     await interaction.response.send_message(embed=embed)
 
 
@@ -893,16 +915,17 @@ async def bounties(interaction: discord.Interaction):
 async def claimbounty(interaction: discord.Interaction, bounty_id: int):
     bounty = TOKEN_DB.claim_bounty(bounty_id, interaction.user)
     if bounty is None:
-        await interaction.response.send_message("That bounty does not exist or has already been claimed.", ephemeral=True)
+        await interaction.response.send_message(
+            "That bounty does not exist or has already been claimed.",
+            ephemeral=True,
+        )
         return
 
     embed = build_embed(
         f"🎯 Bounty Claimed — #{bounty['id']}",
         (
-            f"**Title:** {bounty['title']}
-"
-            f"**Reward:** {fmt_tokens(bounty['reward'])} tokens
-"
+            f"**Title:** {bounty['title']}\n"
+            f"**Reward:** {fmt_tokens(bounty['reward'])} tokens\n"
             f"**Claimed By:** {interaction.user.mention}"
         ),
         0x57F287,
@@ -926,8 +949,7 @@ async def addtokens(interaction: discord.Interaction, user: discord.Member, amou
         return
     TOKEN_DB.add_tokens(user, amount, reason, "admin")
     await interaction.response.send_message(
-        f"✅ Added **{fmt_tokens(amount)}** tokens to {user.mention}.
-**Reason:** {reason}"
+        f"✅ Added **{fmt_tokens(amount)}** tokens to {user.mention}.\n**Reason:** {reason}"
     )
     await send_log_message(
         f"💰 ADMIN: {interaction.user.mention} added **{fmt_tokens(amount)}** tokens to {user.mention}. Reason: **{reason}**"
@@ -955,8 +977,7 @@ async def removetokens(interaction: discord.Interaction, user: discord.Member, a
         await interaction.response.send_message("Failed to remove tokens.", ephemeral=True)
         return
     await interaction.response.send_message(
-        f"✅ Removed **{fmt_tokens(amount)}** tokens from {user.mention}.
-**Reason:** {reason}"
+        f"✅ Removed **{fmt_tokens(amount)}** tokens from {user.mention}.\n**Reason:** {reason}"
     )
     await send_log_message(
         f"💸 ADMIN: {interaction.user.mention} removed **{fmt_tokens(amount)}** tokens from {user.mention}. Reason: **{reason}**"
@@ -1010,9 +1031,9 @@ async def createreward(
     reason = label if not notes else f"{label} — {notes}"
     TOKEN_DB.add_tokens(user, amount, reason, "reward")
     await interaction.response.send_message(
-        f"✅ Reward logged for {user.mention}: **{fmt_tokens(amount)}** tokens
-**Type:** {label}
-**Notes:** {notes or 'None'}"
+        f"✅ Reward logged for {user.mention}: **{fmt_tokens(amount)}** tokens\n"
+        f"**Type:** {label}\n"
+        f"**Notes:** {notes or 'None'}"
     )
     await send_log_message(
         f"🏅 REWARD: {interaction.user.mention} awarded {user.mention} **{fmt_tokens(amount)}** tokens. Type: **{label}**. Notes: **{notes or 'None'}**"
@@ -1029,9 +1050,7 @@ async def createbounty(interaction: discord.Interaction, title: str, reward: flo
     bounty_id = TOKEN_DB.create_bounty(title, description, reward, interaction.user.id)
     embed = build_embed(
         f"🎯 New Bounty Created — #{bounty_id}",
-        f"**Title:** {title}
-**Reward:** {fmt_tokens(reward)} tokens
-**Objective:** {description}",
+        f"**Title:** {title}\n**Reward:** {fmt_tokens(reward)} tokens\n**Objective:** {description}",
         0xFEE75C,
     )
     await interaction.response.send_message(embed=embed)
@@ -1059,9 +1078,7 @@ async def updatebountyamount(interaction: discord.Interaction, bounty_id: int, r
     updated = TOKEN_DB.get_bounty(bounty_id)
     embed = build_embed(
         f"🎯 Bounty Updated — #{bounty_id}",
-        f"**Title:** {updated['title']}
-**Old Reward:** {fmt_tokens(old_reward)}
-**New Reward:** {fmt_tokens(reward)}",
+        f"**Title:** {updated['title']}\n**Old Reward:** {fmt_tokens(old_reward)}\n**New Reward:** {fmt_tokens(reward)}",
         0x5865F2,
     )
     await interaction.response.send_message(embed=embed)
@@ -1077,37 +1094,21 @@ async def postoverview(interaction: discord.Interaction):
     embed = build_embed(
         "🎮 Meaty Tokens Overview",
         (
-            "**How to Earn Tokens**
-"
-            "• Regular stream win = 1
-"
-            "• Regular stream loss = 0.5
-"
-            "• GOTW win/loss = 2 / 1
-"
-            "• Rival win/loss = 3 / 1.5
-"
-            "• Playoff win/loss = 3 / 1.5
-"
-            "• Super Bowl win/loss = 4 / 2
-"
-            "• Division winner = 2
-"
-            "• Award = 1.5 (max 3)
-"
-            "• Highlight of the week = 0.5
-"
-            "• Recruit bonus = 2
-
-"
-            "**Core Rules**
-"
-            "• Rewards do not stack
-"
-            "• Highest eligible payout only
-"
-            "• Fake streams / farming / collusion = commissioner action
-"
+            "**How to Earn Tokens**\n"
+            "• Regular stream win = 1\n"
+            "• Regular stream loss = 0.5\n"
+            "• GOTW win/loss = 2 / 1\n"
+            "• Rival win/loss = 3 / 1.5\n"
+            "• Playoff win/loss = 3 / 1.5\n"
+            "• Super Bowl win/loss = 4 / 2\n"
+            "• Division winner = 2\n"
+            "• Award = 1.5 (max 3)\n"
+            "• Highlight of the week = 0.5\n"
+            "• Recruit bonus = 2\n\n"
+            "**Core Rules**\n"
+            "• Rewards do not stack\n"
+            "• Highest eligible payout only\n"
+            "• Fake streams / farming / collusion = commissioner action\n"
             "• Minimum 2 tokens earned to stay in league"
         ),
         0x5865F2,
