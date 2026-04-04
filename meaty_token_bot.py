@@ -3,7 +3,6 @@ import random
 import re
 import sqlite3
 from dataclasses import dataclass
-from math import ceil
 from typing import Optional
 
 import discord
@@ -392,7 +391,7 @@ def fetch_team_players(team_name: str):
                     p.full_name,
                     p.position,
                     p.age,
-                    p.overall_rating,
+                    COALESCE(p.overall_rating, p.player_best_ovr, 0) AS overall_rating,
                     p.jersey_num,
                     p.years_pro
                 FROM players p
@@ -420,7 +419,7 @@ def fetch_team_players(team_name: str):
                         WHEN p.position = 'P' THEN 18
                         ELSE 99
                     END,
-                    p.overall_rating DESC,
+                    COALESCE(p.overall_rating, p.player_best_ovr, 0) DESC,
                     p.full_name ASC
                 """,
                 (team_name,),
@@ -437,14 +436,14 @@ def fetch_player_search(search_text: str):
                     p.full_name,
                     p.position,
                     p.age,
-                    p.overall_rating,
+                    COALESCE(p.overall_rating, p.player_best_ovr, 0) AS overall_rating,
                     p.jersey_num,
                     p.years_pro,
                     COALESCE(t.team_name, 'Unknown Team') AS team_name
                 FROM players p
                 LEFT JOIN teams t ON t.team_id = p.team_id
                 WHERE LOWER(p.full_name) LIKE LOWER(%s)
-                ORDER BY p.overall_rating DESC, p.full_name ASC
+                ORDER BY COALESCE(p.overall_rating, p.player_best_ovr, 0) DESC, p.full_name ASC
                 LIMIT 60
                 """,
                 (f"%{search_text}%",),
@@ -711,12 +710,14 @@ def build_team_roster_pages(team_name: str, players: list[dict]) -> list[discord
             full_name = p.get("full_name") or "Unknown"
             position = p.get("position") or "?"
             age = p.get("age") or 0
-            ovr = p.get("overall_rating") or 0
+            ovr = p.get("overall_rating")
+            ovr_text = str(ovr) if ovr is not None else "N/A"
             jersey = p.get("jersey_num")
             years_pro = p.get("years_pro") or 0
             jersey_text = f"#{jersey}" if jersey is not None else "#?"
             lines.append(
-                f"**{idx}. {full_name}** — {position} | OVR {ovr} | Age {age} | {jersey_text} | Yrs Pro {years_pro}"
+                f"**{idx}. {full_name}**\n"
+                f"— {position} | OVR {ovr_text} | Age {age} | {jersey_text} | Yrs Pro {years_pro}"
             )
 
         if not lines:
@@ -744,13 +745,15 @@ def build_player_search_pages(search_text: str, players: list[dict]) -> list[dis
             full_name = p.get("full_name") or "Unknown"
             position = p.get("position") or "?"
             age = p.get("age") or 0
-            ovr = p.get("overall_rating") or 0
+            ovr = p.get("overall_rating")
+            ovr_text = str(ovr) if ovr is not None else "N/A"
             jersey = p.get("jersey_num")
             years_pro = p.get("years_pro") or 0
             team_name = p.get("team_name") or "Unknown Team"
             jersey_text = f"#{jersey}" if jersey is not None else "#?"
             lines.append(
-                f"**{idx}. {full_name}** — {team_name} | {position} | OVR {ovr} | Age {age} | {jersey_text} | Yrs Pro {years_pro}"
+                f"**{idx}. {full_name}**\n"
+                f"— {team_name} | {position} | OVR {ovr_text} | Age {age} | {jersey_text} | Yrs Pro {years_pro}"
             )
 
         if not lines:
@@ -882,8 +885,11 @@ async def team(interaction: discord.Interaction, team_name: str):
         return
 
     pages = build_team_roster_pages(team_name, players)
-    view = PaginatedRosterView(pages, interaction.user.id) if len(pages) > 1 else None
-    await interaction.response.send_message(embed=pages[0], view=view)
+    if len(pages) > 1:
+        view = PaginatedRosterView(pages, interaction.user.id)
+        await interaction.response.send_message(embed=pages[0], view=view)
+    else:
+        await interaction.response.send_message(embed=pages[0])
 
 
 @bot.tree.command(name="player", description="Search for a player by name.")
@@ -900,8 +906,11 @@ async def player(interaction: discord.Interaction, name: str):
         return
 
     pages = build_player_search_pages(name, players)
-    view = PaginatedRosterView(pages, interaction.user.id) if len(pages) > 1 else None
-    await interaction.response.send_message(embed=pages[0], view=view)
+    if len(pages) > 1:
+        view = PaginatedRosterView(pages, interaction.user.id)
+        await interaction.response.send_message(embed=pages[0], view=view)
+    else:
+        await interaction.response.send_message(embed=pages[0])
 
 
 @bot.tree.command(name="balance", description="Check your token balance.")
