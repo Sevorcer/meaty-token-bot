@@ -3,6 +3,7 @@ import random
 import re
 import sqlite3
 from dataclasses import dataclass
+from math import ceil
 from typing import Optional
 
 import discord
@@ -12,11 +13,14 @@ from discord import app_commands
 from discord.ext import commands
 
 # =========================================================
-# Meaty Token Bot - Slash Command Casino / Token Tracker
-# + Madden standings from shared Postgres
-# + Weekly matchup channel creation from Postgres schedule
-# + Automatic top 2 Games of the Week
-# + Season stat leaders
+# Meaty Token Bot
+# - Tokens / casino / shop / bounties
+# - Madden standings from Postgres
+# - Week matchup channel creation
+# - Automatic top 2 GOTW
+# - Season stat leaders
+# - /team roster pages
+# - /player player search pages
 # =========================================================
 
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
@@ -39,6 +43,9 @@ DEV_OPPORTUNITY_COST = 53
 ROULETTE_MIN_BET = 1
 ROULETTE_MAX_BET = 10
 
+PAGE_SIZE = 12
+MAX_PAGES = 5
+
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
@@ -47,7 +54,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 # -----------------------------
-# Token database helpers (SQLite)
+# SQLite token database
 # -----------------------------
 class TokenDatabase:
     def __init__(self, path: str):
@@ -265,7 +272,7 @@ TOKEN_DB = TokenDatabase(TOKEN_DB_PATH)
 
 
 # -----------------------------
-# Utility helpers
+# Helpers
 # -----------------------------
 def is_admin_member(member: discord.Member) -> bool:
     return any(role.name in ADMIN_ROLE_NAMES for role in member.roles)
@@ -278,7 +285,6 @@ def admin_only():
         if is_admin_member(interaction.user):
             return True
         raise app_commands.CheckFailure("You need the Commissioner or Admin role to use this command.")
-
     return app_commands.check(predicate)
 
 
@@ -331,6 +337,13 @@ def get_pg_conn():
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
+def chunk_list(items, size):
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+# -----------------------------
+# Postgres data helpers
+# -----------------------------
 def fetch_standings_rows():
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
@@ -353,6 +366,88 @@ def fetch_standings_rows():
                 JOIN teams t ON t.team_id = s.team_id
                 ORDER BY s.wins DESC, s.win_pct DESC, s.pts_for DESC, t.team_name ASC
                 """
+            )
+            return cur.fetchall()
+
+
+def fetch_team_list():
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT team_id, team_name
+                FROM teams
+                ORDER BY team_name ASC
+                """
+            )
+            return cur.fetchall()
+
+
+def fetch_team_players(team_name: str):
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    p.full_name,
+                    p.position,
+                    p.age,
+                    p.overall_rating,
+                    p.jersey_num,
+                    p.years_pro
+                FROM players p
+                JOIN teams t ON t.team_id = p.team_id
+                WHERE LOWER(t.team_name) = LOWER(%s)
+                ORDER BY
+                    CASE
+                        WHEN p.position = 'QB' THEN 1
+                        WHEN p.position = 'HB' THEN 2
+                        WHEN p.position = 'FB' THEN 3
+                        WHEN p.position = 'WR' THEN 4
+                        WHEN p.position = 'TE' THEN 5
+                        WHEN p.position = 'LT' THEN 6
+                        WHEN p.position = 'LG' THEN 7
+                        WHEN p.position = 'C' THEN 8
+                        WHEN p.position = 'RG' THEN 9
+                        WHEN p.position = 'RT' THEN 10
+                        WHEN p.position IN ('LE', 'RE', 'REDGE', 'LEDGE') THEN 11
+                        WHEN p.position = 'DT' THEN 12
+                        WHEN p.position IN ('LOLB', 'ROLB', 'MLB', 'MIKE') THEN 13
+                        WHEN p.position = 'CB' THEN 14
+                        WHEN p.position = 'FS' THEN 15
+                        WHEN p.position = 'SS' THEN 16
+                        WHEN p.position = 'K' THEN 17
+                        WHEN p.position = 'P' THEN 18
+                        ELSE 99
+                    END,
+                    p.overall_rating DESC,
+                    p.full_name ASC
+                """,
+                (team_name,),
+            )
+            return cur.fetchall()
+
+
+def fetch_player_search(search_text: str):
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    p.full_name,
+                    p.position,
+                    p.age,
+                    p.overall_rating,
+                    p.jersey_num,
+                    p.years_pro,
+                    COALESCE(t.team_name, 'Unknown Team') AS team_name
+                FROM players p
+                LEFT JOIN teams t ON t.team_id = p.team_id
+                WHERE LOWER(p.full_name) LIKE LOWER(%s)
+                ORDER BY p.overall_rating DESC, p.full_name ASC
+                LIMIT 60
+                """,
+                (f"%{search_text}%",),
             )
             return cur.fetchall()
 
@@ -383,17 +478,13 @@ def member_matches_team(member: discord.Member, team_name: str) -> bool:
         raw_norm = normalize_team_name(raw_name)
         if not raw_norm:
             continue
-        if team_norm == raw_norm:
+        if team_norm == raw_norm or team_norm in raw_norm:
             return True
-        if team_norm in raw_norm:
-            return True
-
     return False
 
 
 def find_member_for_team(guild: discord.Guild, team_name: str) -> Optional[discord.Member]:
     matches = [member for member in guild.members if member_matches_team(member, team_name)]
-
     if len(matches) == 1:
         return matches[0]
 
@@ -404,7 +495,6 @@ def find_member_for_team(guild: discord.Guild, team_name: str) -> Optional[disco
     ]
     if len(exact_display_matches) == 1:
         return exact_display_matches[0]
-
     return None
 
 
@@ -485,6 +575,7 @@ def fetch_top_passing_leaders(limit: int = 5):
                 LEFT JOIN players ON players.roster_id = pps.roster_id
                 LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, pps.team_id)
                 GROUP BY pps.roster_id
+                HAVING SUM(COALESCE(pps.pass_yds, 0)) > 0
                 ORDER BY total_pass_yds DESC, player_name ASC
                 LIMIT %s
                 """,
@@ -507,6 +598,7 @@ def fetch_top_rushing_leaders(limit: int = 5):
                 LEFT JOIN players ON players.roster_id = prs.roster_id
                 LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, prs.team_id)
                 GROUP BY prs.roster_id
+                HAVING SUM(COALESCE(prs.rush_yds, 0)) > 0
                 ORDER BY total_rush_yds DESC, player_name ASC
                 LIMIT %s
                 """,
@@ -529,6 +621,7 @@ def fetch_top_sack_leaders(limit: int = 5):
                 LEFT JOIN players ON players.roster_id = pds.roster_id
                 LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, pds.team_id)
                 GROUP BY pds.roster_id
+                HAVING SUM(COALESCE(pds.def_sacks, 0)) > 0
                 ORDER BY total_sacks DESC, player_name ASC
                 LIMIT %s
                 """,
@@ -551,6 +644,7 @@ def fetch_top_interception_leaders(limit: int = 5):
                 LEFT JOIN players ON players.roster_id = pds.roster_id
                 LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, pds.team_id)
                 GROUP BY pds.roster_id
+                HAVING SUM(COALESCE(pds.def_ints, 0)) > 0
                 ORDER BY total_ints DESC, player_name ASC
                 LIMIT %s
                 """,
@@ -564,11 +658,113 @@ def format_leader_lines(rows, stat_key: str, stat_label: str):
         return [f"No data found for {stat_label.lower()}."]
     lines = []
     for idx, row in enumerate(rows, start=1):
-        player_name = row.get("player_name", "Unknown")
-        team_name = row.get("team_name", "Unknown Team")
-        stat_value = row.get(stat_key, 0)
-        lines.append(f"{idx}. {player_name} ({team_name}) — {stat_value}")
+        lines.append(f"{idx}. {row.get('player_name', 'Unknown')} ({row.get('team_name', 'Unknown Team')}) — {row.get(stat_key, 0)}")
     return lines
+
+
+# -----------------------------
+# Pagination views
+# -----------------------------
+class PaginatedRosterView(discord.ui.View):
+    def __init__(self, pages: list[discord.Embed], requester_id: int):
+        super().__init__(timeout=180)
+        self.pages = pages
+        self.page_index = 0
+        self.requester_id = requester_id
+        self._refresh_buttons()
+
+    def _refresh_buttons(self):
+        self.prev_button.disabled = self.page_index <= 0
+        self.next_button.disabled = self.page_index >= len(self.pages) - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("These buttons belong to the person who ran the command.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page_index -= 1
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.page_index], view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page_index += 1
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.page_index], view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+
+def build_team_roster_pages(team_name: str, players: list[dict]) -> list[discord.Embed]:
+    player_pages = chunk_list(players[: PAGE_SIZE * MAX_PAGES], PAGE_SIZE)
+    total_pages = max(1, len(player_pages))
+    pages = []
+
+    for page_num, page_players in enumerate(player_pages or [[]], start=1):
+        lines = []
+        for idx, p in enumerate(page_players, start=(page_num - 1) * PAGE_SIZE + 1):
+            full_name = p.get("full_name") or "Unknown"
+            position = p.get("position") or "?"
+            age = p.get("age") or 0
+            ovr = p.get("overall_rating") or 0
+            jersey = p.get("jersey_num")
+            years_pro = p.get("years_pro") or 0
+            jersey_text = f"#{jersey}" if jersey is not None else "#?"
+            lines.append(
+                f"**{idx}. {full_name}** — {position} | OVR {ovr} | Age {age} | {jersey_text} | Yrs Pro {years_pro}"
+            )
+
+        if not lines:
+            lines = ["No players found for this team."]
+
+        embed = discord.Embed(
+            title=f"🏈 {team_name} Roster",
+            description="\n".join(lines),
+            color=0x5865F2,
+        )
+        embed.set_footer(text=f"Page {page_num}/{total_pages} • 12 players per page")
+        pages.append(embed)
+
+    return pages
+
+
+def build_player_search_pages(search_text: str, players: list[dict]) -> list[discord.Embed]:
+    player_pages = chunk_list(players[: PAGE_SIZE * MAX_PAGES], PAGE_SIZE)
+    total_pages = max(1, len(player_pages))
+    pages = []
+
+    for page_num, page_players in enumerate(player_pages or [[]], start=1):
+        lines = []
+        for idx, p in enumerate(page_players, start=(page_num - 1) * PAGE_SIZE + 1):
+            full_name = p.get("full_name") or "Unknown"
+            position = p.get("position") or "?"
+            age = p.get("age") or 0
+            ovr = p.get("overall_rating") or 0
+            jersey = p.get("jersey_num")
+            years_pro = p.get("years_pro") or 0
+            team_name = p.get("team_name") or "Unknown Team"
+            jersey_text = f"#{jersey}" if jersey is not None else "#?"
+            lines.append(
+                f"**{idx}. {full_name}** — {team_name} | {position} | OVR {ovr} | Age {age} | {jersey_text} | Yrs Pro {years_pro}"
+            )
+
+        if not lines:
+            lines = ["No matching players found."]
+
+        embed = discord.Embed(
+            title=f"🔎 Player Search: {search_text}",
+            description="\n".join(lines),
+            color=0x57F287,
+        )
+        embed.set_footer(text=f"Page {page_num}/{total_pages} • 12 players per page")
+        pages.append(embed)
+
+    return pages
 
 
 @dataclass
@@ -581,7 +777,7 @@ class PrizeResult:
 
 
 # -----------------------------
-# Bot events
+# Events
 # -----------------------------
 @bot.event
 async def on_ready():
@@ -640,21 +836,11 @@ async def standings(interaction: discord.Interaction):
 
     lines = []
     for idx, row in enumerate(rows, start=1):
-        team_name = row["team_name"]
-        wins = row["wins"]
-        losses = row["losses"]
-        ties = row["ties"]
-        win_pct = row["win_pct"] or 0
-        seed = row["seed"] or 0
-        team_ovr = row["team_ovr"] or 0
-        pts_for = row["pts_for"] or 0
-        pts_against = row["pts_against"] or 0
-        turnover_diff = row["turnover_diff"] or 0
-
         lines.append(
-            f"**{idx}. {team_name}** ({wins}-{losses}-{ties}) | "
-            f"Win%: {win_pct:.3f} | Seed: {seed} | Ovr: {team_ovr} | "
-            f"PF: {pts_for} | PA: {pts_against} | TO: {turnover_diff}"
+            f"**{idx}. {row['team_name']}** ({row['wins']}-{row['losses']}-{row['ties']}) | "
+            f"Win%: {(row['win_pct'] or 0):.3f} | Seed: {row['seed'] or 0} | "
+            f"Ovr: {row['team_ovr'] or 0} | PF: {row['pts_for'] or 0} | "
+            f"PA: {row['pts_against'] or 0} | TO: {row['turnover_diff'] or 0}"
         )
 
     chunks = []
@@ -672,13 +858,50 @@ async def standings(interaction: discord.Interaction):
     if current:
         chunks.append("\n".join(current))
 
-    await interaction.response.send_message(
-        embed=build_embed("🏈 League Standings", chunks[0], 0x5865F2)
-    )
+    await interaction.response.send_message(embed=build_embed("🏈 League Standings", chunks[0], 0x5865F2))
     for page_num, chunk in enumerate(chunks[1:], start=2):
-        await interaction.followup.send(
-            embed=build_embed(f"🏈 League Standings (Page {page_num})", chunk, 0x5865F2)
+        await interaction.followup.send(embed=build_embed(f"🏈 League Standings (Page {page_num})", chunk, 0x5865F2))
+
+
+@bot.tree.command(name="team", description="Show a team's roster.")
+@app_commands.describe(team_name="Exact team name from the database")
+async def team(interaction: discord.Interaction, team_name: str):
+    try:
+        players = fetch_team_players(team_name)
+    except Exception as exc:
+        await interaction.response.send_message(f"Failed to load team roster: {exc}", ephemeral=True)
+        return
+
+    if not players:
+        teams = fetch_team_list()
+        team_names = ", ".join(t["team_name"] for t in teams[:20])
+        await interaction.response.send_message(
+            f"No players found for **{team_name}**.\nTry the exact team name. Example teams: {team_names}",
+            ephemeral=True,
         )
+        return
+
+    pages = build_team_roster_pages(team_name, players)
+    view = PaginatedRosterView(pages, interaction.user.id) if len(pages) > 1 else None
+    await interaction.response.send_message(embed=pages[0], view=view)
+
+
+@bot.tree.command(name="player", description="Search for a player by name.")
+@app_commands.describe(name="Full or partial player name")
+async def player(interaction: discord.Interaction, name: str):
+    try:
+        players = fetch_player_search(name)
+    except Exception as exc:
+        await interaction.response.send_message(f"Failed to search players: {exc}", ephemeral=True)
+        return
+
+    if not players:
+        await interaction.response.send_message(f"No players found matching **{name}**.", ephemeral=True)
+        return
+
+    pages = build_player_search_pages(name, players)
+    view = PaginatedRosterView(pages, interaction.user.id) if len(pages) > 1 else None
+    await interaction.response.send_message(embed=pages[0], view=view)
 
 
 @bot.tree.command(name="balance", description="Check your token balance.")
@@ -732,9 +955,7 @@ async def leaderboard(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=build_embed("🏆 Token Leaderboard", chunks[0], 0xFEE75C))
     for page_num, chunk in enumerate(chunks[1:], start=2):
-        await interaction.followup.send(
-            embed=build_embed(f"🏆 Token Leaderboard (Page {page_num})", chunk, 0xFEE75C)
-        )
+        await interaction.followup.send(embed=build_embed(f"🏆 Token Leaderboard (Page {page_num})", chunk, 0xFEE75C))
 
 
 @bot.tree.command(name="history", description="Show your most recent token activity.")
@@ -749,15 +970,9 @@ async def history(interaction: discord.Interaction, user: Optional[discord.Membe
     lines = []
     for row in rows:
         sign = "+" if row["amount"] >= 0 else ""
-        lines.append(
-            f"`{row['created_at']}` {sign}{fmt_tokens(row['amount'])} — {row['reason']} ({row['category']})"
-        )
+        lines.append(f"`{row['created_at']}` {sign}{fmt_tokens(row['amount'])} — {row['reason']} ({row['category']})")
 
-    embed = build_embed(
-        f"📜 {target.display_name}'s Recent Token History",
-        "\n".join(lines),
-        0x5865F2,
-    )
+    embed = build_embed(f"📜 {target.display_name}'s Recent Token History", "\n".join(lines), 0x5865F2)
     await interaction.response.send_message(embed=embed, ephemeral=(target == interaction.user))
 
 
@@ -784,12 +999,8 @@ async def buy_attribute(interaction: discord.Interaction, player_name: str):
         await interaction.response.send_message("You do not have enough tokens for that purchase.", ephemeral=True)
         return
     TOKEN_DB.record_shop_purchase(interaction.user, "Attribute Point", ATTRIBUTE_COST, player_name)
-    await interaction.response.send_message(
-        f"✅ Purchase logged: **1 attribute point** for **{player_name}** for **{ATTRIBUTE_COST}** tokens."
-    )
-    await send_log_message(
-        f"🛒 SHOP: {interaction.user.mention} bought **1 attribute point** for **{player_name}** for **{ATTRIBUTE_COST}** tokens."
-    )
+    await interaction.response.send_message(f"✅ Purchase logged: **1 attribute point** for **{player_name}** for **{ATTRIBUTE_COST}** tokens.")
+    await send_log_message(f"🛒 SHOP: {interaction.user.mention} bought **1 attribute point** for **{player_name}** for **{ATTRIBUTE_COST}** tokens.")
 
 
 @bot.tree.command(name="buy_namechange", description="Buy a player name change from the token shop.")
@@ -800,12 +1011,8 @@ async def buy_namechange(interaction: discord.Interaction, old_name: str, new_na
         await interaction.response.send_message("You do not have enough tokens for that purchase.", ephemeral=True)
         return
     TOKEN_DB.record_shop_purchase(interaction.user, "Player Name Change", NAME_CHANGE_COST, f"{old_name} -> {new_name}")
-    await interaction.response.send_message(
-        f"✅ Purchase logged: **{old_name}** will be changed to **{new_name}** for **{NAME_CHANGE_COST}** tokens."
-    )
-    await send_log_message(
-        f"🛒 SHOP: {interaction.user.mention} bought a **name change** from **{old_name}** to **{new_name}** for **{NAME_CHANGE_COST}** tokens."
-    )
+    await interaction.response.send_message(f"✅ Purchase logged: **{old_name}** will be changed to **{new_name}** for **{NAME_CHANGE_COST}** tokens.")
+    await send_log_message(f"🛒 SHOP: {interaction.user.mention} bought a **name change** from **{old_name}** to **{new_name}** for **{NAME_CHANGE_COST}** tokens.")
 
 
 @bot.tree.command(name="buy_rookiereveal", description="Buy a rookie dev reveal from the token shop.")
@@ -816,12 +1023,8 @@ async def buy_rookiereveal(interaction: discord.Interaction, player_name: str):
         await interaction.response.send_message("You do not have enough tokens for that purchase.", ephemeral=True)
         return
     TOKEN_DB.record_shop_purchase(interaction.user, "Rookie Dev Reveal", ROOKIE_REVEAL_COST, player_name)
-    await interaction.response.send_message(
-        f"✅ Purchase logged: **Rookie dev reveal** for **{player_name}** for **{ROOKIE_REVEAL_COST}** tokens."
-    )
-    await send_log_message(
-        f"🛒 SHOP: {interaction.user.mention} bought a **rookie dev reveal** for **{player_name}** for **{ROOKIE_REVEAL_COST}** tokens."
-    )
+    await interaction.response.send_message(f"✅ Purchase logged: **Rookie dev reveal** for **{player_name}** for **{ROOKIE_REVEAL_COST}** tokens.")
+    await send_log_message(f"🛒 SHOP: {interaction.user.mention} bought a **rookie dev reveal** for **{player_name}** for **{ROOKIE_REVEAL_COST}** tokens.")
 
 
 @bot.tree.command(name="buy_devopportunity", description="Buy a dev opportunity from the token shop.")
@@ -832,22 +1035,15 @@ async def buy_devopportunity(interaction: discord.Interaction, player_name: str)
         await interaction.response.send_message("You do not have enough tokens for that purchase.", ephemeral=True)
         return
     TOKEN_DB.record_shop_purchase(interaction.user, "Dev Opportunity", DEV_OPPORTUNITY_COST, player_name)
-    await interaction.response.send_message(
-        f"✅ Purchase logged: **Dev opportunity** for **{player_name}** for **{DEV_OPPORTUNITY_COST}** tokens."
-    )
-    await send_log_message(
-        f"🛒 SHOP: {interaction.user.mention} bought a **dev opportunity** for **{player_name}** for **{DEV_OPPORTUNITY_COST}** tokens."
-    )
+    await interaction.response.send_message(f"✅ Purchase logged: **Dev opportunity** for **{player_name}** for **{DEV_OPPORTUNITY_COST}** tokens.")
+    await send_log_message(f"🛒 SHOP: {interaction.user.mention} bought a **dev opportunity** for **{player_name}** for **{DEV_OPPORTUNITY_COST}** tokens.")
 
 
 @bot.tree.command(name="wheel", description="Spin the Prize Wheel.")
 async def wheel(interaction: discord.Interaction):
     ok = TOKEN_DB.spend_tokens(interaction.user, PRIZE_WHEEL_COST, "Prize Wheel spin", "casino")
     if not ok:
-        await interaction.response.send_message(
-            f"You need **{PRIZE_WHEEL_COST}** tokens to spin the Prize Wheel.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"You need **{PRIZE_WHEEL_COST}** tokens to spin the Prize Wheel.", ephemeral=True)
         return
 
     roll = random.randint(1, 100)
@@ -858,19 +1054,9 @@ async def wheel(interaction: discord.Interaction):
     elif roll <= 72:
         result = PrizeResult("+2 Tokens", "Solid hit. You won back the cost of the spin.", payout=2, won=True)
     elif roll <= 84:
-        result = PrizeResult(
-            "Free Name Change",
-            "You won a cosmetic voucher. Commissioner can honor this manually.",
-            won=True,
-            bonus_note="Free Name Change Voucher",
-        )
+        result = PrizeResult("Free Name Change", "You won a cosmetic voucher. Commissioner can honor this manually.", won=True, bonus_note="Free Name Change Voucher")
     elif roll <= 93:
-        result = PrizeResult(
-            "Free Rookie Dev Reveal",
-            "Big hit. Commissioner can honor this manually.",
-            won=True,
-            bonus_note="Free Rookie Dev Reveal Voucher",
-        )
+        result = PrizeResult("Free Rookie Dev Reveal", "Big hit. Commissioner can honor this manually.", won=True, bonus_note="Free Rookie Dev Reveal Voucher")
     else:
         result = PrizeResult("Jackpot", "Huge spin. The wheel pays out +4 tokens.", payout=4, won=True)
 
@@ -879,16 +1065,9 @@ async def wheel(interaction: discord.Interaction):
     TOKEN_DB.update_casino_result(interaction.user, result.won)
 
     extra = f"\n\n**Manual Bonus To Honor:** {result.bonus_note}" if result.bonus_note else ""
-    embed = build_embed(
-        f"🎡 Prize Wheel — {result.title}",
-        f"**Cost:** {PRIZE_WHEEL_COST} tokens\n{result.description}{extra}",
-        0xFEE75C if result.won else 0xED4245,
-    )
+    embed = build_embed(f"🎡 Prize Wheel — {result.title}", f"**Cost:** {PRIZE_WHEEL_COST} tokens\n{result.description}{extra}", 0xFEE75C if result.won else 0xED4245)
     await interaction.response.send_message(embed=embed)
-    await send_log_message(
-        f"🎡 WHEEL: {interaction.user.mention} spun the Prize Wheel for **{PRIZE_WHEEL_COST}** tokens and got **{result.title}**.",
-        embed=embed,
-    )
+    await send_log_message(f"🎡 WHEEL: {interaction.user.mention} spun the Prize Wheel for **{PRIZE_WHEEL_COST}** tokens and got **{result.title}**.", embed=embed)
 
 
 @bot.tree.command(name="boomorbust", description="Risk tokens on a Boom or Bust roll.")
@@ -896,20 +1075,14 @@ async def wheel(interaction: discord.Interaction):
 async def boomorbust(interaction: discord.Interaction, player_name: str):
     ok = TOKEN_DB.spend_tokens(interaction.user, BOOM_OR_BUST_COST, f"Boom or Bust on {player_name}", "casino")
     if not ok:
-        await interaction.response.send_message(
-            f"You need **{BOOM_OR_BUST_COST}** tokens to use Boom or Bust.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"You need **{BOOM_OR_BUST_COST}** tokens to use Boom or Bust.", ephemeral=True)
         return
 
     hit = random.randint(1, 100) <= 45
     TOKEN_DB.update_casino_result(interaction.user, hit)
 
     if hit:
-        desc = (
-            f"**BOOM.** {player_name} hit the upside roll.\n\n"
-            "Commissioner reward suggestion: approve a modest player boost or 1-2 selected attribute points."
-        )
+        desc = f"**BOOM.** {player_name} hit the upside roll.\n\nCommissioner reward suggestion: approve a modest player boost or 1-2 selected attribute points."
         color = 0x57F287
         title = "💥 Boom or Bust — BOOM"
     else:
@@ -919,20 +1092,14 @@ async def boomorbust(interaction: discord.Interaction, player_name: str):
 
     embed = build_embed(title, f"**Cost:** {BOOM_OR_BUST_COST} tokens\n{desc}", color)
     await interaction.response.send_message(embed=embed)
-    await send_log_message(
-        f"💥 BOOM OR BUST: {interaction.user.mention} used Boom or Bust on **{player_name}** for **{BOOM_OR_BUST_COST}** tokens.",
-        embed=embed,
-    )
+    await send_log_message(f"💥 BOOM OR BUST: {interaction.user.mention} used Boom or Bust on **{player_name}** for **{BOOM_OR_BUST_COST}** tokens.", embed=embed)
 
 
 @bot.tree.command(name="mysterycrate", description="Open a Mystery Crate.")
 async def mysterycrate(interaction: discord.Interaction):
     ok = TOKEN_DB.spend_tokens(interaction.user, MYSTERY_CRATE_COST, "Mystery Crate purchase", "casino")
     if not ok:
-        await interaction.response.send_message(
-            f"You need **{MYSTERY_CRATE_COST}** tokens to open a Mystery Crate.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"You need **{MYSTERY_CRATE_COST}** tokens to open a Mystery Crate.", ephemeral=True)
         return
 
     roll = random.randint(1, 100)
@@ -974,16 +1141,9 @@ async def mysterycrate(interaction: discord.Interaction):
     TOKEN_DB.update_casino_result(interaction.user, won)
 
     extra = f"\n\n**Manual Bonus To Honor:** {bonus_note}" if bonus_note else ""
-    embed = build_embed(
-        f"📦 Mystery Crate — {title}",
-        f"**Cost:** {MYSTERY_CRATE_COST} tokens\n{desc}{extra}",
-        0x5865F2 if won else 0xED4245,
-    )
+    embed = build_embed(f"📦 Mystery Crate — {title}", f"**Cost:** {MYSTERY_CRATE_COST} tokens\n{desc}{extra}", 0x5865F2 if won else 0xED4245)
     await interaction.response.send_message(embed=embed)
-    await send_log_message(
-        f"📦 MYSTERY CRATE: {interaction.user.mention} opened a Mystery Crate for **{MYSTERY_CRATE_COST}** tokens and got **{title}**.",
-        embed=embed,
-    )
+    await send_log_message(f"📦 MYSTERY CRATE: {interaction.user.mention} opened a Mystery Crate for **{MYSTERY_CRATE_COST}** tokens and got **{title}**.", embed=embed)
 
 
 @bot.tree.command(name="roulette", description="Bet tokens on roulette.")
@@ -1002,55 +1162,34 @@ async def mysterycrate(interaction: discord.Interaction):
 )
 async def roulette(interaction: discord.Interaction, bet_type: app_commands.Choice[str], amount: float, value: str):
     if amount < ROULETTE_MIN_BET or amount > ROULETTE_MAX_BET:
-        await interaction.response.send_message(
-            f"Roulette bets must be between **{ROULETTE_MIN_BET}** and **{ROULETTE_MAX_BET}** tokens.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"Roulette bets must be between **{ROULETTE_MIN_BET}** and **{ROULETTE_MAX_BET}** tokens.", ephemeral=True)
         return
 
     normalized = value.strip().lower()
     if bet_type.value == "color" and normalized not in {"red", "black"}:
-        await interaction.response.send_message(
-            "For color bets, value must be **red** or **black**.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("For color bets, value must be **red** or **black**.", ephemeral=True)
         return
     if bet_type.value == "parity" and normalized not in {"odd", "even"}:
-        await interaction.response.send_message(
-            "For parity bets, value must be **odd** or **even**.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("For parity bets, value must be **odd** or **even**.", ephemeral=True)
         return
     if bet_type.value == "range" and normalized not in {"low", "high"}:
-        await interaction.response.send_message(
-            "For range bets, value must be **low** or **high**.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("For range bets, value must be **low** or **high**.", ephemeral=True)
         return
     if bet_type.value == "number":
         try:
             chosen_number = int(normalized)
         except ValueError:
-            await interaction.response.send_message(
-                "For number bets, value must be a whole number from **0** to **36**.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("For number bets, value must be a whole number from **0** to **36**.", ephemeral=True)
             return
         if not 0 <= chosen_number <= 36:
-            await interaction.response.send_message(
-                "For number bets, value must be between **0** and **36**.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("For number bets, value must be between **0** and **36**.", ephemeral=True)
             return
     else:
         chosen_number = None
 
     ok = TOKEN_DB.spend_tokens(interaction.user, amount, f"Roulette bet: {bet_type.value}={normalized}", "casino")
     if not ok:
-        await interaction.response.send_message(
-            "You do not have enough tokens for that roulette bet.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("You do not have enough tokens for that roulette bet.", ephemeral=True)
         return
 
     number, color = roulette_spin()
@@ -1098,10 +1237,7 @@ async def roulette(interaction: discord.Interaction, bet_type: app_commands.Choi
 
     embed = build_embed(title, result_text, color_code)
     await interaction.response.send_message(embed=embed)
-    await send_log_message(
-        f"🎲 ROULETTE: {interaction.user.mention} bet **{fmt_tokens(amount)}** on **{bet_type.value}={normalized}**. Result: **{number} ({color})**.",
-        embed=embed,
-    )
+    await send_log_message(f"🎲 ROULETTE: {interaction.user.mention} bet **{fmt_tokens(amount)}** on **{bet_type.value}={normalized}**. Result: **{number} ({color})**.", embed=embed)
 
 
 @bot.tree.command(name="bounties", description="List all active bounties.")
@@ -1128,26 +1264,16 @@ async def bounties(interaction: discord.Interaction):
 async def claimbounty(interaction: discord.Interaction, bounty_id: int):
     bounty = TOKEN_DB.claim_bounty(bounty_id, interaction.user)
     if bounty is None:
-        await interaction.response.send_message(
-            "That bounty does not exist or has already been claimed.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("That bounty does not exist or has already been claimed.", ephemeral=True)
         return
 
     embed = build_embed(
         f"🎯 Bounty Claimed — #{bounty['id']}",
-        (
-            f"**Title:** {bounty['title']}\n"
-            f"**Reward:** {fmt_tokens(bounty['reward'])} tokens\n"
-            f"**Claimed By:** {interaction.user.mention}"
-        ),
+        f"**Title:** {bounty['title']}\n**Reward:** {fmt_tokens(bounty['reward'])} tokens\n**Claimed By:** {interaction.user.mention}",
         0x57F287,
     )
     await interaction.response.send_message(embed=embed)
-    await send_log_message(
-        f"🎯 BOUNTY CLAIMED: {interaction.user.mention} claimed bounty **#{bounty['id']} - {bounty['title']}** for **{fmt_tokens(bounty['reward'])}** tokens.",
-        embed=embed,
-    )
+    await send_log_message(f"🎯 BOUNTY CLAIMED: {interaction.user.mention} claimed bounty **#{bounty['id']} - {bounty['title']}** for **{fmt_tokens(bounty['reward'])}** tokens.", embed=embed)
 
 
 # -----------------------------
@@ -1161,12 +1287,8 @@ async def addtokens(interaction: discord.Interaction, user: discord.Member, amou
         await interaction.response.send_message("Amount must be greater than 0.", ephemeral=True)
         return
     TOKEN_DB.add_tokens(user, amount, reason, "admin")
-    await interaction.response.send_message(
-        f"✅ Added **{fmt_tokens(amount)}** tokens to {user.mention}.\n**Reason:** {reason}"
-    )
-    await send_log_message(
-        f"💰 ADMIN: {interaction.user.mention} added **{fmt_tokens(amount)}** tokens to {user.mention}. Reason: **{reason}**"
-    )
+    await interaction.response.send_message(f"✅ Added **{fmt_tokens(amount)}** tokens to {user.mention}.\n**Reason:** {reason}")
+    await send_log_message(f"💰 ADMIN: {interaction.user.mention} added **{fmt_tokens(amount)}** tokens to {user.mention}. Reason: **{reason}**")
 
 
 @bot.tree.command(name="removetokens", description="Admin: remove tokens from a user.")
@@ -1179,22 +1301,15 @@ async def removetokens(interaction: discord.Interaction, user: discord.Member, a
 
     row = TOKEN_DB.get_user(user)
     if row["balance"] < amount:
-        await interaction.response.send_message(
-            f"{user.mention} does not have enough tokens. Current balance: {fmt_tokens(row['balance'])}",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"{user.mention} does not have enough tokens. Current balance: {fmt_tokens(row['balance'])}", ephemeral=True)
         return
 
     success = TOKEN_DB.spend_tokens(user, amount, reason, "admin")
     if not success:
         await interaction.response.send_message("Failed to remove tokens.", ephemeral=True)
         return
-    await interaction.response.send_message(
-        f"✅ Removed **{fmt_tokens(amount)}** tokens from {user.mention}.\n**Reason:** {reason}"
-    )
-    await send_log_message(
-        f"💸 ADMIN: {interaction.user.mention} removed **{fmt_tokens(amount)}** tokens from {user.mention}. Reason: **{reason}**"
-    )
+    await interaction.response.send_message(f"✅ Removed **{fmt_tokens(amount)}** tokens from {user.mention}.\n**Reason:** {reason}")
+    await send_log_message(f"💸 ADMIN: {interaction.user.mention} removed **{fmt_tokens(amount)}** tokens from {user.mention}. Reason: **{reason}**")
 
 
 @bot.tree.command(name="createreward", description="Admin: quick-add standard token rewards.")
@@ -1218,12 +1333,7 @@ async def removetokens(interaction: discord.Interaction, user: discord.Member, a
         app_commands.Choice(name="Recruit Bonus (+2)", value="recruit"),
     ]
 )
-async def createreward(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    reward_type: app_commands.Choice[str],
-    notes: Optional[str] = None,
-):
+async def createreward(interaction: discord.Interaction, user: discord.Member, reward_type: app_commands.Choice[str], notes: Optional[str] = None):
     reward_map = {
         "regular_win": (1, "Regular streamed game win"),
         "regular_loss": (0.5, "Regular streamed game loss"),
@@ -1243,14 +1353,8 @@ async def createreward(
     amount, label = reward_map[reward_type.value]
     reason = label if not notes else f"{label} — {notes}"
     TOKEN_DB.add_tokens(user, amount, reason, "reward")
-    await interaction.response.send_message(
-        f"✅ Reward logged for {user.mention}: **{fmt_tokens(amount)}** tokens\n"
-        f"**Type:** {label}\n"
-        f"**Notes:** {notes or 'None'}"
-    )
-    await send_log_message(
-        f"🏅 REWARD: {interaction.user.mention} awarded {user.mention} **{fmt_tokens(amount)}** tokens. Type: **{label}**. Notes: **{notes or 'None'}**"
-    )
+    await interaction.response.send_message(f"✅ Reward logged for {user.mention}: **{fmt_tokens(amount)}** tokens\n**Type:** {label}\n**Notes:** {notes or 'None'}")
+    await send_log_message(f"🏅 REWARD: {interaction.user.mention} awarded {user.mention} **{fmt_tokens(amount)}** tokens. Type: **{label}**. Notes: **{notes or 'None'}**")
 
 
 @bot.tree.command(name="createbounty", description="Admin: create a new bounty.")
@@ -1261,16 +1365,9 @@ async def createbounty(interaction: discord.Interaction, title: str, reward: flo
         await interaction.response.send_message("Reward must be greater than 0.", ephemeral=True)
         return
     bounty_id = TOKEN_DB.create_bounty(title, description, reward, interaction.user.id)
-    embed = build_embed(
-        f"🎯 New Bounty Created — #{bounty_id}",
-        f"**Title:** {title}\n**Reward:** {fmt_tokens(reward)} tokens\n**Objective:** {description}",
-        0xFEE75C,
-    )
+    embed = build_embed(f"🎯 New Bounty Created — #{bounty_id}", f"**Title:** {title}\n**Reward:** {fmt_tokens(reward)} tokens\n**Objective:** {description}", 0xFEE75C)
     await interaction.response.send_message(embed=embed)
-    await send_log_message(
-        f"🎯 ADMIN: {interaction.user.mention} created bounty **#{bounty_id} - {title}** worth **{fmt_tokens(reward)}** tokens.",
-        embed=embed,
-    )
+    await send_log_message(f"🎯 ADMIN: {interaction.user.mention} created bounty **#{bounty_id} - {title}** worth **{fmt_tokens(reward)}** tokens.", embed=embed)
 
 
 @bot.tree.command(name="updatebountyamount", description="Admin: change the reward amount for a specific bounty.")
@@ -1289,16 +1386,9 @@ async def updatebountyamount(interaction: discord.Interaction, bounty_id: int, r
     old_reward = existing["reward"]
     TOKEN_DB.update_bounty_reward(bounty_id, reward)
     updated = TOKEN_DB.get_bounty(bounty_id)
-    embed = build_embed(
-        f"🎯 Bounty Updated — #{bounty_id}",
-        f"**Title:** {updated['title']}\n**Old Reward:** {fmt_tokens(old_reward)}\n**New Reward:** {fmt_tokens(reward)}",
-        0x5865F2,
-    )
+    embed = build_embed(f"🎯 Bounty Updated — #{bounty_id}", f"**Title:** {updated['title']}\n**Old Reward:** {fmt_tokens(old_reward)}\n**New Reward:** {fmt_tokens(reward)}", 0x5865F2)
     await interaction.response.send_message(embed=embed)
-    await send_log_message(
-        f"🎯 ADMIN: {interaction.user.mention} changed bounty **#{bounty_id}** from **{fmt_tokens(old_reward)}** to **{fmt_tokens(reward)}** tokens.",
-        embed=embed,
-    )
+    await send_log_message(f"🎯 ADMIN: {interaction.user.mention} changed bounty **#{bounty_id}** from **{fmt_tokens(old_reward)}** to **{fmt_tokens(reward)}** tokens.", embed=embed)
 
 
 @bot.tree.command(name="postoverview", description="Admin: post the league token overview embed.")
@@ -1328,23 +1418,13 @@ async def postoverview(interaction: discord.Interaction):
     )
     await interaction.response.send_message("Posted below:")
     await interaction.channel.send(embed=embed)
-    await send_log_message(
-        f"📌 ADMIN: {interaction.user.mention} posted the token overview in {interaction.channel.mention}.",
-        embed=embed,
-    )
+    await send_log_message(f"📌 ADMIN: {interaction.user.mention} posted the token overview in {interaction.channel.mention}.", embed=embed)
 
 
 @bot.tree.command(name="create_week_channels", description="Admin: create one matchup channel per game for a week.")
 @admin_only()
-@app_commands.describe(
-    week="Week number from the games table (preseason week 1 appears to be week 0)",
-    category_name="Optional category name to create/use",
-)
-async def create_week_channels(
-    interaction: discord.Interaction,
-    week: int,
-    category_name: Optional[str] = None,
-):
+@app_commands.describe(week="Week number from the games table", category_name="Optional category name to create/use")
+async def create_week_channels(interaction: discord.Interaction, week: int, category_name: Optional[str] = None):
     if interaction.guild is None:
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
         return
@@ -1383,7 +1463,6 @@ async def create_week_channels(
         status = game["status"]
         away_team_name = game["away_team_name"]
         home_team_name = game["home_team_name"]
-
         is_gotw = game_id in gotw_game_ids
 
         base_name = f"wk{game_week}-{slugify_channel_name(away_team_name)}-vs-{slugify_channel_name(home_team_name)}"
@@ -1405,23 +1484,12 @@ async def create_week_channels(
         )
 
         mention_parts = []
-        if away_member is not None:
-            mention_parts.append(away_member.mention)
-        else:
-            mention_parts.append(f"**{away_team_name}** (no Discord match found)")
-
-        if home_member is not None:
-            mention_parts.append(home_member.mention)
-        else:
-            mention_parts.append(f"**{home_team_name}** (no Discord match found)")
+        mention_parts.append(away_member.mention if away_member is not None else f"**{away_team_name}** (no Discord match found)")
+        mention_parts.append(home_member.mention if home_member is not None else f"**{home_team_name}** (no Discord match found)")
 
         message_lines = []
-
         if is_gotw:
-            message_lines.extend([
-                "🔥 **GAME OF THE WEEK** 🔥",
-                "",
-            ])
+            message_lines.extend(["🔥 **GAME OF THE WEEK** 🔥", ""])
             gotw_created.append(channel_name)
 
         message_lines.extend([
@@ -1453,20 +1521,13 @@ async def create_week_channels(
         summary_lines.extend(f"- {name}" for name in skipped_channels[:20])
 
     await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
-
-    await send_log_message(
-        f"📅 SCHEDULE: {interaction.user.mention} created week {week} matchup channels. "
-        f"Created: {len(created_channels)} | GOTW: {len(gotw_created)} | Skipped: {len(skipped_channels)}"
-    )
+    await send_log_message(f"📅 SCHEDULE: {interaction.user.mention} created week {week} matchup channels. Created: {len(created_channels)} | GOTW: {len(gotw_created)} | Skipped: {len(skipped_channels)}")
 
 
 @bot.tree.command(name="post_season_leaders", description="Admin: post current season stat leaders.")
 @admin_only()
 @app_commands.describe(channel="Optional channel to post in. Defaults to LEADERS_CHANNEL_ID or current channel.")
-async def post_season_leaders(
-    interaction: discord.Interaction,
-    channel: Optional[discord.TextChannel] = None,
-):
+async def post_season_leaders(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
     await interaction.response.defer(ephemeral=True)
 
     try:
@@ -1493,10 +1554,7 @@ async def post_season_leaders(
         if isinstance(interaction.channel, discord.TextChannel):
             target_channel = interaction.channel
         else:
-            await interaction.followup.send(
-                "No target channel found. Provide a channel or set LEADERS_CHANNEL_ID.",
-                ephemeral=True,
-            )
+            await interaction.followup.send("No target channel found. Provide a channel or set LEADERS_CHANNEL_ID.", ephemeral=True)
             return
 
     sections = [
@@ -1506,25 +1564,13 @@ async def post_season_leaders(
         ("🖐️ Interceptions", format_leader_lines(interception_rows, "total_ints", "Interceptions")),
     ]
 
-    embed = discord.Embed(
-        title="📊 Season Stat Leaders",
-        description="Top 5 current season leaders",
-        color=0x5865F2,
-    )
-
+    embed = discord.Embed(title="📊 Season Stat Leaders", description="Top 5 current season leaders", color=0x5865F2)
     for title, lines in sections:
         embed.add_field(name=title, value="\n".join(lines), inline=False)
 
     await target_channel.send(embed=embed)
-
-    await interaction.followup.send(
-        f"Posted season leaders in {target_channel.mention}.",
-        ephemeral=True,
-    )
-
-    await send_log_message(
-        f"📊 LEADERS: {interaction.user.mention} posted season leaders in {target_channel.mention}."
-    )
+    await interaction.followup.send(f"Posted season leaders in {target_channel.mention}.", ephemeral=True)
+    await send_log_message(f"📊 LEADERS: {interaction.user.mention} posted season leaders in {target_channel.mention}.")
 
 
 if not BOT_TOKEN:
