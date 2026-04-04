@@ -4,7 +4,6 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from typing import Optional
-import asyncio
 
 import discord
 import psycopg
@@ -33,8 +32,9 @@ ATTRIBUTE_COST = 3
 NAME_CHANGE_COST = 5
 ROOKIE_REVEAL_COST = 10
 DEV_OPPORTUNITY_COST = 53
+
 ROULETTE_MIN_BET = 1
-ROULETTE_MAX_BET = 10
+ROULETTE_MAX_BET = 15
 
 BLACKJACK_MIN_BET = 1
 BLACKJACK_MAX_BET = 25
@@ -812,6 +812,46 @@ class BlackjackView(discord.ui.View):
             await interaction.response.send_message("This hand is already finished.", ephemeral=True)
             return
 
+        if self.game.player_has_blackjack() or self.game.dealer_has_blackjack():
+            self.game.is_finished = True
+            BLACKJACK_GAMES.pop(self.game.user_id, None)
+
+            for item in self.children:
+                item.disabled = True
+
+            if self.game.player_has_blackjack() and self.game.dealer_has_blackjack():
+                payout = self.game.bet
+                TOKEN_DB.add_tokens(
+                    interaction.user,
+                    payout,
+                    f"Blackjack push refund ({fmt_tokens(self.game.bet)} bet)",
+                    "casino",
+                )
+                title = "🃏 Blackjack — Push"
+                text = f"Both you and the dealer have blackjack. Your **{fmt_tokens(self.game.bet)}** token bet was returned."
+                color = 0xFEE75C
+            elif self.game.player_has_blackjack():
+                payout = self.game.payout_amount()
+                TOKEN_DB.add_tokens(
+                    interaction.user,
+                    payout,
+                    f"Blackjack natural payout ({fmt_tokens(self.game.bet)} bet)",
+                    "casino",
+                )
+                TOKEN_DB.update_casino_result(interaction.user, True)
+                title = "🃏 Blackjack — Blackjack!"
+                text = f"Natural blackjack! You were paid **{fmt_tokens(payout)}** tokens."
+                color = 0x57F287
+            else:
+                TOKEN_DB.update_casino_result(interaction.user, False)
+                title = "🃏 Blackjack — Dealer Blackjack"
+                text = "Dealer has blackjack. You lose."
+                color = 0xED4245
+
+            embed = self.game.finished_embed(interaction.user.mention, title, text, color)
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
+
         self.game.play_dealer()
         result = self.game.outcome()
         payout = self.game.payout_amount()
@@ -1148,9 +1188,9 @@ async def wheel(interaction: discord.Interaction):
     if roll <= 30:
         result = PrizeResult("No Prize", "The wheel lands on nothing. The house wins this round.", won=False)
     elif roll <= 55:
-        result = PrizeResult("+1 Token", "Nice. The wheel gives you a small payout.", payout=1, won=True)
+        result = PrizeResult("+2 Tokens", "Nice. The wheel gives you a small payout.", payout=2, won=True)
     elif roll <= 72:
-        result = PrizeResult("+2 Tokens", "Solid hit. You won back the cost of the spin.", payout=2, won=True)
+        result = PrizeResult("+4 Tokens", "Solid hit. Great spin.", payout=4, won=True)
     elif roll <= 84:
         result = PrizeResult(
             "Free Name Change",
@@ -1158,15 +1198,15 @@ async def wheel(interaction: discord.Interaction):
             won=True,
             bonus_note="Free Name Change Voucher",
         )
-    elif roll <= 93:
+    elif roll <= 88:
         result = PrizeResult(
-            "Free Rookie Dev Reveal",
-            "Big hit. Commissioner can honor this manually.",
+            "Position Group +1 Upgrade",
+            "You won a position group +1 upgrade. Commissioner can honor this manually.",
             won=True,
-            bonus_note="Free Rookie Dev Reveal Voucher",
+            bonus_note="Position Group +1 Upgrade",
         )
     else:
-        result = PrizeResult("Jackpot", "Huge spin. The wheel pays out +4 tokens.", payout=4, won=True)
+        result = PrizeResult("Jackpot", "Huge spin. The wheel pays out +8 tokens.", payout=8, won=True)
 
     if result.payout > 0:
         TOKEN_DB.add_tokens(interaction.user, result.payout, f"Prize Wheel reward: {result.title}", "casino")
@@ -1196,13 +1236,15 @@ async def boomorbust(interaction: discord.Interaction, player_name: str):
         )
         return
 
-    hit = random.randint(1, 100) <= 45
+    hit = random.randint(1, 100) <= 35
     TOKEN_DB.update_casino_result(interaction.user, hit)
 
     if hit:
+        payout = BOOM_OR_BUST_COST * 2
+        TOKEN_DB.add_tokens(interaction.user, payout, f"Boom or Bust payout for {player_name}", "casino")
         desc = (
             f"**BOOM.** {player_name} hit the upside roll.\n\n"
-            "Commissioner reward suggestion: approve a modest player boost or 1-2 selected attribute points."
+            f"You were paid **{fmt_tokens(payout)}** tokens."
         )
         color = 0x57F287
         title = "💥 Boom or Bust — BOOM"
@@ -1239,13 +1281,13 @@ async def mysterycrate(interaction: discord.Interaction):
         desc = "The crate is empty. Brutal."
         won = False
     elif roll <= 42:
-        title = "+2 Tokens"
-        desc = "Small crate hit."
-        payout = 2
+        title = "+8 Tokens"
+        desc = "Nice crate hit."
+        payout = 8
     elif roll <= 57:
-        title = "+4 Tokens"
-        desc = "Good value crate."
-        payout = 4
+        title = "+12 Tokens"
+        desc = "Big crate hit."
+        payout = 12
     elif roll <= 72:
         title = "Free Prize Wheel Spin"
         desc = "Commissioner can honor one free spin manually."
@@ -1260,8 +1302,8 @@ async def mysterycrate(interaction: discord.Interaction):
         bonus_note = "Free Rookie Dev Reveal"
     else:
         title = "Jackpot Crate"
-        desc = "Massive crate. You win +8 tokens."
-        payout = 8
+        desc = "Massive crate. You win +16 tokens."
+        payout = 16
 
     if payout > 0:
         TOKEN_DB.add_tokens(interaction.user, payout, f"Mystery Crate reward: {title}", "casino")
@@ -1430,52 +1472,6 @@ async def blackjack(interaction: discord.Interaction, amount: float):
 
     game = BlackjackGame(interaction.user, amount)
     BLACKJACK_GAMES[interaction.user.id] = game
-
-    if game.player_has_blackjack() or game.dealer_has_blackjack():
-        game.is_finished = True
-        BLACKJACK_GAMES.pop(interaction.user.id, None)
-
-        if game.player_has_blackjack() and game.dealer_has_blackjack():
-            payout = game.bet
-            TOKEN_DB.add_tokens(
-                interaction.user,
-                payout,
-                f"Blackjack push refund ({fmt_tokens(game.bet)} bet)",
-                "casino",
-            )
-            title = "🃏 Blackjack — Push"
-            text = f"Both you and the dealer have blackjack. Your **{fmt_tokens(game.bet)}** token bet was returned."
-            color = 0xFEE75C
-            await send_log_message(
-                f"🃏 BLACKJACK: {interaction.user.mention} pushed with a natural blackjack."
-            )
-        elif game.player_has_blackjack():
-            payout = game.payout_amount()
-            TOKEN_DB.add_tokens(
-                interaction.user,
-                payout,
-                f"Blackjack natural payout ({fmt_tokens(game.bet)} bet)",
-                "casino",
-            )
-            TOKEN_DB.update_casino_result(interaction.user, True)
-            title = "🃏 Blackjack — Blackjack!"
-            text = f"Natural blackjack! You were paid **{fmt_tokens(payout)}** tokens."
-            color = 0x57F287
-            await send_log_message(
-                f"🃏 BLACKJACK: {interaction.user.mention} hit a natural blackjack and was paid **{fmt_tokens(payout)}**."
-            )
-        else:
-            TOKEN_DB.update_casino_result(interaction.user, False)
-            title = "🃏 Blackjack — Dealer Blackjack"
-            text = "Dealer has blackjack. You lose."
-            color = 0xED4245
-            await send_log_message(
-                f"🃏 BLACKJACK: {interaction.user.mention} lost to dealer blackjack."
-            )
-
-        embed = game.finished_embed(interaction.user.mention, title, text, color)
-        await interaction.response.send_message(embed=embed)
-        return
 
     view = BlackjackView(game)
     embed = game.active_embed(interaction.user.mention)
