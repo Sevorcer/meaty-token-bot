@@ -14,6 +14,7 @@ from discord.ext import commands
 # Meaty Token Bot - Slash Command Casino / Token Tracker
 # + Madden standings from shared Postgres
 # + Weekly matchup channel creation from Postgres schedule
+# + Automatic top 2 Games of the Week
 # =========================================================
 # Setup:
 # 1) pip install -U -r requirements.txt
@@ -377,7 +378,6 @@ def normalize_team_name(value: str) -> str:
 
 def member_matches_team(member: discord.Member, team_name: str) -> bool:
     team_norm = normalize_team_name(team_name)
-
     possible_names = [
         member.display_name or "",
         member.name or "",
@@ -426,16 +426,54 @@ def fetch_games_for_week(week: int):
                     away.team_name AS away_team_name,
                     home.team_name AS home_team_name,
                     g.away_team_id,
-                    g.home_team_id
+                    g.home_team_id,
+                    COALESCE(away_standings.wins, 0) AS away_wins,
+                    COALESCE(away_standings.losses, 0) AS away_losses,
+                    COALESCE(away_standings.ties, 0) AS away_ties,
+                    COALESCE(away_standings.win_pct, 0) AS away_win_pct,
+                    COALESCE(away.team_ovr, 0) AS away_ovr,
+                    COALESCE(home_standings.wins, 0) AS home_wins,
+                    COALESCE(home_standings.losses, 0) AS home_losses,
+                    COALESCE(home_standings.ties, 0) AS home_ties,
+                    COALESCE(home_standings.win_pct, 0) AS home_win_pct,
+                    COALESCE(home.team_ovr, 0) AS home_ovr
                 FROM games g
                 JOIN teams away ON away.team_id = g.away_team_id
                 JOIN teams home ON home.team_id = g.home_team_id
+                LEFT JOIN standings away_standings ON away_standings.team_id = g.away_team_id
+                LEFT JOIN standings home_standings ON home_standings.team_id = g.home_team_id
                 WHERE g.week = %s
                 ORDER BY g.game_id ASC
                 """,
                 (week,),
             )
             return cur.fetchall()
+
+
+def compute_matchup_score(game_row) -> float:
+    away_wins = game_row[8] or 0
+    away_win_pct = float(game_row[11] or 0)
+    away_ovr = game_row[12] or 0
+
+    home_wins = game_row[13] or 0
+    home_win_pct = float(game_row[16] or 0)
+    home_ovr = game_row[17] or 0
+
+    both_good_bonus = 0
+    if away_win_pct >= 0.500 and home_win_pct >= 0.500:
+        both_good_bonus += 5
+    if away_wins >= 5 and home_wins >= 5:
+        both_good_bonus += 3
+
+    return (
+        away_wins
+        + home_wins
+        + (away_win_pct * 10)
+        + (home_win_pct * 10)
+        + (away_ovr / 10)
+        + (home_ovr / 10)
+        + both_good_bonus
+    )
 
 
 @dataclass
@@ -1234,8 +1272,16 @@ async def create_week_channels(
     if existing_category is None:
         existing_category = await guild.create_category(category_title)
 
+    scored_games = []
+    for game in games:
+        scored_games.append((game, compute_matchup_score(game)))
+
+    scored_games.sort(key=lambda item: item[1], reverse=True)
+    gotw_game_ids = {game[0] for game, _score in scored_games[:2]}
+
     created_channels = []
     skipped_channels = []
+    gotw_created = []
 
     for game in games:
         game_id = game[0]
@@ -1245,7 +1291,10 @@ async def create_week_channels(
         away_team_name = game[4]
         home_team_name = game[5]
 
-        channel_name = f"wk{game_week}-{slugify_channel_name(away_team_name)}-vs-{slugify_channel_name(home_team_name)}"
+        is_gotw = game_id in gotw_game_ids
+
+        base_name = f"wk{game_week}-{slugify_channel_name(away_team_name)}-vs-{slugify_channel_name(home_team_name)}"
+        channel_name = f"gotw-{base_name}" if is_gotw else base_name
         channel_name = channel_name[:100]
 
         existing_channel = discord.utils.get(guild.text_channels, name=channel_name)
@@ -1273,7 +1322,16 @@ async def create_week_channels(
         else:
             mention_parts.append(f"**{home_team_name}** (no Discord match found)")
 
-        message_lines = [
+        message_lines = []
+
+        if is_gotw:
+            message_lines.extend([
+                "🔥 **GAME OF THE WEEK** 🔥",
+                "",
+            ])
+            gotw_created.append(channel_name)
+
+        message_lines.extend([
             f"🏈 **Week {game_week} Matchup**",
             f"**Away:** {away_team_name}",
             f"**Home:** {home_team_name}",
@@ -1281,14 +1339,20 @@ async def create_week_channels(
             f"{mention_parts[0]} vs {mention_parts[1]}",
             "",
             "Use this channel to schedule your game.",
-        ]
+        ])
 
         await channel.send("\n".join(message_lines))
         created_channels.append(channel_name)
 
     summary_lines = [
-        f"Created **{len(created_channels)}** channel(s) for week **{week}** in **{category_title}**."
+        f"Created **{len(created_channels)}** channel(s) for week **{week}** in **{category_title}**.",
+        f"Selected **{len(gotw_created)}** Game(s) of the Week.",
     ]
+
+    if gotw_created:
+        summary_lines.append("")
+        summary_lines.append("GOTW:")
+        summary_lines.extend(f"- {name}" for name in gotw_created)
 
     if skipped_channels:
         summary_lines.append("")
@@ -1299,7 +1363,7 @@ async def create_week_channels(
 
     await send_log_message(
         f"📅 SCHEDULE: {interaction.user.mention} created week {week} matchup channels. "
-        f"Created: {len(created_channels)} | Skipped: {len(skipped_channels)}"
+        f"Created: {len(created_channels)} | GOTW: {len(gotw_created)} | Skipped: {len(skipped_channels)}"
     )
 
 
