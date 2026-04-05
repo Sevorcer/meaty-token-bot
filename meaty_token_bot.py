@@ -2,6 +2,7 @@ import os
 import random
 import re
 import sqlite3
+import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
@@ -40,6 +41,9 @@ BLACKJACK_MIN_BET = 1
 BLACKJACK_MAX_BET = 25
 BLACKJACK_BLACKJACK_MULTIPLIER = 2.5
 BLACKJACK_WIN_MULTIPLIER = 2.0
+
+CASINO_DELETE_DELAY = 60
+BLACKJACK_FINISHED_DELETE_DELAY = 180
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -313,6 +317,16 @@ async def send_log_message(message: str, embed: Optional[discord.Embed] = None):
             await channel.send(message)
     except Exception as exc:
         print(f"Failed to send log message to channel {LOG_CHANNEL_ID}: {exc}")
+
+
+def schedule_message_delete(message: discord.Message, delay: int):
+    async def _delete_later():
+        await asyncio.sleep(delay)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+    asyncio.create_task(_delete_later())
 
 
 def roulette_spin() -> tuple[int, str]:
@@ -769,6 +783,7 @@ class BlackjackView(discord.ui.View):
                     0xED4245,
                 )
                 await message.edit(embed=embed, view=self)
+                schedule_message_delete(message, BLACKJACK_FINISHED_DELETE_DELAY)
             except Exception:
                 pass
 
@@ -781,6 +796,12 @@ class BlackjackView(discord.ui.View):
 
         embed = self.game.finished_embed(interaction.user.mention, final_title, final_text, color)
         await interaction.response.edit_message(embed=embed, view=self)
+
+        try:
+            message = await interaction.original_response()
+            schedule_message_delete(message, BLACKJACK_FINISHED_DELETE_DELAY)
+        except Exception:
+            pass
 
     @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary)
     async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -850,6 +871,12 @@ class BlackjackView(discord.ui.View):
 
             embed = self.game.finished_embed(interaction.user.mention, title, text, color)
             await interaction.response.edit_message(embed=embed, view=self)
+
+            try:
+                message = await interaction.original_response()
+                schedule_message_delete(message, BLACKJACK_FINISHED_DELETE_DELAY)
+            except Exception:
+                pass
             return
 
         self.game.play_dealer()
@@ -1219,6 +1246,13 @@ async def wheel(interaction: discord.Interaction):
         0xFEE75C if result.won else 0xED4245,
     )
     await interaction.response.send_message(embed=embed)
+
+    try:
+        msg = await interaction.original_response()
+        schedule_message_delete(msg, CASINO_DELETE_DELAY)
+    except Exception:
+        pass
+
     await send_log_message(
         f"🎡 WHEEL: {interaction.user.mention} spun the Prize Wheel for **{PRIZE_WHEEL_COST}** tokens and got **{result.title}**.",
         embed=embed,
@@ -1255,6 +1289,13 @@ async def boomorbust(interaction: discord.Interaction, player_name: str):
 
     embed = build_embed(title, f"**Cost:** {BOOM_OR_BUST_COST} tokens\n{desc}", color)
     await interaction.response.send_message(embed=embed)
+
+    try:
+        msg = await interaction.original_response()
+        schedule_message_delete(msg, CASINO_DELETE_DELAY)
+    except Exception:
+        pass
+
     await send_log_message(
         f"💥 BOOM OR BUST: {interaction.user.mention} used Boom or Bust on **{player_name}** for **{BOOM_OR_BUST_COST}** tokens.",
         embed=embed,
@@ -1316,6 +1357,13 @@ async def mysterycrate(interaction: discord.Interaction):
         0x5865F2 if won else 0xED4245,
     )
     await interaction.response.send_message(embed=embed)
+
+    try:
+        msg = await interaction.original_response()
+        schedule_message_delete(msg, CASINO_DELETE_DELAY)
+    except Exception:
+        pass
+
     await send_log_message(
         f"📦 MYSTERY CRATE: {interaction.user.mention} opened a Mystery Crate for **{MYSTERY_CRATE_COST}** tokens and got **{title}**.",
         embed=embed,
@@ -1434,6 +1482,13 @@ async def roulette(interaction: discord.Interaction, bet_type: app_commands.Choi
 
     embed = build_embed(title, result_text, color_code)
     await interaction.response.send_message(embed=embed)
+
+    try:
+        msg = await interaction.original_response()
+        schedule_message_delete(msg, CASINO_DELETE_DELAY)
+    except Exception:
+        pass
+
     await send_log_message(
         f"🎲 ROULETTE: {interaction.user.mention} bet **{fmt_tokens(amount)}** on **{bet_type.value}={normalized}**. Result: **{number} ({color})**.",
         embed=embed,
