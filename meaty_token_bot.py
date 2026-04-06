@@ -34,6 +34,83 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 ADMIN_ROLE_NAMES = {"Commissioner", "Admin", "COMMISH"}
 
+STAGE_LABELS = {
+    1: "Preseason",
+    2: "Regular Season",
+    3: "Wild Card",
+    4: "Divisional",
+    5: "Conference Championship",
+    6: "Super Bowl",
+    7: "Offseason",
+}
+STAGE_PARSE_MAP = {
+    "auto": None,
+    "preseason": 1,
+    "regular": 2,
+    "regular season": 2,
+    "wild card": 3,
+    "wildcard": 3,
+    "divisional": 4,
+    "conference": 5,
+    "conference championship": 5,
+    "super bowl": 6,
+    "superbowl": 6,
+    "offseason": 7,
+}
+COMPLETE_GAME_STATUS_VALUES = {2, 4, 5, 6, 7, 8}
+
+DEV_TRAIT_LABELS = {
+    0: "Normal",
+    1: "Star",
+    2: "Superstar",
+    3: "X-Factor",
+}
+
+DEV_TRAIT_EMOJIS = {
+    0: "⚪",
+    1: "⭐",
+    2: "🌟",
+    3: "🔥",
+}
+
+DEV_TRAIT_COLORS = {
+    0: 0x95A5A6,
+    1: 0xF1C40F,
+    2: 0x9B59B6,
+    3: 0xE74C3C,
+}
+
+ROSTER_PAGE_SIZE = 12
+POSITION_SORT_ORDER = {
+    "QB": 1,
+    "HB": 2,
+    "FB": 3,
+    "WR": 4,
+    "TE": 5,
+    "LT": 6,
+    "LG": 7,
+    "C": 8,
+    "RG": 9,
+    "RT": 10,
+    "LEDGE": 11,
+    "REDGE": 12,
+    "LE": 13,
+    "RE": 14,
+    "DT": 15,
+    "LOLB": 16,
+    "MLB": 17,
+    "ROLB": 18,
+    "SAM": 19,
+    "MIKE": 20,
+    "WILL": 21,
+    "CB": 22,
+    "FS": 23,
+    "SS": 24,
+    "K": 25,
+    "P": 26,
+    "LS": 27,
+}
+
 PRIZE_WHEEL_COST = 2
 BOOM_OR_BUST_COST = 5
 MYSTERY_CRATE_COST = 8
@@ -432,7 +509,101 @@ def find_member_for_team(guild: discord.Guild, team_name: str) -> Optional[disco
     return None
 
 
-def fetch_games_for_week(week: int):
+def stage_display_name(stage_index: int) -> str:
+    return STAGE_LABELS.get(stage_index, f"Stage {stage_index}")
+
+
+def stage_channel_prefix(stage_index: int) -> str:
+    return {
+        1: "pre-wk",
+        2: "wk",
+        3: "wc",
+        4: "div",
+        5: "conf",
+        6: "sb",
+    }.get(stage_index, f"s{stage_index}-w")
+
+
+def stage_week_label(stage_index: int, display_week: int) -> str:
+    if stage_index == 2:
+        return f"Week {display_week}"
+    if stage_index == 1:
+        return f"Preseason Week {display_week}"
+    if stage_index == 3:
+        return f"Wild Card Week {display_week}"
+    if stage_index == 4:
+        return f"Divisional Week {display_week}"
+    if stage_index == 5:
+        return f"Conference Championship Week {display_week}"
+    if stage_index == 6:
+        return "Super Bowl"
+    return f"{stage_display_name(stage_index)} Week {display_week}"
+
+
+def parse_phase_to_stage_index(phase: Optional[str]) -> Optional[int]:
+    if phase is None:
+        return None
+    return STAGE_PARSE_MAP.get(phase.strip().lower())
+
+
+def looks_like_completed_game(row) -> bool:
+    away_score = int(row.get("away_score") or 0)
+    home_score = int(row.get("home_score") or 0)
+    if away_score > 0 or home_score > 0:
+        return True
+    status = row.get("status")
+    try:
+        status_int = int(status)
+    except (TypeError, ValueError):
+        return False
+    return status_int in COMPLETE_GAME_STATUS_VALUES
+
+
+def detect_current_stage_and_week() -> tuple[Optional[int], Optional[int]]:
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT g.stage_index, g.week, g.status, g.away_score, g.home_score
+                FROM games g
+                WHERE g.season_index = (SELECT MAX(season_index) FROM games)
+                ORDER BY g.stage_index ASC, g.week ASC, g.game_id ASC
+                """
+            )
+            rows = cur.fetchall()
+
+    if not rows:
+        return None, None
+
+    progress = {}
+    for row in rows:
+        key = (int(row["stage_index"]), int(row["week"]))
+        bucket = progress.setdefault(key, {"total": 0, "completed": 0})
+        bucket["total"] += 1
+        if looks_like_completed_game(row):
+            bucket["completed"] += 1
+
+    for (stage_index, raw_week), counts in sorted(progress.items(), key=lambda item: (item[0][0], item[0][1])):
+        if counts["completed"] < counts["total"]:
+            return stage_index, raw_week + 1
+
+    last_stage, last_week = sorted(progress.keys(), key=lambda item: (item[0], item[1]))[-1]
+    return last_stage, last_week + 1
+
+
+def resolve_command_stage(phase: Optional[str]) -> int:
+    chosen = parse_phase_to_stage_index(phase)
+    if chosen is not None:
+        return chosen
+    detected_stage, detected_week = detect_current_stage_and_week()
+    if detected_stage is None:
+        raise RuntimeError("Unable to detect the current phase from imported games.")
+    print(f"Auto-detected stage {stage_display_name(detected_stage)} at display week {detected_week}")
+    return detected_stage
+
+
+def fetch_games_for_stage_week(stage_index: int, display_week: int):
+    raw_week = max(display_week - 1, 0)
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -440,8 +611,12 @@ def fetch_games_for_week(week: int):
                 SELECT
                     g.game_id,
                     g.week,
+                    (g.week + 1) AS display_week,
                     g.stage_index,
                     g.status,
+                    g.season_index,
+                    g.away_score,
+                    g.home_score,
                     away.team_name AS away_team_name,
                     home.team_name AS home_team_name,
                     g.away_team_id,
@@ -461,12 +636,19 @@ def fetch_games_for_week(week: int):
                 JOIN teams home ON home.team_id = g.home_team_id
                 LEFT JOIN standings away_standings ON away_standings.team_id = g.away_team_id
                 LEFT JOIN standings home_standings ON home_standings.team_id = g.home_team_id
-                WHERE g.week = %s
+                WHERE g.season_index = (SELECT MAX(season_index) FROM games)
+                  AND g.stage_index = %s
+                  AND g.week = %s
                 ORDER BY g.game_id ASC
                 """,
-                (week,),
+                (stage_index, raw_week),
             )
             return cur.fetchall()
+
+
+def fetch_games_for_week(week: int, stage_index: Optional[int] = None):
+    resolved_stage = stage_index if stage_index is not None else resolve_command_stage(None)
+    return fetch_games_for_stage_week(resolved_stage, week)
 
 
 def compute_matchup_score(game_row) -> float:
@@ -1050,6 +1232,68 @@ async def standings(interaction: discord.Interaction):
         await interaction.followup.send(
             embed=build_embed(f"🏈 League Standings (Page {page_num})", chunk, 0x5865F2)
         )
+
+
+@bot.tree.command(name="player", description="Look up a player card with dev trait and ratings.")
+@app_commands.describe(name="Player name to search")
+async def player(interaction: discord.Interaction, name: str):
+    results = fetch_player_search_results(name, limit=10)
+    if not results:
+        await interaction.response.send_message(f"No player found matching **{name}**.", ephemeral=True)
+        return
+
+    first = results[0]
+    exact_match = safe_text(first.get("full_name")).lower() == name.strip().lower()
+    if exact_match or len(results) == 1:
+        await interaction.response.send_message(embed=build_player_embed(first))
+        return
+
+    embed = build_embed(
+        f"🔎 Player Search: {name}",
+        "\n".join(
+            f"**{idx}.** {safe_text(row.get('full_name'))} — {safe_text(row.get('team_name'), 'Free Agent')} | "
+            f"{safe_text(row.get('position'))} | {safe_int(row.get('overall_rating'))} OVR | "
+            f"{dev_trait_to_label(row.get('dev_trait'), row.get('resolved_dev_trait_label') or row.get('dev_trait_label'))}"
+            for idx, row in enumerate(results[:10], start=1)
+        ),
+        0x5865F2,
+    )
+    embed.set_footer(text="Search with a more exact name to pull one player card.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="roster", description="Show a team roster with 12 players per page.")
+@app_commands.describe(team_name="Team name or mascot", page="Roster page number")
+async def roster(interaction: discord.Interaction, team_name: str, page: Optional[int] = 1):
+    team_row = resolve_team_row(team_name)
+    if not team_row:
+        await interaction.response.send_message(f"Could not find a team matching **{team_name}**.", ephemeral=True)
+        return
+
+    roster_rows = fetch_team_roster_rows(safe_int(team_row.get("team_id")))
+    if not roster_rows:
+        await interaction.response.send_message(f"No roster rows found for **{safe_text(team_row.get('team_name'))}**.", ephemeral=True)
+        return
+
+    standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
+    merged_team = {**team_row, **standing_row}
+    embed = build_roster_embed(merged_team, roster_rows, page or 1)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="team", description="Show a team summary and its first roster page.")
+@app_commands.describe(team_name="Team name or mascot")
+async def team(interaction: discord.Interaction, team_name: str):
+    team_row = resolve_team_row(team_name)
+    if not team_row:
+        await interaction.response.send_message(f"Could not find a team matching **{team_name}**.", ephemeral=True)
+        return
+
+    roster_rows = fetch_team_roster_rows(safe_int(team_row.get("team_id")))
+    standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
+    merged_team = {**team_row, **standing_row}
+    embed = build_roster_embed(merged_team, roster_rows, 1)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="balance", description="Check your token balance.")
@@ -1804,6 +2048,280 @@ def safe_int(value, default: int = 0) -> int:
         return default
 
 
+def safe_text(value, default: str = "Unknown") -> str:
+    text = (value or "").strip() if isinstance(value, str) else str(value or "").strip()
+    return text or default
+
+
+def dev_trait_raw_value(raw_value, existing_label: Optional[str] = None) -> int:
+    if existing_label:
+        normalized = existing_label.strip().lower()
+        for key, label in DEV_TRAIT_LABELS.items():
+            if label.lower() == normalized:
+                return key
+    try:
+        return int(raw_value or 0)
+    except Exception:
+        return 0
+
+
+def dev_trait_to_label(raw_value, existing_label: Optional[str] = None) -> str:
+    if existing_label:
+        return existing_label
+    raw = dev_trait_raw_value(raw_value)
+    return DEV_TRAIT_LABELS.get(raw, f"Trait {raw}")
+
+
+def dev_trait_badge(raw_value, existing_label: Optional[str] = None) -> str:
+    raw = dev_trait_raw_value(raw_value, existing_label)
+    label = dev_trait_to_label(raw, existing_label)
+    emoji = DEV_TRAIT_EMOJIS.get(raw, "❔")
+    return f"{emoji} {label}"
+
+
+def dev_trait_color(raw_value, existing_label: Optional[str] = None) -> int:
+    raw = dev_trait_raw_value(raw_value, existing_label)
+    return DEV_TRAIT_COLORS.get(raw, 0x5865F2)
+
+
+def format_height_inches(height_inches: Optional[int]) -> str:
+    try:
+        total = int(height_inches or 0)
+    except Exception:
+        return "Unknown"
+    if total <= 0:
+        return "Unknown"
+    feet = total // 12
+    inches = total % 12
+    return f"{feet}'{inches}\""
+
+
+def format_currency_compact(value) -> str:
+    try:
+        amount = int(value or 0)
+    except Exception:
+        return "0"
+    if abs(amount) >= 1_000_000:
+        return f"${amount / 1_000_000:.1f}M"
+    if abs(amount) >= 1_000:
+        return f"${amount / 1_000:.0f}K"
+    return f"${amount}"
+
+
+def fetch_all_team_rows() -> list[dict]:
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    team_id,
+                    team_name,
+                    conference_name,
+                    division_name,
+                    team_ovr
+                FROM teams
+                ORDER BY team_name ASC
+                """
+            )
+            return [record_to_dict(row) for row in cur.fetchall()]
+
+
+def resolve_team_row(team_name: str):
+    normalized_query = normalize_team_name(team_name)
+    if not normalized_query:
+        return None
+
+    teams = fetch_all_team_rows()
+    best_exact = None
+    best_contains = None
+    best_suffix = None
+
+    for team in teams:
+        team_display = safe_text(team.get("team_name"), "")
+        team_norm = normalize_team_name(team_display)
+        mascot = normalize_team_name(team_display.split()[-1]) if team_display else ""
+
+        if team_norm == normalized_query:
+            best_exact = team
+            break
+        if mascot == normalized_query and best_suffix is None:
+            best_suffix = team
+        if normalized_query in team_norm or team_norm in normalized_query:
+            if best_contains is None:
+                best_contains = team
+
+    return best_exact or best_suffix or best_contains
+
+
+def fetch_player_search_results(name: str, limit: int = 10) -> list[dict]:
+    wildcard = f"%{name.strip()}%"
+    exact_name = name.strip().lower()
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    p.*,
+                    t.team_name,
+                    t.conference_name,
+                    t.division_name,
+                    COALESCE(
+                        p.dev_trait_label,
+                        CASE COALESCE(p.dev_trait, 0)
+                            WHEN 0 THEN 'Normal'
+                            WHEN 1 THEN 'Star'
+                            WHEN 2 THEN 'Superstar'
+                            WHEN 3 THEN 'X-Factor'
+                            ELSE 'Unknown'
+                        END
+                    ) AS resolved_dev_trait_label
+                FROM players p
+                LEFT JOIN teams t ON t.team_id = p.team_id
+                WHERE p.full_name ILIKE %s
+                ORDER BY
+                    CASE
+                        WHEN LOWER(p.full_name) = %s THEN 0
+                        WHEN LOWER(p.last_name) = %s THEN 1
+                        WHEN LOWER(p.first_name) = %s THEN 2
+                        ELSE 3
+                    END,
+                    COALESCE(p.overall_rating, 0) DESC,
+                    p.full_name ASC
+                LIMIT %s
+                """,
+                (wildcard, exact_name, exact_name, exact_name, limit),
+            )
+            return [record_to_dict(row) for row in cur.fetchall()]
+
+
+def fetch_team_roster_rows(team_id: int) -> list[dict]:
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    p.*,
+                    t.team_name,
+                    COALESCE(
+                        p.dev_trait_label,
+                        CASE COALESCE(p.dev_trait, 0)
+                            WHEN 0 THEN 'Normal'
+                            WHEN 1 THEN 'Star'
+                            WHEN 2 THEN 'Superstar'
+                            WHEN 3 THEN 'X-Factor'
+                            ELSE 'Unknown'
+                        END
+                    ) AS resolved_dev_trait_label
+                FROM players p
+                LEFT JOIN teams t ON t.team_id = p.team_id
+                WHERE p.team_id = %s
+                ORDER BY
+                    COALESCE(p.overall_rating, 0) DESC,
+                    CASE WHEN p.position IS NULL THEN 999 ELSE COALESCE(%s::jsonb ->> p.position, '999')::int END,
+                    p.full_name ASC
+                """,
+                (team_id, json.dumps(POSITION_SORT_ORDER)),
+            )
+            return [record_to_dict(row) for row in cur.fetchall()]
+
+
+def build_player_embed(row: dict) -> discord.Embed:
+    team_name = safe_text(row.get("team_name"), "Free Agent")
+    dev_label = dev_trait_to_label(row.get("dev_trait"), row.get("resolved_dev_trait_label") or row.get("dev_trait_label"))
+    position = safe_text(row.get("position"))
+    jersey = safe_int(row.get("jersey_num"))
+    title_name = safe_text(row.get("full_name"))
+    title = f"🏈 {title_name}"
+    if jersey:
+        title += f" #{jersey}"
+
+    embed = build_embed(
+        title,
+        f"**{position}** • **{team_name}** • **{safe_int(row.get('overall_rating'))} OVR** • **{dev_label}**",
+        0x5865F2,
+    )
+    embed.add_field(
+        name="Profile",
+        value=(
+            f"Age: {safe_int(row.get('age'))}\n"
+            f"Years Pro: {safe_int(row.get('years_pro'))}\n"
+            f"Height / Weight: {format_height_inches(row.get('height'))} / {safe_int(row.get('weight'))} lbs\n"
+            f"College: {safe_text(row.get('college'))}"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Key Ratings",
+        value=(
+            f"Speed: {safe_int(row.get('speed_rating'))}\n"
+            f"Awareness: {safe_int(row.get('awareness_rating'))}\n"
+            f"Catch: {safe_int(row.get('catch_rating'))}\n"
+            f"Break Tackle: {safe_int(row.get('break_tackle_rating'))}\n"
+            f"Throw Power: {safe_int(row.get('throw_power_rating'))}"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Contract",
+        value=(
+            f"Years Left: {safe_int(row.get('contract_years_left'))}\n"
+            f"Salary: {format_currency_compact(row.get('contract_salary'))}\n"
+            f"Best OVR: {safe_int(row.get('player_best_ovr'))}\n"
+            f"Rookie Year: {safe_int(row.get('rookie_year'))}"
+        ),
+        inline=False,
+    )
+    abilities = safe_text(row.get("signature_abilities"), "")
+    if abilities:
+        embed.add_field(name="Abilities", value=abilities, inline=False)
+    return embed
+
+
+def build_roster_embed(team_row: dict, roster_rows: list[dict], page: int) -> discord.Embed:
+    total_players = len(roster_rows)
+    total_pages = max(1, (total_players + ROSTER_PAGE_SIZE - 1) // ROSTER_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * ROSTER_PAGE_SIZE
+    end = start + ROSTER_PAGE_SIZE
+    chunk = roster_rows[start:end]
+
+    if not chunk:
+        description = "No players found for this roster."
+    else:
+        lines = []
+        for idx, row in enumerate(chunk, start=start + 1):
+            dev_label = dev_trait_to_label(row.get("dev_trait"), row.get("resolved_dev_trait_label") or row.get("dev_trait_label"))
+            lines.append(
+                f"**{idx}.** {safe_text(row.get('full_name'))} — {safe_text(row.get('position'))} | "
+                f"{safe_int(row.get('overall_rating'))} OVR | {dev_label}"
+            )
+        description = "\n".join(lines)
+
+    record_bits = []
+    if team_row.get("wins") is not None:
+        record_bits.append(wins_losses_ties_text(team_row))
+    if team_row.get("team_ovr") is not None:
+        record_bits.append(f"{safe_int(team_row.get('team_ovr'))} OVR")
+    subtitle = " • ".join(record_bits) if record_bits else "Team roster"
+
+    embed = build_embed(
+        f"📋 {safe_text(team_row.get('team_name'))} Roster",
+        description,
+        0x57F287,
+    )
+    embed.add_field(
+        name="Team Snapshot",
+        value=(
+            f"{subtitle}\n"
+            f"{safe_text(team_row.get('conference_name'))} / {safe_text(team_row.get('division_name'))}\n"
+            f"Players: {total_players}"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"Page {page}/{total_pages} • 12 players per page")
+    return embed
+
+
 def fetch_team_standing(team_id: int):
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
@@ -2407,6 +2925,7 @@ async def post_weekly_news_article(
     games,
     gotw_game_ids: set[int],
     fallback_channel: Optional[discord.TextChannel] = None,
+    stage_index: Optional[int] = None,
 ):
     target_channel = await resolve_news_channel(guild, fallback_channel)
     if target_channel is None:
@@ -2416,8 +2935,9 @@ async def post_weekly_news_article(
     article_text, used_ai = await generate_weekly_news_text(week, games, gotw_game_ids)
     spotlight_items = build_weekly_news_spotlights(facts)
 
+    title_prefix = f"{stage_week_label(stage_index, week)} — " if stage_index is not None else ""
     embed = discord.Embed(
-        title=f"📰 {build_weekly_news_headline(facts)}",
+        title=f"📰 {title_prefix}{build_weekly_news_headline(facts)}",
         description=article_text,
         color=0x1ABC9C,
     )
@@ -2429,16 +2949,27 @@ async def post_weekly_news_article(
     return target_channel, used_ai
 
 
-@bot.tree.command(name="create_week_channels", description="Admin: create one matchup channel per game for a week.")
+@bot.tree.command(name="create_week_channels", description="Admin: create one matchup channel per game for a human week number.")
 @admin_only()
 @app_commands.describe(
-    week="Week number from the games table",
+    week="Human week number (Week 1, Week 2, etc.)",
+    phase="Optional phase override. Leave empty to auto-detect the current phase.",
     category_name="Optional category name to create/use",
     auto_news="Optional override for posting the weekly news article",
 )
+@app_commands.choices(phase=[
+    app_commands.Choice(name="Auto Detect", value="auto"),
+    app_commands.Choice(name="Preseason", value="preseason"),
+    app_commands.Choice(name="Regular Season", value="regular"),
+    app_commands.Choice(name="Wild Card", value="wild card"),
+    app_commands.Choice(name="Divisional", value="divisional"),
+    app_commands.Choice(name="Conference Championship", value="conference championship"),
+    app_commands.Choice(name="Super Bowl", value="super bowl"),
+])
 async def create_week_channels(
     interaction: discord.Interaction,
     week: int,
+    phase: Optional[str] = None,
     category_name: Optional[str] = None,
     auto_news: Optional[bool] = None,
 ):
@@ -2448,18 +2979,24 @@ async def create_week_channels(
 
     await interaction.response.defer(ephemeral=True)
 
+    if week < 1:
+        await interaction.followup.send("Enter the real human week number, starting at 1.", ephemeral=True)
+        return
+
     try:
-        games = fetch_games_for_week(week)
+        stage_index = resolve_command_stage(phase)
+        games = fetch_games_for_stage_week(stage_index, week)
     except Exception as exc:
-        await interaction.followup.send(f"Failed to load games for week {week}: {exc}", ephemeral=True)
+        await interaction.followup.send(f"Failed to load games for {stage_display_name(stage_index) if 'stage_index' in locals() else 'the selected phase'} week {week}: {exc}", ephemeral=True)
         return
 
     if not games:
-        await interaction.followup.send(f"No games found for week {week}.", ephemeral=True)
+        await interaction.followup.send(f"No games found for {stage_week_label(stage_index, week)}.", ephemeral=True)
         return
 
     guild = interaction.guild
-    category_title = category_name or f"Week {week} Games"
+    week_label = stage_week_label(stage_index, week)
+    category_title = category_name or f"{week_label} Games"
 
     existing_category = discord.utils.get(guild.categories, name=category_title)
     if existing_category is None:
@@ -2475,15 +3012,15 @@ async def create_week_channels(
 
     for game in games:
         game_id = game["game_id"]
-        game_week = game["week"]
-        stage_index = game["stage_index"]
+        game_week = int(game.get("display_week", week))
+        game_stage_index = int(game["stage_index"])
         status = game["status"]
         away_team_name = game["away_team_name"]
         home_team_name = game["home_team_name"]
 
         is_gotw = game_id in gotw_game_ids
 
-        base_name = f"wk{game_week}-{slugify_channel_name(away_team_name)}-vs-{slugify_channel_name(home_team_name)}"
+        base_name = f"{stage_channel_prefix(game_stage_index)}{game_week}-{slugify_channel_name(away_team_name)}-vs-{slugify_channel_name(home_team_name)}"
         channel_name = f"gotw-{base_name}" if is_gotw else base_name
         channel_name = channel_name[:100]
 
@@ -2498,7 +3035,10 @@ async def create_week_channels(
         channel = await guild.create_text_channel(
             name=channel_name,
             category=existing_category,
-            topic=f"Game ID {game_id} | Week {game_week} | Stage {stage_index} | Status {status}",
+            topic=(
+                f"Game ID {game_id} | Display Week {game_week} | Raw Week {game['week']} | "
+                f"Stage {stage_display_name(game_stage_index)} ({game_stage_index}) | Status {status}"
+            ),
         )
 
         mention_parts = []
@@ -2513,16 +3053,12 @@ async def create_week_channels(
             mention_parts.append(f"**{home_team_name}** (no Discord match found)")
 
         message_lines = []
-
         if is_gotw:
-            message_lines.extend([
-                "🔥 **GAME OF THE WEEK** 🔥",
-                "",
-            ])
+            message_lines.extend(["🔥 **GAME OF THE WEEK** 🔥", ""])
             gotw_created.append(channel_name)
 
         message_lines.extend([
-            f"🏈 **Week {game_week} Matchup**",
+            f"🏈 **{stage_week_label(game_stage_index, game_week)} Matchup**",
             f"**Away:** {away_team_name}",
             f"**Home:** {home_team_name}",
             "",
@@ -2534,86 +3070,68 @@ async def create_week_channels(
         await channel.send("\n".join(message_lines))
 
         if AUTO_POST_MATCHUP_PREVIEWS:
-            facts = build_matchup_facts(game, is_gotw)
-            facts["headline"] = build_matchup_headline(facts)
-            facts["players_to_watch"] = build_matchup_players_to_watch(facts)
-            facts["stakes_line"] = build_matchup_stakes_line(facts)
-            preview_text, used_ai = await generate_matchup_preview_text(game, is_gotw)
-            preview_embed = discord.Embed(
-                title=f"📰 {facts['headline']}",
-                description=preview_text,
-                color=0x3498DB if not is_gotw else 0xF39C12,
-            )
-            if facts["players_to_watch"]:
-                preview_embed.add_field(name="Players to Watch", value="\n".join(f"• {item}" for item in facts["players_to_watch"]), inline=False)
-            preview_embed.add_field(name="Why It Matters", value=facts["stakes_line"], inline=False)
-            preview_embed.set_footer(text="AI-assisted preview" if used_ai else "Template preview")
-            await channel.send(embed=preview_embed)
+            try:
+                preview_text, used_ai = await generate_matchup_preview_text(game, is_gotw)
+                facts = build_matchup_facts(game, is_gotw)
+                embed = discord.Embed(
+                    title=f"📰 {facts['headline']}",
+                    description=preview_text,
+                    color=0x3498DB if not is_gotw else 0xF39C12,
+                )
+                if facts["players_to_watch"]:
+                    embed.add_field(name="Players to Watch", value="\n".join(f"• {item}" for item in facts["players_to_watch"]), inline=False)
+                embed.add_field(name="Why It Matters", value=facts["stakes_line"], inline=False)
+                embed.set_footer(text="AI-assisted preview" if used_ai else "Template preview")
+                await channel.send(embed=embed)
+            except Exception as exc:
+                await channel.send(f"Pregame preview failed to generate: {exc}")
 
         created_channels.append(channel_name)
 
-
-    weekly_news_posted = False
-    weekly_news_mode = "disabled"
     should_post_news = AUTO_POST_WEEKLY_NEWS if auto_news is None else auto_news
     if should_post_news:
-        fallback_news_channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
         try:
-            posted_channel, used_ai = await post_weekly_news_article(
+            await post_weekly_news_article(
                 guild,
                 week,
                 games,
                 gotw_game_ids,
-                fallback_channel=fallback_news_channel,
+                stage_index=stage_index,
             )
-            if posted_channel is not None:
-                weekly_news_posted = True
-                weekly_news_mode = "ai" if used_ai else "template"
-            else:
-                weekly_news_mode = "no-channel"
         except Exception as exc:
-            print(f"Weekly news post failed for week {week}: {exc}")
-            weekly_news_mode = "failed"
+            print(f"Weekly news auto-post failed for {week_label}: {exc}")
 
-    summary_lines = [
-        f"Created **{len(created_channels)}** channel(s) for week **{week}** in **{category_title}**.",
-        f"Selected **{len(gotw_created)}** Game(s) of the Week.",
-    ]
-
-    if gotw_created:
-        summary_lines.append("")
-        summary_lines.append("GOTW:")
-        summary_lines.extend(f"- {name}" for name in gotw_created)
-
+    summary_lines = [f"Created {len(created_channels)} channel(s) in **{category_title}** for **{week_label}**."]
+    if created_channels:
+        summary_lines.append("Created:\n" + "\n".join(f"• {name}" for name in created_channels[:20]))
     if skipped_channels:
-        summary_lines.append("")
-        summary_lines.append("Skipped:")
-        summary_lines.extend(f"- {name}" for name in skipped_channels[:20])
+        summary_lines.append("Skipped:\n" + "\n".join(f"• {name}" for name in skipped_channels[:20]))
+    if gotw_created:
+        summary_lines.append("GOTW:\n" + "\n".join(f"• {name}" for name in gotw_created))
 
-    summary_lines.append("")
-    summary_lines.append(
-        f"Weekly news: {'posted' if weekly_news_posted else 'not posted'} ({weekly_news_mode})."
-    )
-
-    await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
-
-    await send_log_message(
-        f"📅 SCHEDULE: {interaction.user.mention} created week {week} matchup channels. "
-        f"Created: {len(created_channels)} | GOTW: {len(gotw_created)} | Skipped: {len(skipped_channels)}"
-    )
-
-
+    await interaction.followup.send("\n\n".join(summary_lines), ephemeral=True)
 
 
 @bot.tree.command(name="post_weekly_news", description="Admin: post the main weekly league news article.")
 @admin_only()
 @app_commands.describe(
-    week="Week number from the games table",
+    week="Human week number (Week 1, Week 2, etc.)",
+    phase="Optional phase override. Leave empty to auto-detect the current phase.",
     channel="Optional channel to post in. Defaults to NEWS_CHANNEL_ID or current channel.",
 )
+@app_commands.choices(phase=[
+    app_commands.Choice(name="Auto Detect", value="auto"),
+    app_commands.Choice(name="Preseason", value="preseason"),
+    app_commands.Choice(name="Regular Season", value="regular"),
+    app_commands.Choice(name="Wild Card", value="wild card"),
+    app_commands.Choice(name="Divisional", value="divisional"),
+    app_commands.Choice(name="Conference Championship", value="conference championship"),
+    app_commands.Choice(name="Super Bowl", value="super bowl"),
+])
 async def post_weekly_news(
     interaction: discord.Interaction,
     week: int,
+    phase: Optional[str] = None,
     channel: Optional[discord.TextChannel] = None,
 ):
     if interaction.guild is None:
@@ -2622,14 +3140,19 @@ async def post_weekly_news(
 
     await interaction.response.defer(ephemeral=True)
 
+    if week < 1:
+        await interaction.followup.send("Enter the real human week number, starting at 1.", ephemeral=True)
+        return
+
     try:
-        games = fetch_games_for_week(week)
+        stage_index = resolve_command_stage(phase)
+        games = fetch_games_for_stage_week(stage_index, week)
     except Exception as exc:
-        await interaction.followup.send(f"Failed to load games for week {week}: {exc}", ephemeral=True)
+        await interaction.followup.send(f"Failed to load games for {stage_display_name(stage_index) if 'stage_index' in locals() else 'the selected phase'} week {week}: {exc}", ephemeral=True)
         return
 
     if not games:
-        await interaction.followup.send(f"No games found for week {week}.", ephemeral=True)
+        await interaction.followup.send(f"No games found for {stage_week_label(stage_index, week)}.", ephemeral=True)
         return
 
     scored_games = [(game, compute_matchup_score(game)) for game in games]
@@ -2643,6 +3166,7 @@ async def post_weekly_news(
             games,
             gotw_game_ids,
             fallback_channel=channel or (interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None),
+            stage_index=stage_index,
         )
     except Exception as exc:
         await interaction.followup.send(f"Failed to post weekly news: {exc}", ephemeral=True)
@@ -2656,23 +3180,38 @@ async def post_weekly_news(
         return
 
     await interaction.followup.send(
-        f"Posted weekly news in {posted_channel.mention} ({'AI' if used_ai else 'template'} mode).",
+        f"Posted {stage_week_label(stage_index, week)} news in {posted_channel.mention} ({'AI' if used_ai else 'template'} mode).",
         ephemeral=True,
     )
     await send_log_message(
-        f"📰 NEWS: {interaction.user.mention} posted week {week} league news in {posted_channel.mention} "
+        f"📰 NEWS: {interaction.user.mention} posted {stage_week_label(stage_index, week)} league news in {posted_channel.mention} "
         f"using {'AI' if used_ai else 'template'} mode."
     )
 
 
 @bot.tree.command(name="preview_matchup_article", description="Admin: post one matchup preview article in the current channel.")
 @admin_only()
-@app_commands.describe(week="Week number", away_team="Away team name", home_team="Home team name")
+@app_commands.describe(
+    week="Human week number",
+    phase="Optional phase override. Leave empty to auto-detect the current phase.",
+    away_team="Away team name",
+    home_team="Home team name",
+)
+@app_commands.choices(phase=[
+    app_commands.Choice(name="Auto Detect", value="auto"),
+    app_commands.Choice(name="Preseason", value="preseason"),
+    app_commands.Choice(name="Regular Season", value="regular"),
+    app_commands.Choice(name="Wild Card", value="wild card"),
+    app_commands.Choice(name="Divisional", value="divisional"),
+    app_commands.Choice(name="Conference Championship", value="conference championship"),
+    app_commands.Choice(name="Super Bowl", value="super bowl"),
+])
 async def preview_matchup_article(
     interaction: discord.Interaction,
     week: int,
-    away_team: str,
-    home_team: str,
+    phase: Optional[str] = None,
+    away_team: str = "",
+    home_team: str = "",
 ):
     if interaction.guild is None:
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
@@ -2680,10 +3219,15 @@ async def preview_matchup_article(
 
     await interaction.response.defer(ephemeral=True)
 
+    if week < 1:
+        await interaction.followup.send("Enter the real human week number, starting at 1.", ephemeral=True)
+        return
+
     try:
-        games = fetch_games_for_week(week)
+        stage_index = resolve_command_stage(phase)
+        games = fetch_games_for_stage_week(stage_index, week)
     except Exception as exc:
-        await interaction.followup.send(f"Failed to load games for week {week}: {exc}", ephemeral=True)
+        await interaction.followup.send(f"Failed to load games for {stage_display_name(stage_index) if 'stage_index' in locals() else 'the selected phase'} week {week}: {exc}", ephemeral=True)
         return
 
     normalized_away = normalize_team_name(away_team)
@@ -2696,7 +3240,7 @@ async def preview_matchup_article(
             break
 
     if selected_game is None:
-        await interaction.followup.send("That matchup was not found for the requested week.", ephemeral=True)
+        await interaction.followup.send("That matchup was not found for the requested phase/week.", ephemeral=True)
         return
 
     scored_games = [(game, compute_matchup_score(game)) for game in games]
@@ -2705,9 +3249,6 @@ async def preview_matchup_article(
     is_gotw = selected_game["game_id"] in gotw_game_ids
 
     facts = build_matchup_facts(selected_game, is_gotw)
-    facts["headline"] = build_matchup_headline(facts)
-    facts["players_to_watch"] = build_matchup_players_to_watch(facts)
-    facts["stakes_line"] = build_matchup_stakes_line(facts)
     preview_text, used_ai = await generate_matchup_preview_text(selected_game, is_gotw)
     embed = discord.Embed(
         title=f"📰 {facts['headline']}",
@@ -2727,27 +3268,53 @@ async def preview_matchup_article(
 @bot.tree.command(name="regenerate_weekly_news", description="Admin: regenerate and repost the weekly league news article.")
 @admin_only()
 @app_commands.describe(
-    week="Week number from the games table",
+    week="Human week number",
+    phase="Optional phase override. Leave empty to auto-detect the current phase.",
     channel="Optional channel to post in. Defaults to NEWS_CHANNEL_ID or current channel.",
 )
+@app_commands.choices(phase=[
+    app_commands.Choice(name="Auto Detect", value="auto"),
+    app_commands.Choice(name="Preseason", value="preseason"),
+    app_commands.Choice(name="Regular Season", value="regular"),
+    app_commands.Choice(name="Wild Card", value="wild card"),
+    app_commands.Choice(name="Divisional", value="divisional"),
+    app_commands.Choice(name="Conference Championship", value="conference championship"),
+    app_commands.Choice(name="Super Bowl", value="super bowl"),
+])
 async def regenerate_weekly_news(
     interaction: discord.Interaction,
     week: int,
+    phase: Optional[str] = None,
     channel: Optional[discord.TextChannel] = None,
 ):
-    await post_weekly_news.callback(interaction, week, channel)  # type: ignore[attr-defined]
+    await post_weekly_news.callback(interaction, week, phase, channel)  # type: ignore[attr-defined]
 
 
 @bot.tree.command(name="regenerate_matchup_article", description="Admin: regenerate and repost one matchup preview article in the current channel.")
 @admin_only()
-@app_commands.describe(week="Week number", away_team="Away team name", home_team="Home team name")
+@app_commands.describe(
+    week="Human week number",
+    phase="Optional phase override. Leave empty to auto-detect the current phase.",
+    away_team="Away team name",
+    home_team="Home team name",
+)
+@app_commands.choices(phase=[
+    app_commands.Choice(name="Auto Detect", value="auto"),
+    app_commands.Choice(name="Preseason", value="preseason"),
+    app_commands.Choice(name="Regular Season", value="regular"),
+    app_commands.Choice(name="Wild Card", value="wild card"),
+    app_commands.Choice(name="Divisional", value="divisional"),
+    app_commands.Choice(name="Conference Championship", value="conference championship"),
+    app_commands.Choice(name="Super Bowl", value="super bowl"),
+])
 async def regenerate_matchup_article(
     interaction: discord.Interaction,
     week: int,
-    away_team: str,
-    home_team: str,
+    phase: Optional[str] = None,
+    away_team: str = "",
+    home_team: str = "",
 ):
-    await preview_matchup_article.callback(interaction, week, away_team, home_team)  # type: ignore[attr-defined]
+    await preview_matchup_article.callback(interaction, week, phase, away_team, home_team)  # type: ignore[attr-defined]
 
 
 @bot.tree.command(name="post_season_leaders", description="Admin: post current season stat leaders.")
@@ -3010,7 +3577,7 @@ def build_matchup_facts(game_row, is_gotw: bool) -> dict:
     away_leaders = fetch_team_stat_leaders(game_row["away_team_id"])
     home_leaders = fetch_team_stat_leaders(game_row["home_team_id"])
     matchup_score = round(compute_matchup_score(game_row), 2)
-    week = safe_int(game_row.get("week"))
+    week = safe_int(game_row.get("display_week", safe_int(game_row.get("week")) + 1))
     base_seed = f"wk{week}-game{safe_int(game_row.get('game_id'))}-{away_team['team_name']}-{home_team['team_name']}"
     angle = _pick_low_repeat(MATCHUP_ANGLE_POOL, _WEEKLY_ARTICLE_MEMORY["matchup_angles"][week], base_seed + "-angle")
     structure = _pick_low_repeat(MATCHUP_STRUCTURE_POOL, _WEEKLY_ARTICLE_MEMORY["matchup_structures"][week], base_seed + "-structure")
