@@ -2817,6 +2817,544 @@ async def post_season_leaders(
     )
 
 
+
+# =========================================================
+# Low-repetition article system overrides
+# =========================================================
+import hashlib
+from collections import defaultdict
+
+MATCHUP_ANGLE_POOL = [
+    "statement game", "upset alert", "playoff leverage", "division pressure", "contender check",
+    "pretender check", "star quarterback spotlight", "ground war", "defensive rock fight", "tempo clash",
+    "pass game stress test", "red-zone pressure", "turnover tax", "trench war", "home-field squeeze",
+    "road-test spotlight", "prove-it night", "heavyweight collision", "sleeping giant watch", "seeding collision",
+    "chaos candidate", "fraud watch", "spotlight burden", "clock-control fight", "big-play hunt",
+    "third-down stress", "finishing-drive battle", "defensive answer game", "offensive rebound spot", "bounce-back frame",
+    "discipline test", "talent-gap question", "identity game", "edge-rusher spotlight", "playmaker showcase",
+    "quarterback composure test", "must-answer matchup", "style contrast", "momentum swing game", "tone-setter",
+    "measuring-stick game", "pressure cooker", "statement defense", "late-season energy", "spoiler angle",
+]
+
+MATCHUP_STRUCTURE_POOL = [
+    "stakes-led bulletin", "player-spotlight open", "stat-punch opener", "tension-and-pressure build",
+    "contrast of strengths", "why-it-matters first", "power-ranking style", "broadcast tease format",
+    "warning-shot lead", "featured matchup desk hit", "fast-hitting four-pack", "narrative-first frame",
+    "seed-race frame", "coaching-chess-match frame", "x-factor first", "what-breaks-first frame",
+    "topline-and-subplot", "question-driven lead", "drama-heavy setup", "clean analytic setup",
+    "defense-first setup", "offense-first setup", "sleeper-game frame", "headline-with-turn frame",
+    "contender-meter frame", "separate-the-teams frame", "control-the-script frame", "pressure-point frame",
+    "pace-of-game frame", "possession-battle frame", "finishing-kick frame", "one-edge-decides frame",
+    "spotlight-vs-substance frame", "margin-for-error frame", "explosiveness frame", "physicality frame",
+    "risk-reward frame", "keep-up-or-get-buried frame", "tilt-the-race frame", "who-blinks-first frame",
+    "featured-sidestory frame", "trust-factor frame", "ceiling-vs-floor frame", "strength-on-strength frame",
+    "identity-check frame",
+]
+
+NEWS_ANGLE_POOL = [
+    "power vacuum", "top-tier separation", "conference squeeze", "awards-race heat", "headline week",
+    "playoff map shift", "division chaos", "middle-class traffic", "surprise-rise", "fraud exposure",
+    "statement-week setup", "defense grabs headlines", "offense driving the season", "seeding pressure",
+    "must-keep-pace week", "mvp conversation reset", "tightening race", "contender sorting", "upset radar",
+    "big-game gravity", "late-season urgency", "ranking shuffle", "tier-break week", "control-of-the-room",
+    "chaos watch", "favorite-under-fire", "identity week", "passing-race spotlight", "ground-game spotlight",
+    "defensive playmaker surge", "scoreboard pressure", "top-dog scrutiny", "shadow contenders", "one-week swing",
+    "league pecking order", "trap-door week", "credibility week", "heavyweight traffic", "season temperature rise",
+    "narrative reset", "margin-for-error evaporates", "who-runs-the-league", "power check", "pressure migration",
+    "attention shift",
+]
+
+NEWS_STRUCTURE_POOL = [
+    "headline thesis plus three pivots", "top-down sportsdesk open", "five-storyline stack", "league pulse frame",
+    "power-race then stat-race", "headline game anchor", "contenders-and-chasers frame", "awards-desk frame",
+    "pressure-map frame", "what-changed-this-week frame", "market-watch frame", "temperature-check frame",
+    "if-the-season-ended-today frame", "who-has-the-leverage frame", "biggest-movers frame", "spotlight-carousel frame",
+    "conversation-shifter frame", "from-the-top-down frame", "who-owns-the-week frame", "narrative-reset frame",
+    "danger-list frame", "statement-board frame", "headline-and-undercard frame", "tier-report frame",
+    "table-setter frame", "lead-story plus side quests", "power-lens frame", "awards-lens frame",
+    "schedule-pressure frame", "separation-sunday frame", "one-room-one-story frame", "this-week-in-control frame",
+    "what-everyone-is-watching frame", "high-ground frame", "traffic-jam frame", "center-of-gravity frame",
+    "who-can-breathe frame", "topline-plus-ripple-effects frame", "watch-list frame", "credibility-board frame",
+    "power-balance frame", "chaos-index frame", "spotlight-desk frame", "biggest-questions frame", "season-axis frame",
+]
+
+AVOID_PHRASES = [
+    "both teams come in", "all eyes will be on", "this one has all the makings", "it will be interesting to see",
+    "with momentum on the line", "this game could say a lot", "will look to", "could go a long way",
+    "only time will tell", "set the tone", "battle-tested", "lights get brighter", "must-see matchup",
+    "the pressure is on", "one thing is clear", "on paper", "plenty at stake", "circle this one",
+]
+
+_WEEKLY_ARTICLE_MEMORY = {
+    "matchup_angles": defaultdict(lambda: defaultdict(int)),
+    "matchup_structures": defaultdict(lambda: defaultdict(int)),
+    "news_angles": defaultdict(lambda: defaultdict(int)),
+    "news_structures": defaultdict(lambda: defaultdict(int)),
+}
+
+
+def _stable_hash(value: str) -> int:
+    return int(hashlib.sha256(value.encode("utf-8")).hexdigest(), 16)
+
+
+def _pick_low_repeat(pool, counter_map, seed: str):
+    counts = counter_map
+    min_count = min(counts.get(item, 0) for item in pool)
+    candidates = [item for item in pool if counts.get(item, 0) == min_count]
+    idx = _stable_hash(seed) % len(candidates)
+    choice = candidates[idx]
+    counts[choice] += 1
+    return choice
+
+
+def _top_story(row, label):
+    if not row:
+        return ""
+    if "total_pass_yds" in row:
+        return f"{label} passing pace runs through {row['player_name']} with {safe_int(row.get('total_pass_yds'))} yards"
+    if "total_rush_yds" in row:
+        return f"{label} ground production leans on {row['player_name']} with {safe_int(row.get('total_rush_yds'))} yards"
+    if "total_sacks" in row:
+        return f"{label} pressure starts with {row['player_name']} and {safe_int(row.get('total_sacks'))} sacks"
+    if "total_ints" in row:
+        return f"{label} ball production features {row['player_name']} with {safe_int(row.get('total_ints'))} picks"
+    return ""
+
+
+def _team_trait(team: dict) -> str:
+    pf = safe_int(team.get("pts_for"))
+    pa = safe_int(team.get("pts_against"))
+    to = safe_int(team.get("turnover_diff"))
+    win_pct = float(team.get("win_pct") or 0)
+    ovr = safe_int(team.get("team_ovr"))
+    lines = []
+    if pf >= 150:
+        lines.append("puts points on the board fast")
+    if pa and pa <= 110:
+        lines.append("has kept scoring windows tight")
+    if to >= 5:
+        lines.append("has lived off extra possessions")
+    if to <= -5:
+        lines.append("has been flirting with giveaway trouble")
+    if win_pct >= 0.75:
+        lines.append("has been operating like a front-line contender")
+    if ovr >= 88:
+        lines.append("has top-end roster talent")
+    if not lines:
+        lines.append("has been searching for cleaner weekly control")
+    return deterministic_choice(lines, f"trait-{team.get('team_name','team')}-{pf}-{pa}-{to}-{ovr}")
+
+
+def _structured_matchup_components(facts: dict):
+    away = facts["away_team"]
+    home = facts["home_team"]
+    week = facts["week"]
+    a_name = away["team_name"]
+    h_name = home["team_name"]
+    away_record = wins_losses_ties_text(away)
+    home_record = wins_losses_ties_text(home)
+    a_trait = _team_trait(away)
+    h_trait = _team_trait(home)
+    away_star = _top_story(facts["away_leaders"].get("passing") or facts["away_leaders"].get("rushing") or facts["away_leaders"].get("defense"), a_name)
+    home_star = _top_story(facts["home_leaders"].get("passing") or facts["home_leaders"].get("rushing") or facts["home_leaders"].get("defense"), h_name)
+    stakes = build_matchup_stakes_line(facts)
+    top_story = deterministic_choice([x for x in [away_star, home_star, facts.get("away_storyline"), facts.get("home_storyline")] if x], f"top-story-{week}-{facts['game_id']}")
+    score_gap = abs(safe_int(away.get("pts_for")) - safe_int(home.get("pts_for")))
+    turnover_gap = abs(safe_int(away.get("turnover_diff")) - safe_int(home.get("turnover_diff")))
+    return {
+        "hook_a": f"Week {week} throws {a_name} ({away_record}) into a high-attention spot against {h_name} ({home_record}).",
+        "hook_b": f"There is nothing quiet about {a_name} at {h_name} in Week {week}, especially with both sides carrying different kinds of pressure.",
+        "hook_c": f"{a_name} and {h_name} land on the Week {week} board as a game that can move league opinion in a hurry.",
+        "trait_a": f"{a_name} {a_trait}.",
+        "trait_b": f"{h_name} {h_trait}.",
+        "star": (top_story + ".") if top_story else f"The player layer is worth watching because one explosive performance could swing the whole script.",
+        "metric": deterministic_choice([
+            f"The scoring profiles are separated by just {score_gap} points, which makes execution late in drives feel huge.",
+            f"Turnover margin could be the hinge here, with a difference of {turnover_gap} between the two teams on the year.",
+            f"Roster strength is close enough that this game should be more about control than raw talent.",
+            f"The matchup score landed at {facts['matchup_score']}, and that tracks with how much heat this game carries into kickoff.",
+        ], f"metric-{week}-{facts['game_id']}-{facts['structure']}") ,
+        "stakes": stakes,
+        "close_a": f"That makes this less about surviving four quarters and more about which side can actually dictate the terms.",
+        "close_b": f"Whoever controls the cleaner version of this game probably walks out with a result that carries into next week’s conversation.",
+        "close_c": f"The winner gets more than a box-score bump here; the league reads these games as signals.",
+    }
+
+
+def build_matchup_angle(away_team, home_team, away_leaders, home_leaders, is_gotw: bool, matchup_score: float) -> str:
+    week_seed = f"wk{safe_int(away_team.get('wins'))}-{safe_int(home_team.get('wins'))}-{is_gotw}-{matchup_score}-{away_team.get('team_name')}-{home_team.get('team_name')}"
+    week_key = week_seed
+    pool = MATCHUP_ANGLE_POOL[:]
+    if is_gotw:
+        pool = ["heavyweight collision", "headline week", "statement game", "seeding collision", "spotlight burden"] + pool
+    return _pick_low_repeat(pool, _WEEKLY_ARTICLE_MEMORY["matchup_angles"][week_key], week_seed)
+
+
+def build_matchup_facts(game_row, is_gotw: bool) -> dict:
+    away_team = fetch_team_standing(game_row["away_team_id"]) or {
+        "team_name": game_row["away_team_name"],
+        "wins": game_row.get("away_wins", 0),
+        "losses": game_row.get("away_losses", 0),
+        "ties": game_row.get("away_ties", 0),
+        "win_pct": game_row.get("away_win_pct", 0),
+        "team_ovr": game_row.get("away_ovr", 0),
+    }
+    home_team = fetch_team_standing(game_row["home_team_id"]) or {
+        "team_name": game_row["home_team_name"],
+        "wins": game_row.get("home_wins", 0),
+        "losses": game_row.get("home_losses", 0),
+        "ties": game_row.get("home_ties", 0),
+        "win_pct": game_row.get("home_win_pct", 0),
+        "team_ovr": game_row.get("home_ovr", 0),
+    }
+    away_leaders = fetch_team_stat_leaders(game_row["away_team_id"])
+    home_leaders = fetch_team_stat_leaders(game_row["home_team_id"])
+    matchup_score = round(compute_matchup_score(game_row), 2)
+    week = safe_int(game_row.get("week"))
+    base_seed = f"wk{week}-game{safe_int(game_row.get('game_id'))}-{away_team['team_name']}-{home_team['team_name']}"
+    angle = _pick_low_repeat(MATCHUP_ANGLE_POOL, _WEEKLY_ARTICLE_MEMORY["matchup_angles"][week], base_seed + "-angle")
+    structure = _pick_low_repeat(MATCHUP_STRUCTURE_POOL, _WEEKLY_ARTICLE_MEMORY["matchup_structures"][week], base_seed + "-structure")
+    facts = {
+        "week": week,
+        "game_id": safe_int(game_row.get("game_id")),
+        "stage_index": safe_int(game_row.get("stage_index")),
+        "status": safe_int(game_row.get("status")),
+        "is_gotw": bool(is_gotw),
+        "matchup_score": matchup_score,
+        "angle": angle,
+        "structure": structure,
+        "away_team": away_team,
+        "home_team": home_team,
+        "away_storyline": build_team_storyline(away_team, away_leaders),
+        "home_storyline": build_team_storyline(home_team, home_leaders),
+        "away_leaders": away_leaders,
+        "home_leaders": home_leaders,
+        "players_to_watch": [],
+        "stakes_line": "",
+    }
+    facts["headline"] = build_matchup_headline(facts)
+    facts["players_to_watch"] = build_matchup_players_to_watch(facts)
+    facts["stakes_line"] = build_matchup_stakes_line(facts)
+    return facts
+
+
+def build_matchup_headline(facts: dict) -> str:
+    away = facts["away_team"]["team_name"]
+    home = facts["home_team"]["team_name"]
+    week = facts["week"]
+    angle = facts.get("angle", "statement game")
+    options = {
+        "statement game": [f"Week {week} puts {away} and {home} in a statement spot", f"{away} and {home} get a chance to move the room in Week {week}"],
+        "upset alert": [f"Week {week} carries upset energy with {away} at {home}", f"Can {away} flip the expected script against {home}?"],
+        "playoff leverage": [f"{away} at {home} carries real playoff leverage", f"Week {week} tightens around {away} vs {home}"],
+        "heavyweight collision": [f"Heavyweight collision: {away} at {home}", f"Week {week} headline fight lands on {away} vs {home}"],
+        "seeding collision": [f"{away} and {home} collide with seeding pressure attached", f"Seeding heat follows {away} into {home} this week"],
+    }
+    return deterministic_choice(options.get(angle, [f"Week {week} spotlight: {away} at {home}", f"{away} and {home} land in the Week {week} spotlight"]), f"headline-{week}-{facts['game_id']}-{angle}")
+
+
+def template_matchup_preview_text(facts: dict) -> str:
+    comp = _structured_matchup_components(facts)
+    structure = facts.get("structure", "stakes-led bulletin")
+    blocks = {
+        "stakes-led bulletin": [comp["hook_a"], comp["stakes"], comp["star"], comp["metric"], comp["close_b"]],
+        "player-spotlight open": [comp["star"], comp["hook_c"], comp["trait_a"], comp["trait_b"], comp["stakes"]],
+        "stat-punch opener": [comp["metric"], comp["hook_a"], comp["trait_a"], comp["star"], comp["stakes"]],
+        "tension-and-pressure build": [comp["hook_b"], comp["trait_a"], comp["trait_b"], comp["metric"], comp["close_a"]],
+        "contrast of strengths": [comp["trait_a"], comp["trait_b"], comp["hook_c"], comp["star"], comp["stakes"]],
+        "why-it-matters first": [comp["stakes"], comp["hook_a"], comp["metric"], comp["star"], comp["close_c"]],
+        "power-ranking style": [comp["hook_c"], comp["trait_a"], comp["trait_b"], comp["stakes"], comp["close_b"]],
+        "broadcast tease format": [comp["hook_a"], comp["star"], comp["metric"], comp["trait_b"], comp["close_a"]],
+        "warning-shot lead": [comp["hook_b"], comp["metric"], comp["star"], comp["trait_a"], comp["stakes"]],
+        "featured matchup desk hit": [comp["hook_c"], comp["trait_b"], comp["metric"], comp["star"], comp["close_c"]],
+        "fast-hitting four-pack": [comp["hook_a"], comp["trait_a"], comp["trait_b"], comp["stakes"]],
+        "narrative-first frame": [comp["hook_b"], comp["star"], comp["metric"], comp["close_b"]],
+        "seed-race frame": [comp["stakes"], comp["metric"], comp["hook_c"], comp["star"], comp["close_c"]],
+        "coaching-chess-match frame": [comp["hook_a"], comp["trait_a"], comp["metric"], comp["close_a"]],
+        "x-factor first": [comp["star"], comp["metric"], comp["hook_b"], comp["stakes"]],
+        "what-breaks-first frame": [comp["metric"], comp["trait_a"], comp["trait_b"], comp["close_b"]],
+        "topline-and-subplot": [comp["hook_c"], comp["metric"], comp["star"], comp["close_c"]],
+        "question-driven lead": [f"The Week {facts['week']} question is whether {facts['away_team']['team_name']} can drag this game into their preferred script against {facts['home_team']['team_name']}.", comp["trait_a"], comp["star"], comp["stakes"]],
+        "drama-heavy setup": [comp["hook_b"], comp["stakes"], comp["metric"], comp["close_a"]],
+        "clean analytic setup": [comp["metric"], comp["trait_a"], comp["trait_b"], comp["stakes"]],
+        "defense-first setup": [comp["trait_b"], comp["metric"], comp["hook_a"], comp["close_b"]],
+        "offense-first setup": [comp["trait_a"], comp["star"], comp["hook_c"], comp["stakes"]],
+        "sleeper-game frame": [comp["hook_c"], comp["metric"], comp["close_c"]],
+        "headline-with-turn frame": [comp["hook_a"], comp["metric"], comp["stakes"], comp["close_a"]],
+        "contender-meter frame": [comp["hook_b"], comp["trait_a"], comp["trait_b"], comp["close_c"]],
+        "separate-the-teams frame": [comp["metric"], comp["star"], comp["close_b"]],
+        "control-the-script frame": [comp["hook_c"], comp["trait_a"], comp["stakes"], comp["close_a"]],
+        "pressure-point frame": [comp["stakes"], comp["star"], comp["metric"], comp["close_b"]],
+        "pace-of-game frame": [comp["trait_a"], comp["metric"], comp["hook_a"], comp["close_c"]],
+        "possession-battle frame": [comp["metric"], comp["stakes"], comp["star"], comp["close_b"]],
+        "finishing-kick frame": [comp["hook_b"], comp["metric"], comp["close_a"]],
+        "one-edge-decides frame": [comp["star"], comp["metric"], comp["close_c"]],
+        "spotlight-vs-substance frame": [comp["hook_c"], comp["stakes"], comp["trait_b"], comp["close_b"]],
+        "margin-for-error frame": [comp["hook_a"], comp["metric"], comp["close_a"]],
+        "explosiveness frame": [comp["trait_a"], comp["star"], comp["close_b"]],
+        "physicality frame": [comp["trait_b"], comp["hook_b"], comp["metric"], comp["close_c"]],
+        "risk-reward frame": [comp["metric"], comp["hook_c"], comp["stakes"], comp["close_a"]],
+        "keep-up-or-get-buried frame": [comp["hook_b"], comp["trait_a"], comp["close_c"]],
+        "tilt-the-race frame": [comp["stakes"], comp["hook_a"], comp["close_b"]],
+        "who-blinks-first frame": [comp["hook_c"], comp["metric"], comp["close_a"]],
+        "featured-sidestory frame": [comp["star"], comp["hook_a"], comp["close_c"]],
+        "trust-factor frame": [comp["hook_b"], comp["trait_b"], comp["close_b"]],
+        "ceiling-vs-floor frame": [comp["metric"], comp["trait_a"], comp["close_c"]],
+        "strength-on-strength frame": [comp["trait_a"], comp["trait_b"], comp["star"], comp["stakes"]],
+        "identity-check frame": [comp["hook_a"], comp["trait_a"], comp["trait_b"], comp["close_a"]],
+    }
+    selected = blocks.get(structure, blocks["stakes-led bulletin"])
+    cleaned = []
+    used = set()
+    for line in selected:
+        line = line.strip()
+        low = line.lower()
+        if line and low not in used:
+            cleaned.append(line)
+            used.add(low)
+    return " ".join(cleaned[:5])
+
+
+def build_matchup_prompt(facts: dict) -> str:
+    return (
+        "You are writing one matchup preview for a Madden franchise Discord.\n"
+        "Hard rules:\n"
+        "- Write exactly 4 or 5 sentences.\n"
+        "- Use only the provided facts.\n"
+        "- Do not invent players, streaks, quotes, injuries, awards, or results.\n"
+        f"- The assigned narrative angle is: {facts['angle']}.\n"
+        f"- The assigned article structure is: {facts['structure']}.\n"
+        "- Make this preview feel sharply distinct from other previews in the same week.\n"
+        "- Do not reuse generic sports filler or symmetrical phrasing.\n"
+        f"- Avoid these phrases entirely: {', '.join(AVOID_PHRASES)}.\n"
+        "- Use a different opening style than a plain records recap unless the facts force it.\n"
+        "- End with a strong sentence about leverage, pressure, or why the game matters.\n\n"
+        f"Facts JSON:\n{json.dumps(facts, indent=2)}"
+    )
+
+
+def build_league_news_facts(week: int, games, gotw_game_ids: set[int]) -> dict:
+    standings = fetch_standings_rows()[:8]
+    passing = fetch_top_passing_leaders(6)
+    rushing = fetch_top_rushing_leaders(6)
+    sacks = fetch_top_sack_leaders(6)
+    interceptions = fetch_top_interception_leaders(6)
+    ranked_games = []
+    for game in games:
+        ranked_games.append({
+            "game_id": safe_int(game["game_id"]),
+            "away_team_name": game["away_team_name"],
+            "home_team_name": game["home_team_name"],
+            "matchup_score": round(compute_matchup_score(game), 2),
+            "is_gotw": safe_int(game["game_id"]) in gotw_game_ids,
+            "away_wins": safe_int(game.get("away_wins")),
+            "away_losses": safe_int(game.get("away_losses")),
+            "home_wins": safe_int(game.get("home_wins")),
+            "home_losses": safe_int(game.get("home_losses")),
+        })
+    ranked_games.sort(key=lambda row: row["matchup_score"], reverse=True)
+    seed = f"news-week-{week}-{len(games)}-{len(gotw_game_ids)}"
+    angle = _pick_low_repeat(NEWS_ANGLE_POOL, _WEEKLY_ARTICLE_MEMORY["news_angles"][week], seed + "-angle")
+    structure = _pick_low_repeat(NEWS_STRUCTURE_POOL, _WEEKLY_ARTICLE_MEMORY["news_structures"][week], seed + "-structure")
+    return {
+        "week": week,
+        "angle": angle,
+        "structure": structure,
+        "top_teams": standings[:6],
+        "passing_leaders": passing,
+        "rushing_leaders": rushing,
+        "sack_leaders": sacks,
+        "interception_leaders": interceptions,
+        "top_games": ranked_games[:6],
+        "game_count": len(games),
+    }
+
+
+def build_weekly_news_headline(facts: dict) -> str:
+    week = facts["week"]
+    angle = facts.get("angle", "power vacuum")
+    g = facts["top_games"][0] if facts["top_games"] else None
+    t = facts["top_teams"][0] if facts["top_teams"] else None
+    headlines = [
+        f"Week {week} pressure report: {angle.title()}",
+        f"Week {week} watchboard: {angle.title()}",
+        f"League pulse for Week {week}: {angle.title()}",
+    ]
+    if g:
+        headlines.extend([
+            f"Week {week} turns toward {g['away_team_name']} vs {g['home_team_name']}",
+            f"{g['away_team_name']} vs {g['home_team_name']} sits at the center of Week {week}",
+        ])
+    if t:
+        headlines.extend([
+            f"Week {week} opens with {t['team_name']} still shaping the table",
+            f"{t['team_name']} remain part of the Week {week} headline gravity",
+        ])
+    return deterministic_choice(headlines, f"news-headline-{week}-{angle}")
+
+
+def _news_components(facts: dict):
+    week = facts["week"]
+    teams = facts["top_teams"]
+    games = facts["top_games"]
+    lead = teams[0] if teams else None
+    second = teams[1] if len(teams) > 1 else None
+    top_game = games[0] if games else None
+    p = facts["passing_leaders"][0] if facts["passing_leaders"] else None
+    r = facts["rushing_leaders"][0] if facts["rushing_leaders"] else None
+    s = facts["sack_leaders"][0] if facts["sack_leaders"] else None
+    i = facts["interception_leaders"][0] if facts["interception_leaders"] else None
+    return {
+        "lead": f"Week {week} lands with the league starting to show its real pressure points.",
+        "topline": f"{lead['team_name']} sit first at {wins_losses_ties_text(lead)}." if lead else f"Week {week} arrives with the standings picture still under construction.",
+        "chase": f"{second['team_name']} are close enough at {wins_losses_ties_text(second)} to keep the race uncomfortable." if second else "The chase pack still has room to crash the picture.",
+        "game": f"The main game on the board is {top_game['away_team_name']} vs {top_game['home_team_name']}, and that matchup carries the loudest weekly gravity." if top_game else "There is no shortage of games this week that can shove the standings around.",
+        "pass": f"The passing race still has {p['player_name']} ({p['team_name']}) leading with {safe_int(p.get('total_pass_yds'))} yards." if p else "The passing race remains one of the easiest ways to track the league's power centers.",
+        "rush": f"On the ground, {r['player_name']} ({r['team_name']}) continue to push the pace with {safe_int(r.get('total_rush_yds'))} rushing yards." if r else "The ground game race still matters because a few teams are winning by controlling tempo.",
+        "defense": deterministic_choice([
+            f"Defensively, {s['player_name']} ({s['team_name']}) keep affecting pockets with {safe_int(s.get('total_sacks'))} sacks." if s else "Defensive disruption is shaping more games than usual right now.",
+            f"Ball production is also part of the story thanks to {i['player_name']} ({i['team_name']}) and {safe_int(i.get('total_ints'))} interceptions." if i else "Coverage discipline continues to swing who survives tight games.",
+        ], f"news-defense-{week}"),
+        "close": f"That is why Week {week} feels less like background schedule filler and more like a week that can redraw how the league reads itself.",
+    }
+
+
+def template_weekly_news_text(facts: dict) -> str:
+    comp = _news_components(facts)
+    structure = facts.get("structure", "headline thesis plus three pivots")
+    blocks = {
+        "headline thesis plus three pivots": [comp["lead"], comp["topline"], comp["game"], comp["pass"], comp["close"]],
+        "top-down sportsdesk open": [comp["topline"], comp["chase"], comp["game"], comp["defense"], comp["close"]],
+        "five-storyline stack": [comp["lead"], comp["topline"], comp["pass"], comp["rush"], comp["game"], comp["close"]],
+        "league pulse frame": [comp["lead"], comp["chase"], comp["defense"], comp["game"], comp["close"]],
+        "power-race then stat-race": [comp["topline"], comp["chase"], comp["pass"], comp["rush"], comp["close"]],
+        "headline game anchor": [comp["game"], comp["topline"], comp["pass"], comp["close"]],
+        "contenders-and-chasers frame": [comp["topline"], comp["chase"], comp["game"], comp["close"]],
+        "awards-desk frame": [comp["pass"], comp["rush"], comp["defense"], comp["game"], comp["close"]],
+        "pressure-map frame": [comp["lead"], comp["game"], comp["topline"], comp["close"]],
+        "what-changed-this-week frame": [comp["topline"], comp["game"], comp["defense"], comp["close"]],
+        "market-watch frame": [comp["lead"], comp["chase"], comp["game"], comp["close"]],
+        "temperature-check frame": [comp["lead"], comp["topline"], comp["rush"], comp["close"]],
+        "if-the-season-ended-today frame": [comp["topline"], comp["chase"], comp["game"], comp["close"]],
+        "who-has-the-leverage frame": [comp["topline"], comp["game"], comp["pass"], comp["close"]],
+        "biggest-movers frame": [comp["lead"], comp["chase"], comp["rush"], comp["close"]],
+        "spotlight-carousel frame": [comp["game"], comp["pass"], comp["defense"], comp["close"]],
+        "conversation-shifter frame": [comp["lead"], comp["game"], comp["close"]],
+        "from-the-top-down frame": [comp["topline"], comp["chase"], comp["defense"], comp["close"]],
+        "who-owns-the-week frame": [comp["game"], comp["topline"], comp["close"]],
+        "narrative-reset frame": [comp["lead"], comp["pass"], comp["game"], comp["close"]],
+        "danger-list frame": [comp["chase"], comp["game"], comp["defense"], comp["close"]],
+        "statement-board frame": [comp["lead"], comp["topline"], comp["game"], comp["pass"], comp["close"]],
+        "headline-and-undercard frame": [comp["game"], comp["rush"], comp["defense"], comp["close"]],
+        "tier-report frame": [comp["topline"], comp["chase"], comp["close"]],
+        "table-setter frame": [comp["lead"], comp["game"], comp["close"]],
+        "lead-story plus side quests": [comp["game"], comp["pass"], comp["rush"], comp["close"]],
+        "power-lens frame": [comp["topline"], comp["game"], comp["defense"], comp["close"]],
+        "awards-lens frame": [comp["pass"], comp["rush"], comp["close"]],
+        "schedule-pressure frame": [comp["lead"], comp["game"], comp["chase"], comp["close"]],
+        "separation-sunday frame": [comp["topline"], comp["close"]],
+        "one-room-one-story frame": [comp["game"], comp["topline"], comp["pass"], comp["close"]],
+        "this-week-in-control frame": [comp["topline"], comp["defense"], comp["close"]],
+        "what-everyone-is-watching frame": [comp["game"], comp["pass"], comp["close"]],
+        "high-ground frame": [comp["topline"], comp["chase"], comp["close"]],
+        "traffic-jam frame": [comp["lead"], comp["chase"], comp["game"], comp["close"]],
+        "center-of-gravity frame": [comp["game"], comp["topline"], comp["close"]],
+        "who-can-breathe frame": [comp["lead"], comp["topline"], comp["close"]],
+        "topline-plus-ripple-effects frame": [comp["topline"], comp["game"], comp["defense"], comp["close"]],
+        "watch-list frame": [comp["pass"], comp["rush"], comp["game"], comp["close"]],
+        "credibility-board frame": [comp["lead"], comp["game"], comp["close"]],
+        "power-balance frame": [comp["topline"], comp["chase"], comp["close"]],
+        "chaos-index frame": [comp["lead"], comp["game"], comp["close"]],
+        "spotlight-desk frame": [comp["game"], comp["defense"], comp["close"]],
+        "biggest-questions frame": [comp["lead"], comp["game"], comp["pass"], comp["close"]],
+        "season-axis frame": [comp["topline"], comp["game"], comp["rush"], comp["close"]],
+    }
+    selected = blocks.get(structure, blocks["headline thesis plus three pivots"])
+    cleaned = []
+    seen = set()
+    for line in selected:
+        line = line.strip()
+        low = line.lower()
+        if line and low not in seen:
+            cleaned.append(line)
+            seen.add(low)
+    return " ".join(cleaned[:7])
+
+
+def build_weekly_news_prompt(facts: dict) -> str:
+    return (
+        "You are writing the main weekly ESPN-style league desk article for a Madden franchise Discord.\n"
+        "Hard rules:\n"
+        "- Write 6 or 7 sentences.\n"
+        "- Use only the provided facts.\n"
+        f"- The assigned narrative angle is: {facts['angle']}.\n"
+        f"- The assigned article structure is: {facts['structure']}.\n"
+        "- Make this article feel unlike the matchup previews and unlike other weekly desk pieces.\n"
+        "- No invented results, quotes, streaks, awards, or injuries.\n"
+        f"- Avoid these phrases entirely: {', '.join(AVOID_PHRASES)}.\n"
+        "- Build a stronger headline-style lead than a generic standings recap.\n"
+        "- End with why the week can reshape league perception.\n\n"
+        f"Facts JSON:\n{json.dumps(facts, indent=2)}"
+    )
+
+
+def build_weekly_news_spotlights(facts: dict) -> list[str]:
+    items = []
+    if facts["top_games"]:
+        g = facts["top_games"][0]
+        items.append(f"Centerpiece game: {g['away_team_name']} vs {g['home_team_name']}")
+    if facts["passing_leaders"]:
+        p = facts["passing_leaders"][0]
+        items.append(f"Passing pace: {p['player_name']} ({p['team_name']}) — {safe_int(p.get('total_pass_yds'))} yds")
+    if facts["rushing_leaders"]:
+        r = facts["rushing_leaders"][0]
+        items.append(f"Rushing pace: {r['player_name']} ({r['team_name']}) — {safe_int(r.get('total_rush_yds'))} yds")
+    if facts["sack_leaders"]:
+        s = facts["sack_leaders"][0]
+        items.append(f"Pressure leader: {s['player_name']} ({s['team_name']}) — {safe_int(s.get('total_sacks'))} sacks")
+    if facts["interception_leaders"]:
+        i = facts["interception_leaders"][0]
+        items.append(f"Takeaway leader: {i['player_name']} ({i['team_name']}) — {safe_int(i.get('total_ints'))} INTs")
+    return items[:4]
+
+
+def _clean_generated_text(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    for phrase in AVOID_PHRASES:
+        cleaned = re.sub(re.escape(phrase), "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+async def generate_matchup_preview_text(game_row, is_gotw: bool) -> tuple[str, bool]:
+    facts = build_matchup_facts(game_row, is_gotw)
+    fallback = template_matchup_preview_text(facts)
+    if not OPENAI_API_KEY:
+        return fallback, False
+    try:
+        print(f"Generating matchup preview with OpenAI | week={facts['week']} game={facts['game_id']} angle={facts['angle']} structure={facts['structure']}")
+        ai_text = await asyncio.to_thread(call_openai_text, build_matchup_prompt(facts), 220)
+        cleaned = _clean_generated_text(ai_text)
+        return cleaned or fallback, True
+    except Exception as exc:
+        print(f"OpenAI matchup preview failed, using template fallback | week={facts['week']} game={facts['game_id']} error={exc}")
+        return fallback, False
+
+
+async def generate_weekly_news_text(week: int, games, gotw_game_ids: set[int]) -> tuple[str, bool]:
+    facts = build_league_news_facts(week, games, gotw_game_ids)
+    fallback = template_weekly_news_text(facts)
+    if not OPENAI_API_KEY:
+        return fallback, False
+    try:
+        print(f"Generating weekly news with OpenAI | week={week} angle={facts['angle']} structure={facts['structure']}")
+        ai_text = await asyncio.to_thread(call_openai_text, build_weekly_news_prompt(facts), 320)
+        cleaned = _clean_generated_text(ai_text)
+        return cleaned or fallback, True
+    except Exception as exc:
+        print(f"OpenAI weekly news failed, using template fallback | week={week} error={exc}")
+        return fallback, False
+
 if not BOT_TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN is missing. Set it as an environment variable before running the bot.")
 
