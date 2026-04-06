@@ -1299,7 +1299,7 @@ class RosterPaginationView(discord.ui.View):
             item.disabled = True
 
 
-@bot.tree.command(name="roster", description="Show a team roster with 12 players per page.")
+@bot.tree.command(name="roster", description="Show a team roster with 15 players per page and page buttons.")
 @app_commands.describe(team_name="Team name or mascot", page="Roster page number")
 async def roster(interaction: discord.Interaction, team_name: str, page: Optional[int] = 1):
     team_row = resolve_team_row(team_name)
@@ -2090,6 +2090,22 @@ def safe_text(value, default: str = "Unknown") -> str:
     return text or default
 
 
+def effective_overall(row: dict) -> int:
+    ovr = safe_int(row.get("overall_rating"))
+    if ovr > 0:
+        return ovr
+    best = safe_int(row.get("player_best_ovr"))
+    if best > 0:
+        return best
+    scheme = safe_int(row.get("player_scheme_ovr"))
+    if scheme > 0:
+        return scheme
+    team_scheme = safe_int(row.get("team_scheme_ovr"))
+    if team_scheme > 0:
+        return team_scheme
+    return 0
+
+
 def dev_trait_raw_value(raw_value, existing_label: Optional[str] = None) -> int:
     if existing_label:
         normalized = existing_label.strip().lower()
@@ -2233,7 +2249,7 @@ def fetch_player_search_results(name: str, limit: int = 10) -> list[dict]:
                         WHEN LOWER(p.first_name) = %s THEN 2
                         ELSE 3
                     END,
-                    COALESCE(p.overall_rating, 0) DESC,
+                    COALESCE(NULLIF(p.overall_rating, 0), p.player_best_ovr, p.player_scheme_ovr, p.team_scheme_ovr, 0) DESC,
                     p.full_name ASC
                 LIMIT %s
                 """,
@@ -2264,7 +2280,7 @@ def fetch_team_roster_rows(team_id: int) -> list[dict]:
                 LEFT JOIN teams t ON t.team_id = p.team_id
                 WHERE p.team_id = %s
                 ORDER BY
-                    COALESCE(p.overall_rating, 0) DESC,
+                    COALESCE(NULLIF(p.overall_rating, 0), p.player_best_ovr, p.player_scheme_ovr, p.team_scheme_ovr, 0) DESC,
                     CASE WHEN p.position IS NULL THEN 999 ELSE COALESCE(%s::jsonb ->> p.position, '999')::int END,
                     p.full_name ASC
                 """,
