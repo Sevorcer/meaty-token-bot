@@ -379,6 +379,17 @@ def fmt_tokens(value: float) -> str:
     return f"{value:.1f}"
 
 
+def player_display_ovr(row: dict) -> int:
+    for key in ("overall_rating", "player_best_ovr"):
+        value = row.get(key)
+        try:
+            if value is not None and int(value) > 0:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
 def build_embed(title: str, description: str, color: int = 0x2F3136) -> discord.Embed:
     return discord.Embed(title=title, description=description, color=color)
 
@@ -1252,7 +1263,7 @@ async def player(interaction: discord.Interaction, name: str):
         f"🔎 Player Search: {name}",
         "\n".join(
             f"**{idx}.** {safe_text(row.get('full_name'))} — {safe_text(row.get('team_name'), 'Free Agent')} | "
-            f"{safe_text(row.get('position'))} | {safe_int(row.get('overall_rating'))} OVR | "
+            f"{safe_text(row.get('position'))} | {player_display_ovr(row)} OVR | "
             f"{dev_trait_to_label(row.get('dev_trait'), row.get('resolved_dev_trait_label') or row.get('dev_trait_label'))}"
             for idx, row in enumerate(results[:10], start=1)
         ),
@@ -1298,6 +1309,10 @@ class RosterPaginationView(discord.ui.View):
         self._update_buttons()
         await interaction.response.edit_message(embed=build_roster_embed(self.title_team, self.roster_rows, self.page), view=self)
 
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
 
 @bot.tree.command(name="roster", description="Show a team roster with 12 players per page.")
 @app_commands.describe(team_name="Team name or mascot", page="Roster page number")
@@ -1314,8 +1329,10 @@ async def roster(interaction: discord.Interaction, team_name: str, page: Optiona
 
     standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
     merged_team = {**team_row, **standing_row}
-    embed = build_roster_embed(merged_team, roster_rows, page or 1)
-    await interaction.response.send_message(embed=embed)
+    starting_page = max(1, page or 1)
+    view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, starting_page)
+    embed = build_roster_embed(merged_team, roster_rows, starting_page)
+    await interaction.response.send_message(embed=embed, view=view)
 
 
 @bot.tree.command(name="team", description="Show a team summary and its first roster page.")
@@ -1327,10 +1344,14 @@ async def team(interaction: discord.Interaction, team_name: str):
         return
 
     roster_rows = fetch_team_roster_rows(safe_int(team_row.get("team_id")))
+    if not roster_rows:
+        await interaction.response.send_message(f"No roster rows found for **{safe_text(team_row.get('team_name'))}**.", ephemeral=True)
+        return
     standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
     merged_team = {**team_row, **standing_row}
+    view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, 1)
     embed = build_roster_embed(merged_team, roster_rows, 1)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, view=view)
 
 
 @bot.tree.command(name="balance", description="Check your token balance.")
@@ -2233,9 +2254,10 @@ def fetch_team_roster_rows(team_id: int) -> list[dict]:
                 WHERE p.team_id = %s
                 ORDER BY
                     COALESCE(NULLIF(p.overall_rating, 0), p.player_best_ovr, 0) DESC,
+                    CASE WHEN p.position IS NULL THEN 999 ELSE COALESCE(%s::jsonb ->> p.position, '999')::int END,
                     p.full_name ASC
                 """,
-                (team_id,),
+                (team_id, json.dumps(POSITION_SORT_ORDER)),
             )
             return [record_to_dict(row) for row in cur.fetchall()]
 
@@ -2252,7 +2274,7 @@ def build_player_embed(row: dict) -> discord.Embed:
 
     embed = build_embed(
         title,
-        f"**{position}** • **{team_name}** • **{safe_int(row.get('overall_rating'))} OVR** • **{dev_label}**",
+        f"**{position}** • **{team_name}** • **{player_display_ovr(row)} OVR** • **{dev_label}**",
         0x5865F2,
     )
     embed.add_field(
@@ -2308,7 +2330,7 @@ def build_roster_embed(team_row: dict, roster_rows: list[dict], page: int) -> di
             dev_label = dev_trait_to_label(row.get("dev_trait"), row.get("resolved_dev_trait_label") or row.get("dev_trait_label"))
             lines.append(
                 f"**{idx}.** {safe_text(row.get('full_name'))} — {safe_text(row.get('position'))} | "
-                f"{safe_int(row.get('overall_rating'))} OVR | {dev_label}"
+                f"{player_display_ovr(row)} OVR | {dev_label}"
             )
         description = "\n".join(lines)
 
