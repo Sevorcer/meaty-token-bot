@@ -1263,43 +1263,43 @@ async def player(interaction: discord.Interaction, name: str):
 
 
 
+
 class RosterPaginationView(discord.ui.View):
-    def __init__(self, team_row: dict, roster_rows: list[dict], page: int = 1):
-        super().__init__(timeout=180)
-        self.team_row = team_row
+    def __init__(self, title_team: dict, roster_rows: list[dict], requester_id: int, page: int = 1, timeout: int = 180):
+        super().__init__(timeout=timeout)
+        self.title_team = title_team
         self.roster_rows = roster_rows
-        self.page = page
-        self.total_pages = max(1, (len(roster_rows) + ROSTER_PAGE_SIZE - 1) // ROSTER_PAGE_SIZE)
-        self._refresh_buttons()
+        self.requester_id = requester_id
+        self.page = max(1, page)
+        self.max_page = max(1, (len(self.roster_rows) + ROSTER_PAGE_SIZE - 1) // ROSTER_PAGE_SIZE)
+        self._update_buttons()
 
-    def _refresh_buttons(self):
-        prev_button = self.children[0]
-        next_button = self.children[1]
-        prev_button.disabled = self.page <= 1
-        next_button.disabled = self.page >= self.total_pages
+    def _update_buttons(self) -> None:
+        self.prev_page.disabled = self.page <= 1
+        self.next_page.disabled = self.page >= self.max_page
 
-    @discord.ui.button(label="⬅️ Prev", style=discord.ButtonStyle.secondary)
-    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the user who opened this roster can use these buttons.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_page(self, interaction: discord.Interaction, _: discord.ui.Button):
         if self.page > 1:
             self.page -= 1
-        self._refresh_buttons()
-        embed = build_roster_embed(self.team_row, self.roster_rows, self.page)
-        await interaction.response.edit_message(embed=embed, view=self)
+        self._update_buttons()
+        await interaction.response.edit_message(embed=build_roster_embed(self.title_team, self.roster_rows, self.page), view=self)
 
-    @discord.ui.button(label="Next ➡️", style=discord.ButtonStyle.primary)
-    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.page < self.total_pages:
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.primary)
+    async def next_page(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if self.page < self.max_page:
             self.page += 1
-        self._refresh_buttons()
-        embed = build_roster_embed(self.team_row, self.roster_rows, self.page)
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
+        self._update_buttons()
+        await interaction.response.edit_message(embed=build_roster_embed(self.title_team, self.roster_rows, self.page), view=self)
 
 
-@bot.tree.command(name="roster", description="Show a team roster with 15 players per page and page buttons.")
+@bot.tree.command(name="roster", description="Show a team roster with 12 players per page.")
 @app_commands.describe(team_name="Team name or mascot", page="Roster page number")
 async def roster(interaction: discord.Interaction, team_name: str, page: Optional[int] = 1):
     team_row = resolve_team_row(team_name)
@@ -2090,45 +2090,14 @@ def safe_text(value, default: str = "Unknown") -> str:
     return text or default
 
 
-def effective_overall(row: dict) -> int:
-    ovr = safe_int(row.get("overall_rating"))
-    if ovr > 0:
-        return ovr
-    best = safe_int(row.get("player_best_ovr"))
-    if best > 0:
-        return best
-    return 0
-
-
-def dev_trait_raw_value(raw_value, existing_label: Optional[str] = None) -> int:
-    if existing_label:
-        normalized = existing_label.strip().lower()
-        for key, label in DEV_TRAIT_LABELS.items():
-            if label.lower() == normalized:
-                return key
-    try:
-        return int(raw_value or 0)
-    except Exception:
-        return 0
-
-
 def dev_trait_to_label(raw_value, existing_label: Optional[str] = None) -> str:
     if existing_label:
         return existing_label
-    raw = dev_trait_raw_value(raw_value)
+    try:
+        raw = int(raw_value or 0)
+    except Exception:
+        return "Unknown"
     return DEV_TRAIT_LABELS.get(raw, f"Trait {raw}")
-
-
-def dev_trait_badge(raw_value, existing_label: Optional[str] = None) -> str:
-    raw = dev_trait_raw_value(raw_value, existing_label)
-    label = dev_trait_to_label(raw, existing_label)
-    emoji = DEV_TRAIT_EMOJIS.get(raw, "❔")
-    return f"{emoji} {label}"
-
-
-def dev_trait_color(raw_value, existing_label: Optional[str] = None) -> int:
-    raw = dev_trait_raw_value(raw_value, existing_label)
-    return DEV_TRAIT_COLORS.get(raw, 0x5865F2)
 
 
 def format_height_inches(height_inches: Optional[int]) -> str:
@@ -2180,35 +2149,24 @@ def resolve_team_row(team_name: str):
 
     teams = fetch_all_team_rows()
     best_exact = None
-    best_mascot = None
-    best_city = None
     best_contains = None
+    best_suffix = None
 
     for team in teams:
         team_display = safe_text(team.get("team_name"), "")
-        parts = team_display.split()
-        city = normalize_team_name(" ".join(parts[:-1])) if len(parts) > 1 else ""
-        mascot = normalize_team_name(parts[-1]) if parts else ""
         team_norm = normalize_team_name(team_display)
+        mascot = normalize_team_name(team_display.split()[-1]) if team_display else ""
 
-        aliases = {team_norm, mascot, city}
-        aliases = {a for a in aliases if a}
-
-        if normalized_query in aliases:
+        if team_norm == normalized_query:
             best_exact = team
             break
-
-        if mascot and mascot == normalized_query and best_mascot is None:
-            best_mascot = team
-
-        if city and city == normalized_query and best_city is None:
-            best_city = team
-
+        if mascot == normalized_query and best_suffix is None:
+            best_suffix = team
         if normalized_query in team_norm or team_norm in normalized_query:
             if best_contains is None:
                 best_contains = team
 
-    return best_exact or best_mascot or best_city or best_contains
+    return best_exact or best_suffix or best_contains
 
 
 def fetch_player_search_results(name: str, limit: int = 10) -> list[dict]:
@@ -2275,10 +2233,9 @@ def fetch_team_roster_rows(team_id: int) -> list[dict]:
                 WHERE p.team_id = %s
                 ORDER BY
                     COALESCE(NULLIF(p.overall_rating, 0), p.player_best_ovr, 0) DESC,
-                    CASE WHEN p.position IS NULL THEN 999 ELSE COALESCE(%s::jsonb ->> p.position, '999')::int END,
                     p.full_name ASC
                 """,
-                (team_id, json.dumps(POSITION_SORT_ORDER)),
+                (team_id,),
             )
             return [record_to_dict(row) for row in cur.fetchall()]
 
