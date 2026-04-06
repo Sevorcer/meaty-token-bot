@@ -80,7 +80,7 @@ DEV_TRAIT_COLORS = {
     3: 0xE74C3C,
 }
 
-ROSTER_PAGE_SIZE = 12
+ROSTER_PAGE_SIZE = 15
 POSITION_SORT_ORDER = {
     "QB": 1,
     "HB": 2,
@@ -1262,6 +1262,43 @@ async def player(interaction: discord.Interaction, name: str):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+
+class RosterPaginationView(discord.ui.View):
+    def __init__(self, team_row: dict, roster_rows: list[dict], page: int = 1):
+        super().__init__(timeout=180)
+        self.team_row = team_row
+        self.roster_rows = roster_rows
+        self.page = page
+        self.total_pages = max(1, (len(roster_rows) + ROSTER_PAGE_SIZE - 1) // ROSTER_PAGE_SIZE)
+        self._refresh_buttons()
+
+    def _refresh_buttons(self):
+        prev_button = self.children[0]
+        next_button = self.children[1]
+        prev_button.disabled = self.page <= 1
+        next_button.disabled = self.page >= self.total_pages
+
+    @discord.ui.button(label="⬅️ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page > 1:
+            self.page -= 1
+        self._refresh_buttons()
+        embed = build_roster_embed(self.team_row, self.roster_rows, self.page)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Next ➡️", style=discord.ButtonStyle.primary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page < self.total_pages:
+            self.page += 1
+        self._refresh_buttons()
+        embed = build_roster_embed(self.team_row, self.roster_rows, self.page)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+
 @bot.tree.command(name="roster", description="Show a team roster with 12 players per page.")
 @app_commands.describe(team_name="Team name or mascot", page="Roster page number")
 async def roster(interaction: discord.Interaction, team_name: str, page: Optional[int] = 1):
@@ -2133,24 +2170,35 @@ def resolve_team_row(team_name: str):
 
     teams = fetch_all_team_rows()
     best_exact = None
+    best_mascot = None
+    best_city = None
     best_contains = None
-    best_suffix = None
 
     for team in teams:
         team_display = safe_text(team.get("team_name"), "")
+        parts = team_display.split()
+        city = normalize_team_name(" ".join(parts[:-1])) if len(parts) > 1 else ""
+        mascot = normalize_team_name(parts[-1]) if parts else ""
         team_norm = normalize_team_name(team_display)
-        mascot = normalize_team_name(team_display.split()[-1]) if team_display else ""
 
-        if team_norm == normalized_query:
+        aliases = {team_norm, mascot, city}
+        aliases = {a for a in aliases if a}
+
+        if normalized_query in aliases:
             best_exact = team
             break
-        if mascot == normalized_query and best_suffix is None:
-            best_suffix = team
+
+        if mascot and mascot == normalized_query and best_mascot is None:
+            best_mascot = team
+
+        if city and city == normalized_query and best_city is None:
+            best_city = team
+
         if normalized_query in team_norm or team_norm in normalized_query:
             if best_contains is None:
                 best_contains = team
 
-    return best_exact or best_suffix or best_contains
+    return best_exact or best_mascot or best_city or best_contains
 
 
 def fetch_player_search_results(name: str, limit: int = 10) -> list[dict]:
