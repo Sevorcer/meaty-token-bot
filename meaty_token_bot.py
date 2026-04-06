@@ -3,8 +3,11 @@ import random
 import re
 import sqlite3
 import asyncio
+import json
 from dataclasses import dataclass
 from typing import Optional
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import discord
 import psycopg
@@ -22,6 +25,11 @@ GUILD_IDS = [int(x.strip()) for x in GUILD_IDS_RAW.split(",") if x.strip()]
 TOKEN_DB_PATH = os.getenv("MEATY_TOKEN_DB", "meaty_tokens.db")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 LEADERS_CHANNEL_ID = int(os.getenv("LEADERS_CHANNEL_ID", "0"))
+NEWS_CHANNEL_ID = int(os.getenv("NEWS_CHANNEL_ID", "0"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
+AUTO_POST_MATCHUP_PREVIEWS = os.getenv("AUTO_POST_MATCHUP_PREVIEWS", "true").lower() in {"1", "true", "yes", "on"}
+AUTO_POST_WEEKLY_NEWS = os.getenv("AUTO_POST_WEEKLY_NEWS", "true").lower() in {"1", "true", "yes", "on"}
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 ADMIN_ROLE_NAMES = {"Commissioner", "Admin", "COMMISH"}
@@ -949,6 +957,8 @@ async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
     print(f"LOG_CHANNEL_ID: {LOG_CHANNEL_ID}")
     print(f"LEADERS_CHANNEL_ID: {LEADERS_CHANNEL_ID}")
+    print(f"NEWS_CHANNEL_ID: {NEWS_CHANNEL_ID}")
+    print(f"OPENAI_API_KEY set: {'yes' if OPENAI_API_KEY else 'no'}")
     print(f"DATABASE_URL set: {'yes' if DATABASE_URL else 'no'}")
     try:
         if GUILD_IDS:
@@ -1770,16 +1780,513 @@ async def postoverview(interaction: discord.Interaction):
     )
 
 
+
+
+def record_to_dict(row):
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return dict(row)
+    try:
+        return dict(row)
+    except Exception:
+        return row
+
+
+def wins_losses_ties_text(row) -> str:
+    return f"{row.get('wins', 0)}-{row.get('losses', 0)}-{row.get('ties', 0)}"
+
+
+def safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return default
+
+
+def fetch_team_standing(team_id: int):
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    t.team_id,
+                    t.team_name,
+                    t.conference_name,
+                    t.division_name,
+                    t.team_ovr,
+                    COALESCE(s.wins, 0) AS wins,
+                    COALESCE(s.losses, 0) AS losses,
+                    COALESCE(s.ties, 0) AS ties,
+                    COALESCE(s.win_pct, 0) AS win_pct,
+                    COALESCE(s.seed, 0) AS seed,
+                    COALESCE(s.pts_for, 0) AS pts_for,
+                    COALESCE(s.pts_against, 0) AS pts_against,
+                    COALESCE(s.turnover_diff, 0) AS turnover_diff
+                FROM teams t
+                LEFT JOIN standings s ON s.team_id = t.team_id
+                WHERE t.team_id = %s
+                LIMIT 1
+                """,
+                (team_id,),
+            )
+            row = cur.fetchone()
+            return record_to_dict(row)
+
+
+def fetch_team_stat_leaders(team_id: int) -> dict:
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            passing = None
+            rushing = None
+            sacks = None
+            interceptions = None
+
+            cur.execute(
+                """
+                SELECT
+                    pps.roster_id,
+                    COALESCE(MAX(players.full_name), MAX(pps.full_name)) AS player_name,
+                    SUM(COALESCE(pps.pass_yds, 0)) AS total_pass_yds,
+                    SUM(COALESCE(pps.pass_tds, 0)) AS total_pass_tds
+                FROM player_passing_stats pps
+                LEFT JOIN players ON players.roster_id = pps.roster_id
+                WHERE COALESCE(players.team_id, pps.team_id) = %s
+                GROUP BY pps.roster_id
+                ORDER BY total_pass_yds DESC, total_pass_tds DESC, player_name ASC
+                LIMIT 1
+                """,
+                (team_id,),
+            )
+            passing = record_to_dict(cur.fetchone())
+
+            cur.execute(
+                """
+                SELECT
+                    prs.roster_id,
+                    COALESCE(MAX(players.full_name), MAX(prs.full_name)) AS player_name,
+                    SUM(COALESCE(prs.rush_yds, 0)) AS total_rush_yds,
+                    SUM(COALESCE(prs.rush_tds, 0)) AS total_rush_tds
+                FROM player_rushing_stats prs
+                LEFT JOIN players ON players.roster_id = prs.roster_id
+                WHERE COALESCE(players.team_id, prs.team_id) = %s
+                GROUP BY prs.roster_id
+                ORDER BY total_rush_yds DESC, total_rush_tds DESC, player_name ASC
+                LIMIT 1
+                """,
+                (team_id,),
+            )
+            rushing = record_to_dict(cur.fetchone())
+
+            cur.execute(
+                """
+                SELECT
+                    pds.roster_id,
+                    COALESCE(MAX(players.full_name), MAX(pds.full_name)) AS player_name,
+                    SUM(COALESCE(pds.def_sacks, 0)) AS total_sacks,
+                    SUM(COALESCE(pds.def_ints, 0)) AS total_ints
+                FROM player_defense_stats pds
+                LEFT JOIN players ON players.roster_id = pds.roster_id
+                WHERE COALESCE(players.team_id, pds.team_id) = %s
+                GROUP BY pds.roster_id
+                ORDER BY total_sacks DESC, total_ints DESC, player_name ASC
+                LIMIT 1
+                """,
+                (team_id,),
+            )
+            sacks = record_to_dict(cur.fetchone())
+
+            cur.execute(
+                """
+                SELECT
+                    pds.roster_id,
+                    COALESCE(MAX(players.full_name), MAX(pds.full_name)) AS player_name,
+                    SUM(COALESCE(pds.def_ints, 0)) AS total_ints,
+                    SUM(COALESCE(pds.def_sacks, 0)) AS total_sacks
+                FROM player_defense_stats pds
+                LEFT JOIN players ON players.roster_id = pds.roster_id
+                WHERE COALESCE(players.team_id, pds.team_id) = %s
+                GROUP BY pds.roster_id
+                ORDER BY total_ints DESC, total_sacks DESC, player_name ASC
+                LIMIT 1
+                """,
+                (team_id,),
+            )
+            interceptions = record_to_dict(cur.fetchone())
+
+    return {
+        "passing": passing,
+        "rushing": rushing,
+        "sacks": sacks,
+        "interceptions": interceptions,
+    }
+
+
+def build_team_storyline(team_row: dict, leaders: dict) -> str:
+    team_name = team_row.get("team_name", "Unknown Team")
+    record = wins_losses_ties_text(team_row)
+    seed = safe_int(team_row.get("seed"))
+    pf = safe_int(team_row.get("pts_for"))
+    pa = safe_int(team_row.get("pts_against"))
+    ovr = safe_int(team_row.get("team_ovr"))
+    turnover_diff = safe_int(team_row.get("turnover_diff"))
+
+    fragments = [f"{team_name} is {record} with a {ovr} OVR, {pf} points scored, {pa} allowed, and a turnover diff of {turnover_diff:+d}."]
+    if seed:
+        fragments.append(f"They currently sit on the {seed} seed.")
+    passing = leaders.get("passing")
+    if passing and passing.get("player_name") and safe_int(passing.get("total_pass_yds")) > 0:
+        fragments.append(
+            f"Top passer: {passing['player_name']} with {safe_int(passing.get('total_pass_yds'))} yards and {safe_int(passing.get('total_pass_tds'))} TDs."
+        )
+    rushing = leaders.get("rushing")
+    if rushing and rushing.get("player_name") and safe_int(rushing.get("total_rush_yds")) > 0:
+        fragments.append(
+            f"Top rusher: {rushing['player_name']} with {safe_int(rushing.get('total_rush_yds'))} yards and {safe_int(rushing.get('total_rush_tds'))} TDs."
+        )
+    defender = leaders.get("interceptions") or leaders.get("sacks")
+    if defender and defender.get("player_name"):
+        sack_count = safe_int(defender.get("total_sacks"))
+        int_count = safe_int(defender.get("total_ints"))
+        if sack_count or int_count:
+            fragments.append(
+                f"Defensive tone-setter: {defender['player_name']} with {sack_count} sacks and {int_count} picks."
+            )
+    return " ".join(fragments)
+
+
+def build_matchup_facts(game_row, is_gotw: bool) -> dict:
+    away_team = fetch_team_standing(game_row["away_team_id"]) or {
+        "team_name": game_row["away_team_name"],
+        "wins": game_row.get("away_wins", 0),
+        "losses": game_row.get("away_losses", 0),
+        "ties": game_row.get("away_ties", 0),
+        "win_pct": game_row.get("away_win_pct", 0),
+        "team_ovr": game_row.get("away_ovr", 0),
+    }
+    home_team = fetch_team_standing(game_row["home_team_id"]) or {
+        "team_name": game_row["home_team_name"],
+        "wins": game_row.get("home_wins", 0),
+        "losses": game_row.get("home_losses", 0),
+        "ties": game_row.get("home_ties", 0),
+        "win_pct": game_row.get("home_win_pct", 0),
+        "team_ovr": game_row.get("home_ovr", 0),
+    }
+
+    away_leaders = fetch_team_stat_leaders(game_row["away_team_id"])
+    home_leaders = fetch_team_stat_leaders(game_row["home_team_id"])
+
+    return {
+        "week": safe_int(game_row.get("week")),
+        "game_id": safe_int(game_row.get("game_id")),
+        "stage_index": safe_int(game_row.get("stage_index")),
+        "status": safe_int(game_row.get("status")),
+        "is_gotw": bool(is_gotw),
+        "matchup_score": round(compute_matchup_score(game_row), 2),
+        "away_team": away_team,
+        "home_team": home_team,
+        "away_storyline": build_team_storyline(away_team, away_leaders),
+        "home_storyline": build_team_storyline(home_team, home_leaders),
+        "away_leaders": away_leaders,
+        "home_leaders": home_leaders,
+    }
+
+
+def template_matchup_preview_text(facts: dict) -> str:
+    away = facts["away_team"]
+    home = facts["home_team"]
+
+    lines = []
+    opener = (
+        f"Week {facts['week']} brings a showdown between the {away['team_name']} ({wins_losses_ties_text(away)}) "
+        f"and the {home['team_name']} ({wins_losses_ties_text(home)})."
+    )
+    lines.append(opener)
+
+    if facts["is_gotw"]:
+        lines.append(
+            "This one earned Game of the Week billing, so expect playoff-style energy and a ton of eyes on the result."
+        )
+    else:
+        lines.append(
+            "Both sides have a real chance to shift momentum here, and this matchup could quietly reshape the standings."
+        )
+
+    lines.append(
+        f"The numbers say {away['team_name']} has scored {safe_int(away.get('pts_for'))} points and {home['team_name']} has scored {safe_int(home.get('pts_for'))}, "
+        f"so whichever offense finishes drives better may control the game."
+    )
+
+    away_star = facts["away_leaders"].get("passing") or facts["away_leaders"].get("rushing")
+    home_star = facts["home_leaders"].get("passing") or facts["home_leaders"].get("rushing")
+    if away_star and home_star and away_star.get("player_name") and home_star.get("player_name"):
+        lines.append(
+            f"Players to watch include {away_star['player_name']} for {away['team_name']} and {home_star['player_name']} for {home['team_name']}, "
+            "with both offenses leaning on their top playmakers to set the tone."
+        )
+    else:
+        lines.append(
+            "Keep an eye on who creates the first splash play, because a turnover or explosive drive could decide this one early."
+        )
+
+    lines.append(
+        f"With seeds, momentum, and league perception all in play, this feels like a game that should matter well beyond the final score."
+    )
+
+    return " ".join(lines[:5])
+
+
+def build_league_news_facts(week: int, games, gotw_game_ids: set[int]) -> dict:
+    standings = [record_to_dict(row) for row in fetch_standings_rows()]
+    passing = [record_to_dict(row) for row in fetch_top_passing_leaders(3)]
+    rushing = [record_to_dict(row) for row in fetch_top_rushing_leaders(3)]
+    sacks = [record_to_dict(row) for row in fetch_top_sack_leaders(3)]
+    interceptions = [record_to_dict(row) for row in fetch_top_interception_leaders(3)]
+
+    ranked_games = []
+    for game in games:
+        ranked_games.append({
+            "game_id": safe_int(game["game_id"]),
+            "away_team_name": game["away_team_name"],
+            "home_team_name": game["home_team_name"],
+            "matchup_score": round(compute_matchup_score(game), 2),
+            "is_gotw": safe_int(game["game_id"]) in gotw_game_ids,
+        })
+    ranked_games.sort(key=lambda row: row["matchup_score"], reverse=True)
+
+    return {
+        "week": week,
+        "top_teams": standings[:5],
+        "passing_leaders": passing,
+        "rushing_leaders": rushing,
+        "sack_leaders": sacks,
+        "interception_leaders": interceptions,
+        "top_games": ranked_games[:5],
+        "game_count": len(games),
+    }
+
+
+def template_weekly_news_text(facts: dict) -> str:
+    week = facts["week"]
+    top_teams = facts["top_teams"]
+    top_games = facts["top_games"]
+
+    if top_teams:
+        lead_team = top_teams[0]
+        second_team = top_teams[1] if len(top_teams) > 1 else None
+        standings_line = (
+            f"Week {week} opens with {lead_team['team_name']} sitting on top at {wins_losses_ties_text(lead_team)}"
+        )
+        if second_team:
+            standings_line += f", while {second_team['team_name']} is right behind at {wins_losses_ties_text(second_team)}"
+        standings_line += "."
+    else:
+        standings_line = f"Week {week} is here, and the league race is starting to take shape."
+
+    top_game = top_games[0] if top_games else None
+    if top_game:
+        marquee_line = (
+            f"The marquee matchup this week is {top_game['away_team_name']} vs {top_game['home_team_name']}"
+        )
+        if top_game["is_gotw"]:
+            marquee_line += ", which landed Game of the Week honors."
+        else:
+            marquee_line += "."
+    else:
+        marquee_line = "Several games this week could shake up the standings."
+
+    passing = facts["passing_leaders"][0] if facts["passing_leaders"] else None
+    rushing = facts["rushing_leaders"][0] if facts["rushing_leaders"] else None
+    sacks = facts["sack_leaders"][0] if facts["sack_leaders"] else None
+    interceptions = facts["interception_leaders"][0] if facts["interception_leaders"] else None
+
+    stat_line_parts = []
+    if passing:
+        stat_line_parts.append(
+            f"{passing['player_name']} leads the air attack with {safe_int(passing.get('total_pass_yds'))} passing yards"
+        )
+    if rushing:
+        stat_line_parts.append(
+            f"{rushing['player_name']} has set the pace on the ground with {safe_int(rushing.get('total_rush_yds'))} rushing yards"
+        )
+    if sacks:
+        stat_line_parts.append(
+            f"{sacks['player_name']} is terrorizing quarterbacks with {safe_int(sacks.get('total_sacks'))} sacks"
+        )
+    if interceptions:
+        stat_line_parts.append(
+            f"{interceptions['player_name']} is leading the takeaway hunt with {safe_int(interceptions.get('total_ints'))} interceptions"
+        )
+
+    stat_line = "Stat races are heating up."
+    if stat_line_parts:
+        stat_line = "Meanwhile, " + "; ".join(stat_line_parts) + "."
+
+    close_race_line = "With playoff positioning, pride, and momentum all on the line, this week feels like a pressure point in the season."
+    return " ".join([standings_line, marquee_line, stat_line, close_race_line])
+
+
+def call_openai_text(prompt: str, max_output_tokens: int = 220) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": prompt,
+        "max_output_tokens": max_output_tokens,
+    }
+
+    req = urllib_request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib_request.urlopen(req, timeout=45) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI HTTP {exc.code}: {details[:500]}")
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI request failed: {exc}")
+
+    if isinstance(data, dict):
+        text_value = data.get("output_text")
+        if isinstance(text_value, str) and text_value.strip():
+            return text_value.strip()
+
+        output = data.get("output", [])
+        collected = []
+        for item in output:
+            if item.get("type") != "message":
+                continue
+            for content in item.get("content", []):
+                if content.get("type") in {"output_text", "text"}:
+                    text_piece = content.get("text", "")
+                    if text_piece:
+                        collected.append(text_piece)
+        joined = "\n".join(part.strip() for part in collected if part.strip()).strip()
+        if joined:
+            return joined
+
+    raise RuntimeError("OpenAI returned no text output.")
+
+
+def build_matchup_prompt(facts: dict) -> str:
+    return (
+        "You are writing a short Madden franchise pregame report.\n"
+        "Rules:\n"
+        "- Write exactly 3 to 5 sentences.\n"
+        "- Sound like a TV sports pregame segment.\n"
+        "- Use only the facts provided.\n"
+        "- Do not invent players, injuries, streaks, awards, or statistics.\n"
+        "- Keep it punchy and readable.\n\n"
+        f"Facts JSON:\n{json.dumps(facts, indent=2)}"
+    )
+
+
+def build_weekly_news_prompt(facts: dict) -> str:
+    return (
+        "You are writing a main weekly league news article for a Madden franchise Discord.\n"
+        "Rules:\n"
+        "- Write one tight article of 4 to 6 sentences.\n"
+        "- Focus on standings pressure, headline matchups, and stat-race storylines.\n"
+        "- Use only the facts provided.\n"
+        "- Do not invent records, streaks, awards, or outcomes.\n"
+        "- Make it sound exciting but not cheesy.\n\n"
+        f"Facts JSON:\n{json.dumps(facts, indent=2)}"
+    )
+
+
+async def generate_matchup_preview_text(game_row, is_gotw: bool) -> tuple[str, bool]:
+    facts = build_matchup_facts(game_row, is_gotw)
+    fallback = template_matchup_preview_text(facts)
+    if not OPENAI_API_KEY:
+        return fallback, False
+
+    try:
+        ai_text = await asyncio.to_thread(call_openai_text, build_matchup_prompt(facts), 180)
+        cleaned = re.sub(r"\s+", " ", ai_text).strip()
+        return cleaned or fallback, True
+    except Exception as exc:
+        print(f"AI matchup preview failed for game {game_row.get('game_id')}: {exc}")
+        return fallback, False
+
+
+async def generate_weekly_news_text(week: int, games, gotw_game_ids: set[int]) -> tuple[str, bool]:
+    facts = build_league_news_facts(week, games, gotw_game_ids)
+    fallback = template_weekly_news_text(facts)
+    if not OPENAI_API_KEY:
+        return fallback, False
+
+    try:
+        ai_text = await asyncio.to_thread(call_openai_text, build_weekly_news_prompt(facts), 260)
+        cleaned = re.sub(r"\s+", " ", ai_text).strip()
+        return cleaned or fallback, True
+    except Exception as exc:
+        print(f"AI weekly news failed for week {week}: {exc}")
+        return fallback, False
+
+
+async def resolve_news_channel(guild: discord.Guild, fallback_channel: Optional[discord.TextChannel] = None):
+    target_channel = None
+    if NEWS_CHANNEL_ID:
+        target_channel = guild.get_channel(NEWS_CHANNEL_ID)
+        if target_channel is None:
+            try:
+                fetched = await bot.fetch_channel(NEWS_CHANNEL_ID)
+                if isinstance(fetched, discord.TextChannel):
+                    target_channel = fetched
+            except Exception:
+                target_channel = None
+
+    if target_channel is None and isinstance(fallback_channel, discord.TextChannel):
+        target_channel = fallback_channel
+
+    return target_channel
+
+
+async def post_weekly_news_article(
+    guild: discord.Guild,
+    week: int,
+    games,
+    gotw_game_ids: set[int],
+    fallback_channel: Optional[discord.TextChannel] = None,
+):
+    target_channel = await resolve_news_channel(guild, fallback_channel)
+    if target_channel is None:
+        return None, False
+
+    article_text, used_ai = await generate_weekly_news_text(week, games, gotw_game_ids)
+
+    embed = discord.Embed(
+        title=f"📰 Week {week} League Report",
+        description=article_text,
+        color=0x1ABC9C,
+    )
+    embed.set_footer(text="AI-assisted report" if used_ai else "Template report")
+
+    await target_channel.send(embed=embed)
+    return target_channel, used_ai
+
+
 @bot.tree.command(name="create_week_channels", description="Admin: create one matchup channel per game for a week.")
 @admin_only()
 @app_commands.describe(
     week="Week number from the games table",
     category_name="Optional category name to create/use",
+    auto_news="Optional override for posting the weekly news article",
 )
 async def create_week_channels(
     interaction: discord.Interaction,
     week: int,
     category_name: Optional[str] = None,
+    auto_news: Optional[bool] = None,
 ):
     if interaction.guild is None:
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
@@ -1871,7 +2378,41 @@ async def create_week_channels(
         ])
 
         await channel.send("\n".join(message_lines))
+
+        if AUTO_POST_MATCHUP_PREVIEWS:
+            preview_text, used_ai = await generate_matchup_preview_text(game, is_gotw)
+            preview_embed = discord.Embed(
+                title="📰 Pregame Report",
+                description=preview_text,
+                color=0x3498DB if not is_gotw else 0xF39C12,
+            )
+            preview_embed.set_footer(text="AI-assisted preview" if used_ai else "Template preview")
+            await channel.send(embed=preview_embed)
+
         created_channels.append(channel_name)
+
+
+    weekly_news_posted = False
+    weekly_news_mode = "disabled"
+    should_post_news = AUTO_POST_WEEKLY_NEWS if auto_news is None else auto_news
+    if should_post_news:
+        fallback_news_channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
+        try:
+            posted_channel, used_ai = await post_weekly_news_article(
+                guild,
+                week,
+                games,
+                gotw_game_ids,
+                fallback_channel=fallback_news_channel,
+            )
+            if posted_channel is not None:
+                weekly_news_posted = True
+                weekly_news_mode = "ai" if used_ai else "template"
+            else:
+                weekly_news_mode = "no-channel"
+        except Exception as exc:
+            print(f"Weekly news post failed for week {week}: {exc}")
+            weekly_news_mode = "failed"
 
     summary_lines = [
         f"Created **{len(created_channels)}** channel(s) for week **{week}** in **{category_title}**.",
@@ -1888,12 +2429,131 @@ async def create_week_channels(
         summary_lines.append("Skipped:")
         summary_lines.extend(f"- {name}" for name in skipped_channels[:20])
 
+    summary_lines.append("")
+    summary_lines.append(
+        f"Weekly news: {'posted' if weekly_news_posted else 'not posted'} ({weekly_news_mode})."
+    )
+
     await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
 
     await send_log_message(
         f"📅 SCHEDULE: {interaction.user.mention} created week {week} matchup channels. "
         f"Created: {len(created_channels)} | GOTW: {len(gotw_created)} | Skipped: {len(skipped_channels)}"
     )
+
+
+
+
+@bot.tree.command(name="post_weekly_news", description="Admin: post the main weekly league news article.")
+@admin_only()
+@app_commands.describe(
+    week="Week number from the games table",
+    channel="Optional channel to post in. Defaults to NEWS_CHANNEL_ID or current channel.",
+)
+async def post_weekly_news(
+    interaction: discord.Interaction,
+    week: int,
+    channel: Optional[discord.TextChannel] = None,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        games = fetch_games_for_week(week)
+    except Exception as exc:
+        await interaction.followup.send(f"Failed to load games for week {week}: {exc}", ephemeral=True)
+        return
+
+    if not games:
+        await interaction.followup.send(f"No games found for week {week}.", ephemeral=True)
+        return
+
+    scored_games = [(game, compute_matchup_score(game)) for game in games]
+    scored_games.sort(key=lambda item: item[1], reverse=True)
+    gotw_game_ids = {game["game_id"] for game, _score in scored_games[:2]}
+
+    try:
+        posted_channel, used_ai = await post_weekly_news_article(
+            interaction.guild,
+            week,
+            games,
+            gotw_game_ids,
+            fallback_channel=channel or (interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None),
+        )
+    except Exception as exc:
+        await interaction.followup.send(f"Failed to post weekly news: {exc}", ephemeral=True)
+        return
+
+    if posted_channel is None:
+        await interaction.followup.send(
+            "No valid news channel found. Set NEWS_CHANNEL_ID or provide a channel.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        f"Posted weekly news in {posted_channel.mention} ({'AI' if used_ai else 'template'} mode).",
+        ephemeral=True,
+    )
+    await send_log_message(
+        f"📰 NEWS: {interaction.user.mention} posted week {week} league news in {posted_channel.mention} "
+        f"using {'AI' if used_ai else 'template'} mode."
+    )
+
+
+@bot.tree.command(name="preview_matchup_article", description="Admin: post one matchup preview article in the current channel.")
+@admin_only()
+@app_commands.describe(week="Week number", away_team="Away team name", home_team="Home team name")
+async def preview_matchup_article(
+    interaction: discord.Interaction,
+    week: int,
+    away_team: str,
+    home_team: str,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        games = fetch_games_for_week(week)
+    except Exception as exc:
+        await interaction.followup.send(f"Failed to load games for week {week}: {exc}", ephemeral=True)
+        return
+
+    normalized_away = normalize_team_name(away_team)
+    normalized_home = normalize_team_name(home_team)
+
+    selected_game = None
+    for game in games:
+        if normalize_team_name(game["away_team_name"]) == normalized_away and normalize_team_name(game["home_team_name"]) == normalized_home:
+            selected_game = game
+            break
+
+    if selected_game is None:
+        await interaction.followup.send("That matchup was not found for the requested week.", ephemeral=True)
+        return
+
+    scored_games = [(game, compute_matchup_score(game)) for game in games]
+    scored_games.sort(key=lambda item: item[1], reverse=True)
+    gotw_game_ids = {game["game_id"] for game, _score in scored_games[:2]}
+    is_gotw = selected_game["game_id"] in gotw_game_ids
+
+    preview_text, used_ai = await generate_matchup_preview_text(selected_game, is_gotw)
+    embed = discord.Embed(
+        title=f"📰 Week {week} Pregame Report",
+        description=preview_text,
+        color=0x3498DB if not is_gotw else 0xF39C12,
+    )
+    embed.set_footer(text="AI-assisted preview" if used_ai else "Template preview")
+
+    await interaction.followup.send("Posted below.", ephemeral=True)
+    if interaction.channel:
+        await interaction.channel.send(embed=embed)
 
 
 @bot.tree.command(name="post_season_leaders", description="Admin: post current season stat leaders.")
