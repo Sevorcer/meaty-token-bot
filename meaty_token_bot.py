@@ -1955,6 +1955,93 @@ def build_team_storyline(team_row: dict, leaders: dict) -> str:
     return " ".join(fragments)
 
 
+def deterministic_choice(options: list[str], seed_value: str) -> str:
+    if not options:
+        return ""
+    rng = random.Random(seed_value)
+    return options[rng.randrange(len(options))]
+
+
+def build_matchup_angle(away_team: dict, home_team: dict, away_leaders: dict, home_leaders: dict, is_gotw: bool, matchup_score: float) -> str:
+    away_wins = safe_int(away_team.get("wins"))
+    home_wins = safe_int(home_team.get("wins"))
+    away_pf = safe_int(away_team.get("pts_for"))
+    home_pf = safe_int(home_team.get("pts_for"))
+    away_pa = safe_int(away_team.get("pts_against"))
+    home_pa = safe_int(home_team.get("pts_against"))
+    away_to = safe_int(away_team.get("turnover_diff"))
+    home_to = safe_int(home_team.get("turnover_diff"))
+
+    if is_gotw or matchup_score >= 28:
+        return "marquee showdown"
+    if abs(away_wins - home_wins) >= 4:
+        return "prove-it test"
+    if abs(away_pf - home_pf) >= 35 and abs(away_pa - home_pa) >= 20:
+        return "style clash"
+    if max(away_to, home_to) - min(away_to, home_to) >= 4:
+        return "turnover battle"
+    away_pass = away_leaders.get("passing")
+    home_pass = home_leaders.get("passing")
+    away_sacks = away_leaders.get("defense")
+    home_sacks = home_leaders.get("defense")
+    if away_pass and home_sacks:
+        return "quarterback-vs-pass-rush"
+    if home_pass and away_sacks:
+        return "quarterback-vs-pass-rush"
+    return "playoff pressure"
+
+
+def build_matchup_headline(facts: dict) -> str:
+    away = facts["away_team"]
+    home = facts["home_team"]
+    angle = facts["angle"]
+    if angle == "marquee showdown":
+        return f"{away['team_name']} and {home['team_name']} headline Week {facts['week']}"
+    if angle == "prove-it test":
+        return f"Can the {away['team_name']} crack the {home['team_name']} in Week {facts['week']}?"
+    if angle == "style clash":
+        return f"A style clash is on deck: {away['team_name']} vs {home['team_name']}"
+    if angle == "turnover battle":
+        return f"Takeaways could decide {away['team_name']} vs {home['team_name']}"
+    if angle == "quarterback-vs-pass-rush":
+        return f"Pressure point matchup arrives for {away['team_name']} and {home['team_name']}"
+    return f"Week {facts['week']} spotlight: {away['team_name']} at {home['team_name']}"
+
+
+def build_matchup_players_to_watch(facts: dict) -> list[str]:
+    away = facts["away_team"]
+    home = facts["home_team"]
+    picks = []
+    for team_key, team_name in (("away_leaders", away["team_name"]), ("home_leaders", home["team_name"])):
+        leaders = facts[team_key]
+        primary = leaders.get("passing") or leaders.get("rushing") or leaders.get("defense")
+        if primary and primary.get("player_name"):
+            stat_text = ""
+            if "total_pass_yds" in primary:
+                stat_text = f"{safe_int(primary.get('total_pass_yds'))} pass yds"
+            elif "total_rush_yds" in primary:
+                stat_text = f"{safe_int(primary.get('total_rush_yds'))} rush yds"
+            elif "total_sacks" in primary:
+                stat_text = f"{safe_int(primary.get('total_sacks'))} sacks"
+            elif "total_ints" in primary:
+                stat_text = f"{safe_int(primary.get('total_ints'))} INTs"
+            picks.append(f"{primary['player_name']} ({team_name}{', ' + stat_text if stat_text else ''})")
+    return picks[:2]
+
+
+def build_matchup_stakes_line(facts: dict) -> str:
+    away = facts["away_team"]
+    home = facts["home_team"]
+    both_winning = float(away.get("win_pct") or 0) >= 0.5 and float(home.get("win_pct") or 0) >= 0.5
+    if facts["is_gotw"]:
+        return "Game of the Week billing puts extra league-wide spotlight on every drive in this one."
+    if both_winning:
+        return "This game carries real seeding weight with both sides trying to stay near the top of the race."
+    if abs(safe_int(away.get("wins")) - safe_int(home.get("wins"))) >= 4:
+        return "This feels like a pressure game for the underdog and a statement opportunity for the favorite."
+    return "Momentum, standings position, and league perception all shift a little depending on who walks out with this one."
+
+
 def build_matchup_facts(game_row, is_gotw: bool) -> dict:
     away_team = fetch_team_standing(game_row["away_team_id"]) or {
         "team_name": game_row["away_team_name"],
@@ -1975,6 +2062,8 @@ def build_matchup_facts(game_row, is_gotw: bool) -> dict:
 
     away_leaders = fetch_team_stat_leaders(game_row["away_team_id"])
     home_leaders = fetch_team_stat_leaders(game_row["home_team_id"])
+    matchup_score = round(compute_matchup_score(game_row), 2)
+    angle = build_matchup_angle(away_team, home_team, away_leaders, home_leaders, bool(is_gotw), matchup_score)
 
     return {
         "week": safe_int(game_row.get("week")),
@@ -1982,58 +2071,80 @@ def build_matchup_facts(game_row, is_gotw: bool) -> dict:
         "stage_index": safe_int(game_row.get("stage_index")),
         "status": safe_int(game_row.get("status")),
         "is_gotw": bool(is_gotw),
-        "matchup_score": round(compute_matchup_score(game_row), 2),
+        "matchup_score": matchup_score,
+        "angle": angle,
         "away_team": away_team,
         "home_team": home_team,
         "away_storyline": build_team_storyline(away_team, away_leaders),
         "home_storyline": build_team_storyline(home_team, home_leaders),
         "away_leaders": away_leaders,
         "home_leaders": home_leaders,
+        "headline": "",
+        "players_to_watch": [],
+        "stakes_line": "",
     }
 
 
 def template_matchup_preview_text(facts: dict) -> str:
     away = facts["away_team"]
     home = facts["home_team"]
+    angle = facts["angle"]
+    seed = f"wk{facts['week']}-game{facts['game_id']}-{angle}"
 
-    lines = []
-    opener = (
-        f"Week {facts['week']} brings a showdown between the {away['team_name']} ({wins_losses_ties_text(away)}) "
-        f"and the {home['team_name']} ({wins_losses_ties_text(home)})."
-    )
-    lines.append(opener)
+    opening_options = {
+        "marquee showdown": [
+            f"Week {facts['week']} gets one of its cleanest headline games with the {away['team_name']} ({wins_losses_ties_text(away)}) lining up against the {home['team_name']} ({wins_losses_ties_text(home)}).",
+            f"All eyes in Week {facts['week']} should drift toward the {away['team_name']} and {home['team_name']}, two teams bringing real juice into this matchup.",
+        ],
+        "prove-it test": [
+            f"The {away['team_name']} walk into Week {facts['week']} needing a statement against the {home['team_name']}, who have done more to control the season so far.",
+            f"This Week {facts['week']} matchup feels like a measuring-stick game as the {away['team_name']} try to hang with the {home['team_name']}.",
+        ],
+        "style clash": [
+            f"This one sets up like a real style clash, with the {away['team_name']} and {home['team_name']} bringing very different strengths into Week {facts['week']}.",
+            f"Week {facts['week']} offers a contrast fight between the {away['team_name']} and {home['team_name']}, and that usually makes for chaos.",
+        ],
+        "turnover battle": [
+            f"Week {facts['week']} might come down to ball security as the {away['team_name']} and {home['team_name']} meet in a matchup that screams turnover swing.",
+            f"This one has takeaways written all over it, with the {away['team_name']} and {home['team_name']} both able to flip momentum fast.",
+        ],
+        "quarterback-vs-pass-rush": [
+            f"The headline angle here is simple: can the quarterback stay clean when the {away['team_name']} and {home['team_name']} start trading shots in Week {facts['week']}?",
+            f"Week {facts['week']} brings a pressure game where pass protection and quarterback poise could decide the entire script.",
+        ],
+        "playoff pressure": [
+            f"The {away['team_name']} and {home['team_name']} are stepping into one of those Week {facts['week']} games that feels heavier than a normal regular-season slot.",
+            f"There is real pressure under this Week {facts['week']} spotlight as the {away['team_name']} and {home['team_name']} fight for traction.",
+        ],
+    }
+    opener = deterministic_choice(opening_options.get(angle, opening_options['playoff pressure']), seed)
 
-    if facts["is_gotw"]:
-        lines.append(
-            "This one earned Game of the Week billing, so expect playoff-style energy and a ton of eyes on the result."
-        )
+    detail_line = deterministic_choice([
+        f"{away['team_name']} have put up {safe_int(away.get('pts_for'))} points so far, while {home['team_name']} have allowed {safe_int(home.get('pts_against'))}, making finishing drives one of the biggest swing factors.",
+        f"On the other side, {home['team_name']} have scored {safe_int(home.get('pts_for'))} points and carry a {safe_int(home.get('turnover_diff')):+d} turnover margin, so the {away['team_name']} cannot afford free possessions.",
+        f"The overall ratings are close enough to keep this honest, but the cleaner team situationally should have the edge once the game tightens up.",
+        f"This matchup score came in at {facts['matchup_score']}, which tracks with how much noise both teams have made in the standings so far.",
+    ], seed + '-detail')
+
+    story_options = [
+        facts.get("away_storyline", ""),
+        facts.get("home_storyline", ""),
+        f"The stars are obvious, but hidden depth players could end up deciding field position and late-game tempo.",
+    ]
+    story_line = deterministic_choice([s for s in story_options if s], seed + '-story')
+
+    players = build_matchup_players_to_watch(facts)
+    player_line = ""
+    if len(players) >= 2:
+        player_line = f"Players to watch start with {players[0]} and {players[1]}, two names who can tilt this matchup fast."
+    elif players:
+        player_line = f"One name worth circling is {players[0]}, because a star performance could bend the entire game script."
     else:
-        lines.append(
-            "Both sides have a real chance to shift momentum here, and this matchup could quietly reshape the standings."
-        )
+        player_line = "Whoever lands the first explosive play or turnover will probably control how this game feels the rest of the way."
 
-    lines.append(
-        f"The numbers say {away['team_name']} has scored {safe_int(away.get('pts_for'))} points and {home['team_name']} has scored {safe_int(home.get('pts_for'))}, "
-        f"so whichever offense finishes drives better may control the game."
-    )
-
-    away_star = facts["away_leaders"].get("passing") or facts["away_leaders"].get("rushing")
-    home_star = facts["home_leaders"].get("passing") or facts["home_leaders"].get("rushing")
-    if away_star and home_star and away_star.get("player_name") and home_star.get("player_name"):
-        lines.append(
-            f"Players to watch include {away_star['player_name']} for {away['team_name']} and {home_star['player_name']} for {home['team_name']}, "
-            "with both offenses leaning on their top playmakers to set the tone."
-        )
-    else:
-        lines.append(
-            "Keep an eye on who creates the first splash play, because a turnover or explosive drive could decide this one early."
-        )
-
-    lines.append(
-        f"With seeds, momentum, and league perception all in play, this feels like a game that should matter well beyond the final score."
-    )
-
-    return " ".join(lines[:5])
+    stakes_line = build_matchup_stakes_line(facts)
+    lines = [opener, detail_line, story_line, player_line, stakes_line]
+    return " ".join(line.strip() for line in lines if line.strip())
 
 
 def build_league_news_facts(week: int, games, gotw_game_ids: set[int]) -> dict:
@@ -2051,11 +2162,26 @@ def build_league_news_facts(week: int, games, gotw_game_ids: set[int]) -> dict:
             "home_team_name": game["home_team_name"],
             "matchup_score": round(compute_matchup_score(game), 2),
             "is_gotw": safe_int(game["game_id"]) in gotw_game_ids,
+            "away_wins": safe_int(game.get("away_wins")),
+            "away_losses": safe_int(game.get("away_losses")),
+            "home_wins": safe_int(game.get("home_wins")),
+            "home_losses": safe_int(game.get("home_losses")),
         })
     ranked_games.sort(key=lambda row: row["matchup_score"], reverse=True)
 
+    lead_team = standings[0] if standings else None
+    chase_team = standings[1] if len(standings) > 1 else None
+    angle = "power race"
+    if lead_team and chase_team and abs(safe_int(lead_team.get("wins")) - safe_int(chase_team.get("wins"))) <= 1:
+        angle = "tight race"
+    elif ranked_games and ranked_games[0].get("is_gotw"):
+        angle = "headline week"
+    elif passing or rushing or sacks or interceptions:
+        angle = "awards watch"
+
     return {
         "week": week,
+        "angle": angle,
         "top_teams": standings[:5],
         "passing_leaders": passing,
         "rushing_leaders": rushing,
@@ -2066,64 +2192,83 @@ def build_league_news_facts(week: int, games, gotw_game_ids: set[int]) -> dict:
     }
 
 
+def build_weekly_news_headline(facts: dict) -> str:
+    week = facts["week"]
+    angle = facts.get("angle", "power race")
+    top_game = facts["top_games"][0] if facts["top_games"] else None
+    lead_team = facts["top_teams"][0] if facts["top_teams"] else None
+    if angle == "tight race" and lead_team:
+        return f"Week {week} opens with the standings race tightening around {lead_team['team_name']}"
+    if angle == "headline week" and top_game:
+        return f"Week {week} centers on {top_game['away_team_name']} vs {top_game['home_team_name']}"
+    if angle == "awards watch":
+        return f"Week {week} arrives with MVP and stat races heating up"
+    return f"Week {week} league pulse report"
+
+
+def build_weekly_news_spotlights(facts: dict) -> list[str]:
+    items = []
+    if facts["passing_leaders"]:
+        p = facts["passing_leaders"][0]
+        items.append(f"Passing race: {p['player_name']} ({p['team_name']}) with {safe_int(p.get('total_pass_yds'))} yds")
+    if facts["rushing_leaders"]:
+        r = facts["rushing_leaders"][0]
+        items.append(f"Ground game: {r['player_name']} ({r['team_name']}) with {safe_int(r.get('total_rush_yds'))} yds")
+    if facts["sack_leaders"]:
+        s = facts["sack_leaders"][0]
+        items.append(f"Pass rush: {s['player_name']} ({s['team_name']}) with {safe_int(s.get('total_sacks'))} sacks")
+    if facts["interception_leaders"]:
+        i = facts["interception_leaders"][0]
+        items.append(f"Ball hawk: {i['player_name']} ({i['team_name']}) with {safe_int(i.get('total_ints'))} INTs")
+    if facts["top_games"]:
+        g = facts["top_games"][0]
+        label = "Game of the Week" if g.get("is_gotw") else "Main event"
+        items.append(f"{label}: {g['away_team_name']} vs {g['home_team_name']}")
+    return items[:4]
+
+
 def template_weekly_news_text(facts: dict) -> str:
     week = facts["week"]
     top_teams = facts["top_teams"]
     top_games = facts["top_games"]
+    seed = f"week-news-{week}-{facts.get('angle','power race')}"
 
     if top_teams:
         lead_team = top_teams[0]
         second_team = top_teams[1] if len(top_teams) > 1 else None
-        standings_line = (
-            f"Week {week} opens with {lead_team['team_name']} sitting on top at {wins_losses_ties_text(lead_team)}"
-        )
+        opening_options = [
+            f"Week {week} opens with {lead_team['team_name']} still setting the pace at {wins_losses_ties_text(lead_team)}.",
+            f"The pressure keeps building in Week {week}, and {lead_team['team_name']} remain the team everybody is chasing.",
+        ]
+        standings_line = deterministic_choice(opening_options, seed)
         if second_team:
-            standings_line += f", while {second_team['team_name']} is right behind at {wins_losses_ties_text(second_team)}"
-        standings_line += "."
+            standings_line += f" Right behind them, {second_team['team_name']} sit at {wins_losses_ties_text(second_team)} and keep the race honest."
     else:
-        standings_line = f"Week {week} is here, and the league race is starting to take shape."
+        standings_line = f"Week {week} is on deck and the league is starting to sort contenders from noise."
 
-    top_game = top_games[0] if top_games else None
-    if top_game:
-        marquee_line = (
-            f"The marquee matchup this week is {top_game['away_team_name']} vs {top_game['home_team_name']}"
-        )
-        if top_game["is_gotw"]:
-            marquee_line += ", which landed Game of the Week honors."
-        else:
-            marquee_line += "."
+    if top_games:
+        top_game = top_games[0]
+        marquee_options = [
+            f"The headline game on the board is {top_game['away_team_name']} vs {top_game['home_team_name']}, a matchup that should pull a lot of league attention.",
+            f"Circle {top_game['away_team_name']} against {top_game['home_team_name']} as the matchup most likely to move the room this week.",
+        ]
+        marquee_line = deterministic_choice(marquee_options, seed + '-marquee')
+        if top_game.get("is_gotw"):
+            marquee_line += " It also landed Game of the Week billing."
     else:
-        marquee_line = "Several games this week could shake up the standings."
+        marquee_line = "There are multiple games this week with enough juice to shake up the table."
 
-    passing = facts["passing_leaders"][0] if facts["passing_leaders"] else None
-    rushing = facts["rushing_leaders"][0] if facts["rushing_leaders"] else None
-    sacks = facts["sack_leaders"][0] if facts["sack_leaders"] else None
-    interceptions = facts["interception_leaders"][0] if facts["interception_leaders"] else None
+    spotlight_items = build_weekly_news_spotlights(facts)
+    if spotlight_items:
+        stat_line = "Around the league, " + "; ".join(spotlight_items[:3]) + "."
+    else:
+        stat_line = "Stat races and playoff positioning are both starting to matter more every week."
 
-    stat_line_parts = []
-    if passing:
-        stat_line_parts.append(
-            f"{passing['player_name']} leads the air attack with {safe_int(passing.get('total_pass_yds'))} passing yards"
-        )
-    if rushing:
-        stat_line_parts.append(
-            f"{rushing['player_name']} has set the pace on the ground with {safe_int(rushing.get('total_rush_yds'))} rushing yards"
-        )
-    if sacks:
-        stat_line_parts.append(
-            f"{sacks['player_name']} is terrorizing quarterbacks with {safe_int(sacks.get('total_sacks'))} sacks"
-        )
-    if interceptions:
-        stat_line_parts.append(
-            f"{interceptions['player_name']} is leading the takeaway hunt with {safe_int(interceptions.get('total_ints'))} interceptions"
-        )
-
-    stat_line = "Stat races are heating up."
-    if stat_line_parts:
-        stat_line = "Meanwhile, " + "; ".join(stat_line_parts) + "."
-
-    close_race_line = "With playoff positioning, pride, and momentum all on the line, this week feels like a pressure point in the season."
-    return " ".join([standings_line, marquee_line, stat_line, close_race_line])
+    close_line = deterministic_choice([
+        "This feels like one of those weeks where the standings could look a lot cleaner for some teams and a lot uglier for others.",
+        "Momentum is real at this point in the season, and this slate should tell the league who is building something serious.",
+    ], seed + '-close')
+    return " ".join([standings_line, marquee_line, stat_line, close_line])
 
 
 def call_openai_text(prompt: str, max_output_tokens: int = 220) -> str:
@@ -2179,13 +2324,16 @@ def call_openai_text(prompt: str, max_output_tokens: int = 220) -> str:
 
 def build_matchup_prompt(facts: dict) -> str:
     return (
-        "You are writing a short Madden franchise pregame report.\n"
+        "You are writing a short Madden franchise pregame report for Discord.\n"
         "Rules:\n"
-        "- Write exactly 3 to 5 sentences.\n"
-        "- Sound like a TV sports pregame segment.\n"
+        "- Write exactly 4 or 5 sentences.\n"
         "- Use only the facts provided.\n"
         "- Do not invent players, injuries, streaks, awards, or statistics.\n"
-        "- Keep it punchy and readable.\n\n"
+        "- Choose one central angle and lean into it: marquee showdown, prove-it test, style clash, turnover battle, quarterback-vs-pass-rush, or playoff pressure.\n"
+        "- Do not always open with both teams' records.\n"
+        "- Make it sound like a polished TV pregame hit, not generic filler.\n"
+        "- Vary sentence structure and avoid phrases like 'this one has all the makings' or 'both teams will look to'.\n"
+        "- End with a sentence about what is at stake.\n\n"
         f"Facts JSON:\n{json.dumps(facts, indent=2)}"
     )
 
@@ -2194,11 +2342,13 @@ def build_weekly_news_prompt(facts: dict) -> str:
     return (
         "You are writing a main weekly league news article for a Madden franchise Discord.\n"
         "Rules:\n"
-        "- Write one tight article of 4 to 6 sentences.\n"
-        "- Focus on standings pressure, headline matchups, and stat-race storylines.\n"
+        "- Write 5 to 7 sentences.\n"
         "- Use only the facts provided.\n"
-        "- Do not invent records, streaks, awards, or outcomes.\n"
-        "- Make it sound exciting but not cheesy.\n\n"
+        "- Focus on the biggest season storylines, standings pressure, headline games, and major stat-race movement.\n"
+        "- Do not invent records, streaks, awards, quotes, or outcomes.\n"
+        "- Make it read like a real sports desk update, not a generic recap.\n"
+        "- Use a distinct lead sentence and keep the body varied and specific.\n"
+        "- End by explaining why this week matters for the season.\n\n"
         f"Facts JSON:\n{json.dumps(facts, indent=2)}"
     )
 
@@ -2262,13 +2412,17 @@ async def post_weekly_news_article(
     if target_channel is None:
         return None, False
 
+    facts = build_league_news_facts(week, games, gotw_game_ids)
     article_text, used_ai = await generate_weekly_news_text(week, games, gotw_game_ids)
+    spotlight_items = build_weekly_news_spotlights(facts)
 
     embed = discord.Embed(
-        title=f"📰 Week {week} League Report",
+        title=f"📰 {build_weekly_news_headline(facts)}",
         description=article_text,
         color=0x1ABC9C,
     )
+    if spotlight_items:
+        embed.add_field(name="League Spotlight", value="\n".join(f"• {item}" for item in spotlight_items), inline=False)
     embed.set_footer(text="AI-assisted report" if used_ai else "Template report")
 
     await target_channel.send(embed=embed)
@@ -2380,12 +2534,19 @@ async def create_week_channels(
         await channel.send("\n".join(message_lines))
 
         if AUTO_POST_MATCHUP_PREVIEWS:
+            facts = build_matchup_facts(game, is_gotw)
+            facts["headline"] = build_matchup_headline(facts)
+            facts["players_to_watch"] = build_matchup_players_to_watch(facts)
+            facts["stakes_line"] = build_matchup_stakes_line(facts)
             preview_text, used_ai = await generate_matchup_preview_text(game, is_gotw)
             preview_embed = discord.Embed(
-                title="📰 Pregame Report",
+                title=f"📰 {facts['headline']}",
                 description=preview_text,
                 color=0x3498DB if not is_gotw else 0xF39C12,
             )
+            if facts["players_to_watch"]:
+                preview_embed.add_field(name="Players to Watch", value="\n".join(f"• {item}" for item in facts["players_to_watch"]), inline=False)
+            preview_embed.add_field(name="Why It Matters", value=facts["stakes_line"], inline=False)
             preview_embed.set_footer(text="AI-assisted preview" if used_ai else "Template preview")
             await channel.send(embed=preview_embed)
 
@@ -2543,17 +2704,50 @@ async def preview_matchup_article(
     gotw_game_ids = {game["game_id"] for game, _score in scored_games[:2]}
     is_gotw = selected_game["game_id"] in gotw_game_ids
 
+    facts = build_matchup_facts(selected_game, is_gotw)
+    facts["headline"] = build_matchup_headline(facts)
+    facts["players_to_watch"] = build_matchup_players_to_watch(facts)
+    facts["stakes_line"] = build_matchup_stakes_line(facts)
     preview_text, used_ai = await generate_matchup_preview_text(selected_game, is_gotw)
     embed = discord.Embed(
-        title=f"📰 Week {week} Pregame Report",
+        title=f"📰 {facts['headline']}",
         description=preview_text,
         color=0x3498DB if not is_gotw else 0xF39C12,
     )
+    if facts["players_to_watch"]:
+        embed.add_field(name="Players to Watch", value="\n".join(f"• {item}" for item in facts["players_to_watch"]), inline=False)
+    embed.add_field(name="Why It Matters", value=facts["stakes_line"], inline=False)
     embed.set_footer(text="AI-assisted preview" if used_ai else "Template preview")
 
     await interaction.followup.send("Posted below.", ephemeral=True)
     if interaction.channel:
         await interaction.channel.send(embed=embed)
+
+
+@bot.tree.command(name="regenerate_weekly_news", description="Admin: regenerate and repost the weekly league news article.")
+@admin_only()
+@app_commands.describe(
+    week="Week number from the games table",
+    channel="Optional channel to post in. Defaults to NEWS_CHANNEL_ID or current channel.",
+)
+async def regenerate_weekly_news(
+    interaction: discord.Interaction,
+    week: int,
+    channel: Optional[discord.TextChannel] = None,
+):
+    await post_weekly_news.callback(interaction, week, channel)  # type: ignore[attr-defined]
+
+
+@bot.tree.command(name="regenerate_matchup_article", description="Admin: regenerate and repost one matchup preview article in the current channel.")
+@admin_only()
+@app_commands.describe(week="Week number", away_team="Away team name", home_team="Home team name")
+async def regenerate_matchup_article(
+    interaction: discord.Interaction,
+    week: int,
+    away_team: str,
+    home_team: str,
+):
+    await preview_matchup_article.callback(interaction, week, away_team, home_team)  # type: ignore[attr-defined]
 
 
 @bot.tree.command(name="post_season_leaders", description="Admin: post current season stat leaders.")
