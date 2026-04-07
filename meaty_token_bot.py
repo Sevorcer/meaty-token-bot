@@ -1,6 +1,7 @@
 import os
 import random
 import re
+import sqlite3
 import asyncio
 import json
 from dataclasses import dataclass
@@ -141,109 +142,108 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Token database helpers (SQLite)
 # -----------------------------
 class TokenDatabase:
-    def __init__(self, database_url: str):
-        self.database_url = database_url or DATABASE_URL
-        if not self.database_url:
-            raise RuntimeError("DATABASE_URL is required for token storage.")
+    def __init__(self, path: str):
+        self.path = path
         self._init_db()
 
     def connect(self):
-        return psycopg.connect(self.database_url, row_factory=dict_row)
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
     def _init_db(self):
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS bot_users (
-                        user_id BIGINT PRIMARY KEY,
-                        username TEXT NOT NULL,
-                        balance NUMERIC(12,2) NOT NULL DEFAULT 0,
-                        total_earned NUMERIC(12,2) NOT NULL DEFAULT 0,
-                        total_spent NUMERIC(12,2) NOT NULL DEFAULT 0,
-                        casino_wins INTEGER NOT NULL DEFAULT 0,
-                        casino_losses INTEGER NOT NULL DEFAULT 0,
-                        bounty_wins INTEGER NOT NULL DEFAULT 0,
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )
-                    """
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    balance REAL NOT NULL DEFAULT 0,
+                    total_earned REAL NOT NULL DEFAULT 0,
+                    total_spent REAL NOT NULL DEFAULT 0,
+                    casino_wins INTEGER NOT NULL DEFAULT 0,
+                    casino_losses INTEGER NOT NULL DEFAULT 0,
+                    bounty_wins INTEGER NOT NULL DEFAULT 0
                 )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS bot_ledger (
-                        id BIGSERIAL PRIMARY KEY,
-                        user_id BIGINT NOT NULL REFERENCES bot_users(user_id) ON DELETE CASCADE,
-                        amount NUMERIC(12,2) NOT NULL,
-                        reason TEXT NOT NULL,
-                        category TEXT NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )
-                    """
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    amount REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_ledger_user_id ON bot_ledger(user_id)")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_ledger_created_at ON bot_ledger(created_at)")
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS bot_bounties (
-                        id BIGSERIAL PRIMARY KEY,
-                        title TEXT NOT NULL,
-                        description TEXT NOT NULL,
-                        reward NUMERIC(12,2) NOT NULL,
-                        created_by BIGINT NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                        claimed_by BIGINT,
-                        claimed_at TIMESTAMPTZ
-                    )
-                    """
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bounties (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    reward REAL NOT NULL,
+                    created_by INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    claimed_by INTEGER,
+                    claimed_at TIMESTAMP
                 )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS bot_shop_purchases (
-                        id BIGSERIAL PRIMARY KEY,
-                        user_id BIGINT NOT NULL REFERENCES bot_users(user_id) ON DELETE CASCADE,
-                        item_name TEXT NOT NULL,
-                        cost NUMERIC(12,2) NOT NULL,
-                        notes TEXT,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )
-                    """
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS shop_purchases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    item_name TEXT NOT NULL,
+                    cost REAL NOT NULL,
+                    notes TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
+                """
+            )
             conn.commit()
 
     def ensure_user(self, user: discord.abc.User):
         with self.connect() as conn:
-            with conn.cursor() as cur:
+            cur = conn.cursor()
+            cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user.id,))
+            if cur.fetchone() is None:
                 cur.execute(
-                    """
-                    INSERT INTO bot_users (user_id, username) VALUES (%s, %s)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                        username = EXCLUDED.username,
-                        updated_at = NOW()
-                    """,
+                    "INSERT INTO users (user_id, username) VALUES (?, ?)",
                     (user.id, str(user)),
+                )
+            else:
+                cur.execute(
+                    "UPDATE users SET username = ? WHERE user_id = ?",
+                    (str(user), user.id),
                 )
             conn.commit()
 
     def get_user(self, user: discord.abc.User):
         self.ensure_user(user)
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM bot_users WHERE user_id = %s", (user.id,))
-                return cur.fetchone()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM users WHERE user_id = ?", (user.id,))
+            return cur.fetchone()
 
     def add_tokens(self, user: discord.abc.User, amount: float, reason: str, category: str):
         self.ensure_user(user)
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE bot_users SET balance = balance + %s, total_earned = total_earned + %s, updated_at = NOW() WHERE user_id = %s",
-                    (amount, max(amount, 0), user.id),
-                )
-                cur.execute(
-                    "INSERT INTO bot_ledger (user_id, amount, reason, category) VALUES (%s, %s, %s, %s)",
-                    (user.id, amount, reason, category),
-                )
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE users SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?",
+                (amount, max(amount, 0), user.id),
+            )
+            cur.execute(
+                "INSERT INTO ledger (user_id, amount, reason, category) VALUES (?, ?, ?, ?)",
+                (user.id, amount, reason, category),
+            )
             conn.commit()
 
     def add_tokens_bulk(self, users: list[discord.abc.User], amount: float, reason: str, category: str) -> int:
@@ -252,141 +252,141 @@ class TokenDatabase:
             return 0
 
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                for user in valid_users:
+            cur = conn.cursor()
+
+            for user in valid_users:
+                cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user.id,))
+                if cur.fetchone() is None:
                     cur.execute(
-                        """
-                        INSERT INTO bot_users (user_id, username) VALUES (%s, %s)
-                        ON CONFLICT (user_id) DO UPDATE SET
-                            username = EXCLUDED.username,
-                            updated_at = NOW()
-                        """,
+                        "INSERT INTO users (user_id, username) VALUES (?, ?)",
                         (user.id, str(user)),
                     )
+                else:
+                    cur.execute(
+                        "UPDATE users SET username = ? WHERE user_id = ?",
+                        (str(user), user.id),
+                    )
 
-                cur.executemany(
-                    "UPDATE bot_users SET balance = balance + %s, total_earned = total_earned + %s, updated_at = NOW() WHERE user_id = %s",
-                    [(amount, max(amount, 0), user.id) for user in valid_users],
-                )
-                cur.executemany(
-                    "INSERT INTO bot_ledger (user_id, amount, reason, category) VALUES (%s, %s, %s, %s)",
-                    [(user.id, amount, reason, category) for user in valid_users],
-                )
+            cur.executemany(
+                "UPDATE users SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?",
+                [(amount, max(amount, 0), user.id) for user in valid_users],
+            )
+            cur.executemany(
+                "INSERT INTO ledger (user_id, amount, reason, category) VALUES (?, ?, ?, ?)",
+                [(user.id, amount, reason, category) for user in valid_users],
+            )
             conn.commit()
-        return len(valid_users)
+            return len(valid_users)
+
 
     def spend_tokens(self, user: discord.abc.User, amount: float, reason: str, category: str) -> bool:
         self.ensure_user(user)
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT balance FROM bot_users WHERE user_id = %s FOR UPDATE", (user.id,))
-                row = cur.fetchone()
-                if row is None or float(row["balance"]) < amount:
-                    return False
-                cur.execute(
-                    "UPDATE bot_users SET balance = balance - %s, total_spent = total_spent + %s, updated_at = NOW() WHERE user_id = %s",
-                    (amount, amount, user.id),
-                )
-                cur.execute(
-                    "INSERT INTO bot_ledger (user_id, amount, reason, category) VALUES (%s, %s, %s, %s)",
-                    (user.id, -amount, reason, category),
-                )
+            cur = conn.cursor()
+            cur.execute("SELECT balance FROM users WHERE user_id = ?", (user.id,))
+            row = cur.fetchone()
+            if row is None or row["balance"] < amount:
+                return False
+            cur.execute(
+                "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id = ?",
+                (amount, amount, user.id),
+            )
+            cur.execute(
+                "INSERT INTO ledger (user_id, amount, reason, category) VALUES (?, ?, ?, ?)",
+                (user.id, -amount, reason, category),
+            )
             conn.commit()
             return True
 
     def record_shop_purchase(self, user: discord.abc.User, item_name: str, cost: float, notes: str = ""):
-        self.ensure_user(user)
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO bot_shop_purchases (user_id, item_name, cost, notes) VALUES (%s, %s, %s, %s)",
-                    (user.id, item_name, cost, notes),
-                )
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO shop_purchases (user_id, item_name, cost, notes) VALUES (?, ?, ?, ?)",
+                (user.id, item_name, cost, notes),
+            )
             conn.commit()
 
     def update_casino_result(self, user: discord.abc.User, won: bool):
         self.ensure_user(user)
-        field = "casino_wins" if won else "casino_losses"
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(f"UPDATE bot_users SET {field} = {field} + 1, updated_at = NOW() WHERE user_id = %s", (user.id,))
+            cur = conn.cursor()
+            field = "casino_wins" if won else "casino_losses"
+            cur.execute(f"UPDATE users SET {field} = {field} + 1 WHERE user_id = ?", (user.id,))
             conn.commit()
 
     def leaderboard(self):
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM bot_users WHERE balance > 0 ORDER BY balance DESC, total_earned DESC")
-                return cur.fetchall()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM users WHERE balance > 0 ORDER BY balance DESC, total_earned DESC")
+            return cur.fetchall()
 
     def recent_ledger(self, user: discord.abc.User, limit: int = 10):
         self.ensure_user(user)
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT * FROM bot_ledger WHERE user_id = %s ORDER BY id DESC LIMIT %s",
-                    (user.id, limit),
-                )
-                return cur.fetchall()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM ledger WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+                (user.id, limit),
+            )
+            return cur.fetchall()
 
     def create_bounty(self, title: str, description: str, reward: float, created_by: int):
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO bot_bounties (title, description, reward, created_by) VALUES (%s, %s, %s, %s) RETURNING id",
-                    (title, description, reward, created_by),
-                )
-                bounty_id = cur.fetchone()["id"]
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO bounties (title, description, reward, created_by) VALUES (?, ?, ?, ?)",
+                (title, description, reward, created_by),
+            )
+            bounty_id = cur.lastrowid
             conn.commit()
             return bounty_id
 
     def list_active_bounties(self):
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM bot_bounties WHERE is_active = TRUE ORDER BY id DESC")
-                return cur.fetchall()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM bounties WHERE is_active = 1 ORDER BY id DESC")
+            return cur.fetchall()
 
-    def claim_bounty(self, bounty_id: int, user: discord.abc.User):
+    def claim_bounty(self, bounty_id: int, user: discord.abc.User) -> Optional[sqlite3.Row]:
         self.ensure_user(user)
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM bot_bounties WHERE id = %s AND is_active = TRUE FOR UPDATE", (bounty_id,))
-                bounty = cur.fetchone()
-                if bounty is None:
-                    return None
-                cur.execute(
-                    "UPDATE bot_bounties SET is_active = FALSE, claimed_by = %s, claimed_at = NOW() WHERE id = %s",
-                    (user.id, bounty_id),
-                )
-                cur.execute(
-                    "UPDATE bot_users SET balance = balance + %s, total_earned = total_earned + %s, bounty_wins = bounty_wins + 1, updated_at = NOW() WHERE user_id = %s",
-                    (bounty["reward"], bounty["reward"], user.id),
-                )
-                cur.execute(
-                    "INSERT INTO bot_ledger (user_id, amount, reason, category) VALUES (%s, %s, %s, %s)",
-                    (user.id, bounty["reward"], f"Claimed bounty #{bounty_id}: {bounty['title']}", "bounty"),
-                )
-                cur.execute("SELECT * FROM bot_bounties WHERE id = %s", (bounty_id,))
-                updated = cur.fetchone()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM bounties WHERE id = ? AND is_active = 1", (bounty_id,))
+            bounty = cur.fetchone()
+            if bounty is None:
+                return None
+            cur.execute(
+                "UPDATE bounties SET is_active = 0, claimed_by = ?, claimed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (user.id, bounty_id),
+            )
+            cur.execute(
+                "UPDATE users SET balance = balance + ?, total_earned = total_earned + ?, bounty_wins = bounty_wins + 1 WHERE user_id = ?",
+                (bounty["reward"], bounty["reward"], user.id),
+            )
+            cur.execute(
+                "INSERT INTO ledger (user_id, amount, reason, category) VALUES (?, ?, ?, ?)",
+                (user.id, bounty["reward"], f"Claimed bounty #{bounty_id}: {bounty['title']}", "bounty"),
+            )
             conn.commit()
-            return updated
+            cur.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,))
+            return cur.fetchone()
 
     def update_bounty_reward(self, bounty_id: int, reward: float) -> bool:
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE bot_bounties SET reward = %s WHERE id = %s", (reward, bounty_id))
-                changed = cur.rowcount > 0
+            cur = conn.cursor()
+            cur.execute("UPDATE bounties SET reward = ? WHERE id = ?", (reward, bounty_id))
             conn.commit()
-            return changed
+            return cur.rowcount > 0
 
     def get_bounty(self, bounty_id: int):
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM bot_bounties WHERE id = %s", (bounty_id,))
-                return cur.fetchone()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,))
+            return cur.fetchone()
 
 
-TOKEN_DB = TokenDatabase(DATABASE_URL)
-
+TOKEN_DB = TokenDatabase(TOKEN_DB_PATH)
 
 
 # -----------------------------
@@ -1838,6 +1838,302 @@ def fetch_rivalry_leaderboard_rows(limit: int = 10):
 # -----------------------------
 # Public commands
 # -----------------------------
+
+
+def fetch_all_regular_season_games_current_season():
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    g.game_id,
+                    g.season_index,
+                    g.stage_index,
+                    g.week,
+                    (g.week + 1) AS display_week,
+                    g.status,
+                    g.away_score,
+                    g.home_score,
+                    g.away_team_id,
+                    g.home_team_id,
+                    away.team_name AS away_team_name,
+                    away.division_name AS away_division_name,
+                    home.team_name AS home_team_name,
+                    home.division_name AS home_division_name
+                FROM games g
+                JOIN teams away ON away.team_id = g.away_team_id
+                JOIN teams home ON home.team_id = g.home_team_id
+                WHERE g.season_index = (SELECT MAX(season_index) FROM games)
+                  AND g.stage_index = 1
+                ORDER BY g.week ASC, g.game_id ASC
+                """
+            )
+            return cur.fetchall()
+
+
+def fetch_completed_team_games_current_season(team_id: int):
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    g.game_id,
+                    g.season_index,
+                    g.stage_index,
+                    g.week,
+                    (g.week + 1) AS display_week,
+                    g.status,
+                    g.away_team_id,
+                    g.home_team_id,
+                    g.away_score,
+                    g.home_score,
+                    away.team_name AS away_team_name,
+                    home.team_name AS home_team_name
+                FROM games g
+                JOIN teams away ON away.team_id = g.away_team_id
+                JOIN teams home ON home.team_id = g.home_team_id
+                WHERE g.season_index = (SELECT MAX(season_index) FROM games)
+                  AND g.stage_index = 1
+                  AND (g.away_team_id = %s OR g.home_team_id = %s)
+                ORDER BY g.week DESC, g.game_id DESC
+                """,
+                (team_id, team_id),
+            )
+            rows = cur.fetchall()
+    return [row for row in rows if looks_like_completed_game(row)]
+
+
+def compute_team_streak(team_id: int) -> tuple[str, int]:
+    games = fetch_completed_team_games_current_season(team_id)
+    if not games:
+        return ("N/A", 0)
+
+    streak_type = None
+    streak_count = 0
+    for game in games:
+        away_id = safe_int(game.get("away_team_id"))
+        home_id = safe_int(game.get("home_team_id"))
+        away_score = safe_int(game.get("away_score"))
+        home_score = safe_int(game.get("home_score"))
+
+        if away_score == home_score:
+            result = "T"
+        elif (away_id == team_id and away_score > home_score) or (home_id == team_id and home_score > away_score):
+            result = "W"
+        else:
+            result = "L"
+
+        if streak_type is None:
+            streak_type = result
+            streak_count = 1
+            continue
+
+        if result == streak_type:
+            streak_count += 1
+        else:
+            break
+
+    return (streak_type or "N/A", streak_count)
+
+
+def detect_profile_storyline(team_row: dict) -> str:
+    wins = safe_int(team_row.get("wins"))
+    losses = safe_int(team_row.get("losses"))
+    seed = safe_int(team_row.get("seed"))
+    streak_type, streak_count = compute_team_streak(safe_int(team_row.get("team_id")))
+
+    if wins > 0 and losses == 0:
+        return "Undefeated and hunting statement wins"
+    if streak_type == "W" and streak_count >= 4:
+        return f"On a {streak_count}-game heater"
+    if streak_type == "L" and streak_count >= 3:
+        return f"Slipping with {streak_count} straight losses"
+    if seed and seed <= 4 and wins >= max(6, losses):
+        return "Division bully with playoff control"
+    if wins >= losses and abs(wins - losses) <= 1:
+        return "Fighting for playoff position"
+    if losses > wins and streak_type == "L":
+        return "Under pressure to stop the slide"
+    return "Grinding through the season"
+
+
+def compute_gotw_assignments() -> dict[int, list[dict]]:
+    all_games = fetch_all_regular_season_games_current_season()
+    by_week = {}
+    for game in all_games:
+        by_week.setdefault(safe_int(game.get("display_week")), []).append(game)
+
+    assignments = {}
+    for week, games in by_week.items():
+        scored_games = sorted(((game, compute_matchup_score(game)) for game in games), key=lambda item: item[1], reverse=True)
+        for game, score in scored_games[:2]:
+            game_id = safe_int(game.get("game_id"))
+            assignments[game_id] = {
+                "week": week,
+                "score": score,
+                "away_team_id": safe_int(game.get("away_team_id")),
+                "home_team_id": safe_int(game.get("home_team_id")),
+            }
+    return assignments
+
+
+def compute_rivalry_assignments() -> dict[int, dict]:
+    standings = fetch_standings_rows()
+    standing_map = {safe_text(row.get("team_name")): row for row in standings}
+
+    all_games = fetch_all_regular_season_games_current_season()
+    candidates = []
+    for game in all_games:
+        if normalize_team_name(game.get("away_division_name")) != normalize_team_name(game.get("home_division_name")):
+            continue
+        away_name = safe_text(game.get("away_team_name"))
+        home_name = safe_text(game.get("home_team_name"))
+        away_stand = standing_map.get(away_name, {})
+        home_stand = standing_map.get(home_name, {})
+        combined_wins = safe_int(away_stand.get("wins")) + safe_int(home_stand.get("wins"))
+        combined_win_pct = float(away_stand.get("win_pct") or 0) + float(home_stand.get("win_pct") or 0)
+        candidates.append({
+            "game": game,
+            "combined_wins": combined_wins,
+            "combined_win_pct": combined_win_pct,
+        })
+
+    def game_priority(item, counts):
+        game = item["game"]
+        away_id = safe_int(game.get("away_team_id"))
+        home_id = safe_int(game.get("home_team_id"))
+        under_min_bonus = 0
+        if counts.get(away_id, 0) < 2:
+            under_min_bonus += 1000
+        if counts.get(home_id, 0) < 2:
+            under_min_bonus += 1000
+        return (
+            under_min_bonus,
+            item["combined_wins"] * 10,
+            item["combined_win_pct"] * 100,
+            -safe_int(game.get("display_week")),
+        )
+
+    counts = {}
+    assigned = {}
+
+    remaining = candidates[:]
+    while True:
+        teams_below_min = {team_id for team_id, count in counts.items() if count < 2}
+        if not teams_below_min:
+            # include teams not seen yet
+            team_ids_in_candidates = {safe_int(c["game"].get("away_team_id")) for c in candidates} | {safe_int(c["game"].get("home_team_id")) for c in candidates}
+            teams_below_min = {tid for tid in team_ids_in_candidates if counts.get(tid, 0) < 2}
+        if not teams_below_min:
+            break
+
+        eligible = []
+        for item in remaining:
+            game = item["game"]
+            away_id = safe_int(game.get("away_team_id"))
+            home_id = safe_int(game.get("home_team_id"))
+            if counts.get(away_id, 0) >= 4 or counts.get(home_id, 0) >= 4:
+                continue
+            if counts.get(away_id, 0) < 2 or counts.get(home_id, 0) < 2:
+                eligible.append(item)
+
+        if not eligible:
+            break
+
+        eligible.sort(key=lambda item: game_priority(item, counts), reverse=True)
+        chosen = eligible[0]
+        game = chosen["game"]
+        game_id = safe_int(game.get("game_id"))
+        away_id = safe_int(game.get("away_team_id"))
+        home_id = safe_int(game.get("home_team_id"))
+        assigned[game_id] = {
+            "week": safe_int(game.get("display_week")),
+            "away_team_id": away_id,
+            "home_team_id": home_id,
+        }
+        counts[away_id] = counts.get(away_id, 0) + 1
+        counts[home_id] = counts.get(home_id, 0) + 1
+        remaining = [item for item in remaining if safe_int(item["game"].get("game_id")) != game_id]
+
+    extra_candidates = []
+    for item in remaining:
+        game = item["game"]
+        away_id = safe_int(game.get("away_team_id"))
+        home_id = safe_int(game.get("home_team_id"))
+        if counts.get(away_id, 0) >= 4 or counts.get(home_id, 0) >= 4:
+            continue
+        if item["combined_win_pct"] >= 1.0 or item["combined_wins"] >= 10:
+            extra_candidates.append(item)
+
+    extra_candidates.sort(key=lambda item: game_priority(item, counts), reverse=True)
+    for item in extra_candidates:
+        game = item["game"]
+        game_id = safe_int(game.get("game_id"))
+        away_id = safe_int(game.get("away_team_id"))
+        home_id = safe_int(game.get("home_team_id"))
+        if counts.get(away_id, 0) >= 4 or counts.get(home_id, 0) >= 4:
+            continue
+        assigned[game_id] = {
+            "week": safe_int(game.get("display_week")),
+            "away_team_id": away_id,
+            "home_team_id": home_id,
+        }
+        counts[away_id] = counts.get(away_id, 0) + 1
+        counts[home_id] = counts.get(home_id, 0) + 1
+
+    return assigned
+
+
+def resolve_member_team_row(member: discord.Member):
+    possible_names = [member.display_name or "", member.name or "", getattr(member, "global_name", "") or ""]
+    for raw_name in possible_names:
+        if not raw_name:
+            continue
+        team_row = resolve_team_row(raw_name)
+        if team_row:
+            return team_row
+    return None
+
+
+def build_profile_embed(member: discord.Member, team_row: dict) -> discord.Embed:
+    standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
+    merged_team = {**team_row, **standing_row}
+    token_row = TOKEN_DB.get_user(member)
+
+    gotw_assignments = compute_gotw_assignments()
+    rivalry_assignments = compute_rivalry_assignments()
+    team_id = safe_int(merged_team.get("team_id"))
+
+    gotw_count = sum(1 for item in gotw_assignments.values() if item["away_team_id"] == team_id or item["home_team_id"] == team_id)
+    rivalry_count = sum(1 for item in rivalry_assignments.values() if item["away_team_id"] == team_id or item["home_team_id"] == team_id)
+
+    casino_games = safe_int(token_row["casino_wins"]) + safe_int(token_row["casino_losses"])
+    casino_win_pct = (safe_int(token_row["casino_wins"]) / casino_games * 100) if casino_games else 0.0
+
+    wins = safe_int(merged_team.get("wins"))
+    losses = safe_int(merged_team.get("losses"))
+    ties = safe_int(merged_team.get("ties"))
+    record_text = f"{wins}-{losses}-{ties}" if ties else f"{wins}-{losses}"
+
+    streak_type, streak_count = compute_team_streak(team_id)
+    streak_text = f"{streak_type}{streak_count}" if streak_count else "N/A"
+    storyline = detect_profile_storyline(merged_team)
+
+    embed = discord.Embed(
+        title=f"👤 {member.display_name} Profile",
+        description=f"**Team:** {safe_text(merged_team.get('team_name'))}\n**Record:** {record_text}\n**Storyline:** {storyline}",
+        color=0x5865F2,
+    )
+    embed.add_field(name="Tokens", value=fmt_tokens(token_row["balance"]), inline=True)
+    embed.add_field(name="Casino", value=f"{token_row['casino_wins']}-{token_row['casino_losses']} ({casino_win_pct:.1f}%)", inline=True)
+    embed.add_field(name="Bounties", value=str(token_row["bounty_wins"]), inline=True)
+    embed.add_field(name="Rivalry Games", value=str(rivalry_count), inline=True)
+    embed.add_field(name="GOTW Appearances", value=str(gotw_count), inline=True)
+    embed.add_field(name="Streak", value=streak_text, inline=True)
+    embed.set_footer(text=f"{safe_text(merged_team.get('conference_name'))} / {safe_text(merged_team.get('division_name'))}")
+    return embed
+
+
 @bot.tree.command(name="ping", description="Check if the bot is online.")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong. Meaty Token Bot is online.", ephemeral=True)
@@ -2131,6 +2427,33 @@ async def rivalryleaderboard(interaction: discord.Interaction):
     await interaction.response.send_message(
         embed=build_embed("🔥 Rivalry Leaderboard", "\n".join(lines), 0xE67E22)
     )
+
+
+
+
+@bot.tree.command(name="profile", description="Show a coach profile based on Discord nickname to team matching.")
+@app_commands.describe(user="Optional: check another user's profile")
+async def profile(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    if not isinstance(target, discord.Member):
+        await interaction.response.send_message("This command must be used inside a server.", ephemeral=True)
+        return
+
+    team_row = resolve_member_team_row(target)
+    if not team_row:
+        await interaction.response.send_message(
+            f"Could not match **{target.display_name}** to a franchise team. Their nickname should match the team name.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        embed = build_profile_embed(target, team_row)
+    except Exception as exc:
+        await interaction.response.send_message(f"Failed to build profile: {exc}", ephemeral=True)
+        return
+
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="balance", description="Check your token balance.")
