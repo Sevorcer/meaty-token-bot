@@ -1859,10 +1859,22 @@ def fetch_all_regular_season_games_current_season():
                     away.team_name AS away_team_name,
                     away.division_name AS away_division_name,
                     home.team_name AS home_team_name,
-                    home.division_name AS home_division_name
+                    home.division_name AS home_division_name,
+                    COALESCE(away_standings.wins, 0) AS away_wins,
+                    COALESCE(away_standings.losses, 0) AS away_losses,
+                    COALESCE(away_standings.ties, 0) AS away_ties,
+                    COALESCE(away_standings.win_pct, 0) AS away_win_pct,
+                    COALESCE(away.team_ovr, 0) AS away_ovr,
+                    COALESCE(home_standings.wins, 0) AS home_wins,
+                    COALESCE(home_standings.losses, 0) AS home_losses,
+                    COALESCE(home_standings.ties, 0) AS home_ties,
+                    COALESCE(home_standings.win_pct, 0) AS home_win_pct,
+                    COALESCE(home.team_ovr, 0) AS home_ovr
                 FROM games g
                 JOIN teams away ON away.team_id = g.away_team_id
                 JOIN teams home ON home.team_id = g.home_team_id
+                LEFT JOIN standings away_standings ON away_standings.team_id = g.away_team_id
+                LEFT JOIN standings home_standings ON home_standings.team_id = g.home_team_id
                 WHERE g.season_index = (SELECT MAX(season_index) FROM games)
                   AND g.stage_index = 1
                 ORDER BY g.week ASC, g.game_id ASC
