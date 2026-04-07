@@ -924,6 +924,19 @@ def fetch_games_for_week(week: int, stage_index: Optional[int] = None):
     return fetch_games_for_stage_week(resolved_stage, week)
 
 
+def get_active_stat_scope() -> tuple[int, int]:
+    stage_index, _display_week = detect_current_stage_and_week()
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(MAX(season_index), 0) AS season_index FROM games")
+            row = cur.fetchone() or {}
+    season_index = int((row.get("season_index") or 0))
+    # Madden awards / season leaderboards should use preseason-only during preseason,
+    # and regular-season-only once the regular season has started.
+    stat_stage_index = 0 if stage_index == 0 else 1
+    return season_index, stat_stage_index
+
+
 def compute_matchup_score(game_row) -> float:
     away_wins = game_row["away_wins"] or 0
     away_win_pct = float(game_row["away_win_pct"] or 0)
@@ -950,7 +963,9 @@ def compute_matchup_score(game_row) -> float:
     )
 
 
+
 def fetch_top_passing_leaders(limit: int = 5):
+    season_index, stat_stage_index = get_active_stat_scope()
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -963,16 +978,20 @@ def fetch_top_passing_leaders(limit: int = 5):
                 FROM player_passing_stats pps
                 LEFT JOIN players ON players.roster_id = pps.roster_id
                 LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, pps.team_id)
+                WHERE COALESCE(pps.season_index, 0) = %s
+                  AND COALESCE(pps.stage_index, 0) = %s
                 GROUP BY pps.roster_id
                 ORDER BY total_pass_yds DESC, player_name ASC
                 LIMIT %s
                 """,
-                (limit,),
+                (season_index, stat_stage_index, limit),
             )
             return cur.fetchall()
 
 
+
 def fetch_top_rushing_leaders(limit: int = 5):
+    season_index, stat_stage_index = get_active_stat_scope()
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -985,16 +1004,20 @@ def fetch_top_rushing_leaders(limit: int = 5):
                 FROM player_rushing_stats prs
                 LEFT JOIN players ON players.roster_id = prs.roster_id
                 LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, prs.team_id)
+                WHERE COALESCE(prs.season_index, 0) = %s
+                  AND COALESCE(prs.stage_index, 0) = %s
                 GROUP BY prs.roster_id
                 ORDER BY total_rush_yds DESC, player_name ASC
                 LIMIT %s
                 """,
-                (limit,),
+                (season_index, stat_stage_index, limit),
             )
             return cur.fetchall()
 
 
+
 def fetch_top_sack_leaders(limit: int = 5):
+    season_index, stat_stage_index = get_active_stat_scope()
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1007,16 +1030,20 @@ def fetch_top_sack_leaders(limit: int = 5):
                 FROM player_defense_stats pds
                 LEFT JOIN players ON players.roster_id = pds.roster_id
                 LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, pds.team_id)
+                WHERE COALESCE(pds.season_index, 0) = %s
+                  AND COALESCE(pds.stage_index, 0) = %s
                 GROUP BY pds.roster_id
                 ORDER BY total_sacks DESC, player_name ASC
                 LIMIT %s
                 """,
-                (limit,),
+                (season_index, stat_stage_index, limit),
             )
             return cur.fetchall()
 
 
+
 def fetch_top_interception_leaders(limit: int = 5):
+    season_index, stat_stage_index = get_active_stat_scope()
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1029,11 +1056,13 @@ def fetch_top_interception_leaders(limit: int = 5):
                 FROM player_defense_stats pds
                 LEFT JOIN players ON players.roster_id = pds.roster_id
                 LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, pds.team_id)
+                WHERE COALESCE(pds.season_index, 0) = %s
+                  AND COALESCE(pds.stage_index, 0) = %s
                 GROUP BY pds.roster_id
                 ORDER BY total_ints DESC, player_name ASC
                 LIMIT %s
                 """,
-                (limit,),
+                (season_index, stat_stage_index, limit),
             )
             return cur.fetchall()
 
@@ -1052,7 +1081,9 @@ def format_leader_lines(rows, stat_key: str, stat_label: str):
 
 
 
+
 def fetch_mvp_race_rows(limit: int = 10):
+    season_index, stat_stage_index = get_active_stat_scope()
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1064,6 +1095,8 @@ def fetch_mvp_race_rows(limit: int = 10):
                         SUM(COALESCE(pps.pass_td, 0)) AS pass_td,
                         SUM(COALESCE(pps.pass_int, 0)) AS pass_int
                     FROM player_passing_stats pps
+                    WHERE COALESCE(pps.season_index, 0) = %s
+                      AND COALESCE(pps.stage_index, 0) = %s
                     GROUP BY pps.roster_id
                 ),
                 rush_stats AS (
@@ -1072,6 +1105,8 @@ def fetch_mvp_race_rows(limit: int = 10):
                         SUM(COALESCE(prs.rush_yds, 0)) AS rush_yds,
                         SUM(COALESCE(prs.rush_td, 0)) AS rush_td
                     FROM player_rushing_stats prs
+                    WHERE COALESCE(prs.season_index, 0) = %s
+                      AND COALESCE(prs.stage_index, 0) = %s
                     GROUP BY prs.roster_id
                 )
                 SELECT
@@ -1103,12 +1138,14 @@ def fetch_mvp_race_rows(limit: int = 10):
                 ORDER BY award_score DESC, team_wins DESC, player_name ASC
                 LIMIT %s
                 """,
-                (limit,),
+                (season_index, stat_stage_index, season_index, stat_stage_index, limit),
             )
             return cur.fetchall()
 
 
+
 def fetch_opoty_race_rows(limit: int = 10, rookies_only: bool = False):
+    season_index, stat_stage_index = get_active_stat_scope()
     rookie_clause = "AND COALESCE(p.years_pro, 0) = 0" if rookies_only else ""
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
@@ -1120,6 +1157,8 @@ def fetch_opoty_race_rows(limit: int = 10, rookies_only: bool = False):
                         SUM(COALESCE(pps.pass_yds, 0)) AS pass_yds,
                         SUM(COALESCE(pps.pass_td, 0)) AS pass_td
                     FROM player_passing_stats pps
+                    WHERE COALESCE(pps.season_index, 0) = %s
+                      AND COALESCE(pps.stage_index, 0) = %s
                     GROUP BY pps.roster_id
                 ),
                 rush_stats AS (
@@ -1128,6 +1167,8 @@ def fetch_opoty_race_rows(limit: int = 10, rookies_only: bool = False):
                         SUM(COALESCE(prs.rush_yds, 0)) AS rush_yds,
                         SUM(COALESCE(prs.rush_td, 0)) AS rush_td
                     FROM player_rushing_stats prs
+                    WHERE COALESCE(prs.season_index, 0) = %s
+                      AND COALESCE(prs.stage_index, 0) = %s
                     GROUP BY prs.roster_id
                 )
                 SELECT
@@ -1155,13 +1196,15 @@ def fetch_opoty_race_rows(limit: int = 10, rookies_only: bool = False):
                 ORDER BY award_score DESC, player_name ASC
                 LIMIT %s
                 """,
-                (limit,),
+                (season_index, stat_stage_index, season_index, stat_stage_index, limit),
             )
             return cur.fetchall()
 
 
+
 def fetch_dpoty_race_rows(limit: int = 10, rookies_only: bool = False):
-    rookie_clause = "WHERE COALESCE(p.years_pro, 0) = 0" if rookies_only else ""
+    season_index, stat_stage_index = get_active_stat_scope()
+    rookie_clause = "AND COALESCE(p.years_pro, 0) = 0" if rookies_only else ""
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1182,7 +1225,9 @@ def fetch_dpoty_race_rows(limit: int = 10, rookies_only: bool = False):
                 FROM player_defense_stats pds
                 LEFT JOIN players p ON p.roster_id = pds.roster_id
                 LEFT JOIN teams t ON t.team_id = COALESCE(p.team_id, pds.team_id)
-                {rookie_clause}
+                WHERE COALESCE(pds.season_index, 0) = %s
+                  AND COALESCE(pds.stage_index, 0) = %s
+                  {rookie_clause}
                 GROUP BY p.roster_id, p.full_name, p.position
                 HAVING
                     SUM(COALESCE(pds.def_sacks, 0)) > 0 OR
@@ -1190,7 +1235,7 @@ def fetch_dpoty_race_rows(limit: int = 10, rookies_only: bool = False):
                 ORDER BY award_score DESC, player_name ASC
                 LIMIT %s
                 """,
-                (limit,),
+                (season_index, stat_stage_index, limit),
             )
             return cur.fetchall()
 
@@ -1859,22 +1904,10 @@ def fetch_all_regular_season_games_current_season():
                     away.team_name AS away_team_name,
                     away.division_name AS away_division_name,
                     home.team_name AS home_team_name,
-                    home.division_name AS home_division_name,
-                    COALESCE(away_standings.wins, 0) AS away_wins,
-                    COALESCE(away_standings.losses, 0) AS away_losses,
-                    COALESCE(away_standings.ties, 0) AS away_ties,
-                    COALESCE(away_standings.win_pct, 0) AS away_win_pct,
-                    COALESCE(away.team_ovr, 0) AS away_ovr,
-                    COALESCE(home_standings.wins, 0) AS home_wins,
-                    COALESCE(home_standings.losses, 0) AS home_losses,
-                    COALESCE(home_standings.ties, 0) AS home_ties,
-                    COALESCE(home_standings.win_pct, 0) AS home_win_pct,
-                    COALESCE(home.team_ovr, 0) AS home_ovr
+                    home.division_name AS home_division_name
                 FROM games g
                 JOIN teams away ON away.team_id = g.away_team_id
                 JOIN teams home ON home.team_id = g.home_team_id
-                LEFT JOIN standings away_standings ON away_standings.team_id = g.away_team_id
-                LEFT JOIN standings home_standings ON home_standings.team_id = g.home_team_id
                 WHERE g.season_index = (SELECT MAX(season_index) FROM games)
                   AND g.stage_index = 1
                 ORDER BY g.week ASC, g.game_id ASC
