@@ -1,7 +1,6 @@
 import os
 import random
 import re
-import sqlite3
 import asyncio
 import json
 from dataclasses import dataclass
@@ -142,108 +141,109 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Token database helpers (SQLite)
 # -----------------------------
 class TokenDatabase:
-    def __init__(self, path: str):
-        self.path = path
+    def __init__(self, database_url: str):
+        self.database_url = database_url or DATABASE_URL
+        if not self.database_url:
+            raise RuntimeError("DATABASE_URL is required for token storage.")
         self._init_db()
 
     def connect(self):
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return psycopg.connect(self.database_url, row_factory=dict_row)
 
     def _init_db(self):
         with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT NOT NULL,
-                    balance REAL NOT NULL DEFAULT 0,
-                    total_earned REAL NOT NULL DEFAULT 0,
-                    total_spent REAL NOT NULL DEFAULT 0,
-                    casino_wins INTEGER NOT NULL DEFAULT 0,
-                    casino_losses INTEGER NOT NULL DEFAULT 0,
-                    bounty_wins INTEGER NOT NULL DEFAULT 0
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_users (
+                        user_id BIGINT PRIMARY KEY,
+                        username TEXT NOT NULL,
+                        balance NUMERIC(12,2) NOT NULL DEFAULT 0,
+                        total_earned NUMERIC(12,2) NOT NULL DEFAULT 0,
+                        total_spent NUMERIC(12,2) NOT NULL DEFAULT 0,
+                        casino_wins INTEGER NOT NULL DEFAULT 0,
+                        casino_losses INTEGER NOT NULL DEFAULT 0,
+                        bounty_wins INTEGER NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
                 )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ledger (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    amount REAL NOT NULL,
-                    reason TEXT NOT NULL,
-                    category TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_ledger (
+                        id BIGSERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL REFERENCES bot_users(user_id) ON DELETE CASCADE,
+                        amount NUMERIC(12,2) NOT NULL,
+                        reason TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
                 )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bounties (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    reward REAL NOT NULL,
-                    created_by INTEGER NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_active INTEGER NOT NULL DEFAULT 1,
-                    claimed_by INTEGER,
-                    claimed_at TIMESTAMP
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_ledger_user_id ON bot_ledger(user_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_ledger_created_at ON bot_ledger(created_at)")
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_bounties (
+                        id BIGSERIAL PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        description TEXT NOT NULL,
+                        reward NUMERIC(12,2) NOT NULL,
+                        created_by BIGINT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                        claimed_by BIGINT,
+                        claimed_at TIMESTAMPTZ
+                    )
+                    """
                 )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS shop_purchases (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    item_name TEXT NOT NULL,
-                    cost REAL NOT NULL,
-                    notes TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_shop_purchases (
+                        id BIGSERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL REFERENCES bot_users(user_id) ON DELETE CASCADE,
+                        item_name TEXT NOT NULL,
+                        cost NUMERIC(12,2) NOT NULL,
+                        notes TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
                 )
-                """
-            )
             conn.commit()
 
     def ensure_user(self, user: discord.abc.User):
         with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user.id,))
-            if cur.fetchone() is None:
+            with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO users (user_id, username) VALUES (?, ?)",
+                    """
+                    INSERT INTO bot_users (user_id, username) VALUES (%s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        username = EXCLUDED.username,
+                        updated_at = NOW()
+                    """,
                     (user.id, str(user)),
-                )
-            else:
-                cur.execute(
-                    "UPDATE users SET username = ? WHERE user_id = ?",
-                    (str(user), user.id),
                 )
             conn.commit()
 
     def get_user(self, user: discord.abc.User):
         self.ensure_user(user)
         with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM users WHERE user_id = ?", (user.id,))
-            return cur.fetchone()
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_users WHERE user_id = %s", (user.id,))
+                return cur.fetchone()
 
     def add_tokens(self, user: discord.abc.User, amount: float, reason: str, category: str):
         self.ensure_user(user)
         with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "UPDATE users SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?",
-                (amount, max(amount, 0), user.id),
-            )
-            cur.execute(
-                "INSERT INTO ledger (user_id, amount, reason, category) VALUES (?, ?, ?, ?)",
-                (user.id, amount, reason, category),
-            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE bot_users SET balance = balance + %s, total_earned = total_earned + %s, updated_at = NOW() WHERE user_id = %s",
+                    (amount, max(amount, 0), user.id),
+                )
+                cur.execute(
+                    "INSERT INTO bot_ledger (user_id, amount, reason, category) VALUES (%s, %s, %s, %s)",
+                    (user.id, amount, reason, category),
+                )
             conn.commit()
 
     def add_tokens_bulk(self, users: list[discord.abc.User], amount: float, reason: str, category: str) -> int:
@@ -252,141 +252,141 @@ class TokenDatabase:
             return 0
 
         with self.connect() as conn:
-            cur = conn.cursor()
-
-            for user in valid_users:
-                cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user.id,))
-                if cur.fetchone() is None:
+            with conn.cursor() as cur:
+                for user in valid_users:
                     cur.execute(
-                        "INSERT INTO users (user_id, username) VALUES (?, ?)",
+                        """
+                        INSERT INTO bot_users (user_id, username) VALUES (%s, %s)
+                        ON CONFLICT (user_id) DO UPDATE SET
+                            username = EXCLUDED.username,
+                            updated_at = NOW()
+                        """,
                         (user.id, str(user)),
                     )
-                else:
-                    cur.execute(
-                        "UPDATE users SET username = ? WHERE user_id = ?",
-                        (str(user), user.id),
-                    )
 
-            cur.executemany(
-                "UPDATE users SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?",
-                [(amount, max(amount, 0), user.id) for user in valid_users],
-            )
-            cur.executemany(
-                "INSERT INTO ledger (user_id, amount, reason, category) VALUES (?, ?, ?, ?)",
-                [(user.id, amount, reason, category) for user in valid_users],
-            )
+                cur.executemany(
+                    "UPDATE bot_users SET balance = balance + %s, total_earned = total_earned + %s, updated_at = NOW() WHERE user_id = %s",
+                    [(amount, max(amount, 0), user.id) for user in valid_users],
+                )
+                cur.executemany(
+                    "INSERT INTO bot_ledger (user_id, amount, reason, category) VALUES (%s, %s, %s, %s)",
+                    [(user.id, amount, reason, category) for user in valid_users],
+                )
             conn.commit()
-            return len(valid_users)
-
+        return len(valid_users)
 
     def spend_tokens(self, user: discord.abc.User, amount: float, reason: str, category: str) -> bool:
         self.ensure_user(user)
         with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT balance FROM users WHERE user_id = ?", (user.id,))
-            row = cur.fetchone()
-            if row is None or row["balance"] < amount:
-                return False
-            cur.execute(
-                "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id = ?",
-                (amount, amount, user.id),
-            )
-            cur.execute(
-                "INSERT INTO ledger (user_id, amount, reason, category) VALUES (?, ?, ?, ?)",
-                (user.id, -amount, reason, category),
-            )
+            with conn.cursor() as cur:
+                cur.execute("SELECT balance FROM bot_users WHERE user_id = %s FOR UPDATE", (user.id,))
+                row = cur.fetchone()
+                if row is None or float(row["balance"]) < amount:
+                    return False
+                cur.execute(
+                    "UPDATE bot_users SET balance = balance - %s, total_spent = total_spent + %s, updated_at = NOW() WHERE user_id = %s",
+                    (amount, amount, user.id),
+                )
+                cur.execute(
+                    "INSERT INTO bot_ledger (user_id, amount, reason, category) VALUES (%s, %s, %s, %s)",
+                    (user.id, -amount, reason, category),
+                )
             conn.commit()
             return True
 
     def record_shop_purchase(self, user: discord.abc.User, item_name: str, cost: float, notes: str = ""):
+        self.ensure_user(user)
         with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO shop_purchases (user_id, item_name, cost, notes) VALUES (?, ?, ?, ?)",
-                (user.id, item_name, cost, notes),
-            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO bot_shop_purchases (user_id, item_name, cost, notes) VALUES (%s, %s, %s, %s)",
+                    (user.id, item_name, cost, notes),
+                )
             conn.commit()
 
     def update_casino_result(self, user: discord.abc.User, won: bool):
         self.ensure_user(user)
+        field = "casino_wins" if won else "casino_losses"
         with self.connect() as conn:
-            cur = conn.cursor()
-            field = "casino_wins" if won else "casino_losses"
-            cur.execute(f"UPDATE users SET {field} = {field} + 1 WHERE user_id = ?", (user.id,))
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE bot_users SET {field} = {field} + 1, updated_at = NOW() WHERE user_id = %s", (user.id,))
             conn.commit()
 
     def leaderboard(self):
         with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM users WHERE balance > 0 ORDER BY balance DESC, total_earned DESC")
-            return cur.fetchall()
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_users WHERE balance > 0 ORDER BY balance DESC, total_earned DESC")
+                return cur.fetchall()
 
     def recent_ledger(self, user: discord.abc.User, limit: int = 10):
         self.ensure_user(user)
         with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT * FROM ledger WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-                (user.id, limit),
-            )
-            return cur.fetchall()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM bot_ledger WHERE user_id = %s ORDER BY id DESC LIMIT %s",
+                    (user.id, limit),
+                )
+                return cur.fetchall()
 
     def create_bounty(self, title: str, description: str, reward: float, created_by: int):
         with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO bounties (title, description, reward, created_by) VALUES (?, ?, ?, ?)",
-                (title, description, reward, created_by),
-            )
-            bounty_id = cur.lastrowid
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO bot_bounties (title, description, reward, created_by) VALUES (%s, %s, %s, %s) RETURNING id",
+                    (title, description, reward, created_by),
+                )
+                bounty_id = cur.fetchone()["id"]
             conn.commit()
             return bounty_id
 
     def list_active_bounties(self):
         with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM bounties WHERE is_active = 1 ORDER BY id DESC")
-            return cur.fetchall()
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_bounties WHERE is_active = TRUE ORDER BY id DESC")
+                return cur.fetchall()
 
-    def claim_bounty(self, bounty_id: int, user: discord.abc.User) -> Optional[sqlite3.Row]:
+    def claim_bounty(self, bounty_id: int, user: discord.abc.User):
         self.ensure_user(user)
         with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM bounties WHERE id = ? AND is_active = 1", (bounty_id,))
-            bounty = cur.fetchone()
-            if bounty is None:
-                return None
-            cur.execute(
-                "UPDATE bounties SET is_active = 0, claimed_by = ?, claimed_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (user.id, bounty_id),
-            )
-            cur.execute(
-                "UPDATE users SET balance = balance + ?, total_earned = total_earned + ?, bounty_wins = bounty_wins + 1 WHERE user_id = ?",
-                (bounty["reward"], bounty["reward"], user.id),
-            )
-            cur.execute(
-                "INSERT INTO ledger (user_id, amount, reason, category) VALUES (?, ?, ?, ?)",
-                (user.id, bounty["reward"], f"Claimed bounty #{bounty_id}: {bounty['title']}", "bounty"),
-            )
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_bounties WHERE id = %s AND is_active = TRUE FOR UPDATE", (bounty_id,))
+                bounty = cur.fetchone()
+                if bounty is None:
+                    return None
+                cur.execute(
+                    "UPDATE bot_bounties SET is_active = FALSE, claimed_by = %s, claimed_at = NOW() WHERE id = %s",
+                    (user.id, bounty_id),
+                )
+                cur.execute(
+                    "UPDATE bot_users SET balance = balance + %s, total_earned = total_earned + %s, bounty_wins = bounty_wins + 1, updated_at = NOW() WHERE user_id = %s",
+                    (bounty["reward"], bounty["reward"], user.id),
+                )
+                cur.execute(
+                    "INSERT INTO bot_ledger (user_id, amount, reason, category) VALUES (%s, %s, %s, %s)",
+                    (user.id, bounty["reward"], f"Claimed bounty #{bounty_id}: {bounty['title']}", "bounty"),
+                )
+                cur.execute("SELECT * FROM bot_bounties WHERE id = %s", (bounty_id,))
+                updated = cur.fetchone()
             conn.commit()
-            cur.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,))
-            return cur.fetchone()
+            return updated
 
     def update_bounty_reward(self, bounty_id: int, reward: float) -> bool:
         with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute("UPDATE bounties SET reward = ? WHERE id = ?", (reward, bounty_id))
+            with conn.cursor() as cur:
+                cur.execute("UPDATE bot_bounties SET reward = %s WHERE id = %s", (reward, bounty_id))
+                changed = cur.rowcount > 0
             conn.commit()
-            return cur.rowcount > 0
+            return changed
 
     def get_bounty(self, bounty_id: int):
         with self.connect() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,))
-            return cur.fetchone()
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_bounties WHERE id = %s", (bounty_id,))
+                return cur.fetchone()
 
 
-TOKEN_DB = TokenDatabase(TOKEN_DB_PATH)
+TOKEN_DB = TokenDatabase(DATABASE_URL)
+
 
 
 # -----------------------------
