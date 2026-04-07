@@ -35,27 +35,27 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 ADMIN_ROLE_NAMES = {"Commissioner", "Admin", "COMMISH"}
 
 STAGE_LABELS = {
-    1: "Preseason",
-    2: "Regular Season",
-    3: "Wild Card",
-    4: "Divisional",
-    5: "Conference Championship",
-    6: "Super Bowl",
-    7: "Offseason",
+    0: "Preseason",
+    1: "Regular Season",
+    2: "Wild Card",
+    3: "Divisional",
+    4: "Conference Championship",
+    5: "Super Bowl",
+    6: "Offseason",
 }
 STAGE_PARSE_MAP = {
     "auto": None,
-    "preseason": 1,
-    "regular": 2,
-    "regular season": 2,
-    "wild card": 3,
-    "wildcard": 3,
-    "divisional": 4,
-    "conference": 5,
-    "conference championship": 5,
-    "super bowl": 6,
-    "superbowl": 6,
-    "offseason": 7,
+    "preseason": 0,
+    "regular": 1,
+    "regular season": 1,
+    "wild card": 2,
+    "wildcard": 2,
+    "divisional": 3,
+    "conference": 4,
+    "conference championship": 4,
+    "super bowl": 5,
+    "superbowl": 5,
+    "offseason": 6,
 }
 COMPLETE_GAME_STATUS_VALUES = {2, 4, 5, 6, 7, 8}
 
@@ -244,38 +244,6 @@ class TokenDatabase:
                 (user.id, amount, reason, category),
             )
             conn.commit()
-
-    def add_tokens_bulk(self, users: list[discord.abc.User], amount: float, reason: str, category: str) -> int:
-        valid_users = [user for user in users if not getattr(user, "bot", False)]
-        if not valid_users:
-            return 0
-
-        with self.connect() as conn:
-            cur = conn.cursor()
-
-            for user in valid_users:
-                cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user.id,))
-                if cur.fetchone() is None:
-                    cur.execute(
-                        "INSERT INTO users (user_id, username) VALUES (?, ?)",
-                        (user.id, str(user)),
-                    )
-                else:
-                    cur.execute(
-                        "UPDATE users SET username = ? WHERE user_id = ?",
-                        (str(user), user.id),
-                    )
-
-            cur.executemany(
-                "UPDATE users SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?",
-                [(amount, max(amount, 0), user.id) for user in valid_users],
-            )
-            cur.executemany(
-                "INSERT INTO ledger (user_id, amount, reason, category) VALUES (?, ?, ?, ?)",
-                [(user.id, amount, reason, category) for user in valid_users],
-            )
-            conn.commit()
-            return len(valid_users)
 
     def spend_tokens(self, user: discord.abc.User, amount: float, reason: str, category: str) -> bool:
         self.ensure_user(user)
@@ -547,27 +515,27 @@ def stage_display_name(stage_index: int) -> str:
 
 def stage_channel_prefix(stage_index: int) -> str:
     return {
-        1: "pre-wk",
-        2: "wk",
-        3: "wc",
-        4: "div",
-        5: "conf",
-        6: "sb",
+        0: "pre-wk",
+        1: "wk",
+        2: "wc",
+        3: "div",
+        4: "conf",
+        5: "sb",
     }.get(stage_index, f"s{stage_index}-w")
 
 
 def stage_week_label(stage_index: int, display_week: int) -> str:
-    if stage_index == 2:
-        return f"Week {display_week}"
     if stage_index == 1:
+        return f"Week {display_week}"
+    if stage_index == 0:
         return f"Preseason Week {display_week}"
-    if stage_index == 3:
+    if stage_index == 2:
         return f"Wild Card Week {display_week}"
-    if stage_index == 4:
+    if stage_index == 3:
         return f"Divisional Week {display_week}"
-    if stage_index == 5:
+    if stage_index == 4:
         return f"Conference Championship Week {display_week}"
-    if stage_index == 6:
+    if stage_index == 5:
         return "Super Bowl"
     return f"{stage_display_name(stage_index)} Week {display_week}"
 
@@ -1284,7 +1252,7 @@ async def player(interaction: discord.Interaction, name: str):
         f"🔎 Player Search: {name}",
         "\n".join(
             f"**{idx}.** {safe_text(row.get('full_name'))} — {safe_text(row.get('team_name'), 'Free Agent')} | "
-            f"{safe_text(row.get('position'))} | {display_ovr(row)} OVR | "
+            f"{safe_text(row.get('position'))} | {safe_int(row.get('overall_rating'))} OVR | "
             f"{dev_trait_to_label(row.get('dev_trait'), row.get('resolved_dev_trait_label') or row.get('dev_trait_label'))}"
             for idx, row in enumerate(results[:10], start=1)
         ),
@@ -1330,10 +1298,6 @@ class RosterPaginationView(discord.ui.View):
         self._update_buttons()
         await interaction.response.edit_message(embed=build_roster_embed(self.title_team, self.roster_rows, self.page), view=self)
 
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-
 
 @bot.tree.command(name="roster", description="Show a team roster with 12 players per page.")
 @app_commands.describe(team_name="Team name or mascot", page="Roster page number")
@@ -1350,10 +1314,8 @@ async def roster(interaction: discord.Interaction, team_name: str, page: Optiona
 
     standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
     merged_team = {**team_row, **standing_row}
-    current_page = page or 1
-    embed = build_roster_embed(merged_team, roster_rows, current_page)
-    view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, current_page)
-    await interaction.response.send_message(embed=embed, view=view)
+    embed = build_roster_embed(merged_team, roster_rows, page or 1)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="team", description="Show a team summary and its first roster page.")
@@ -1368,8 +1330,7 @@ async def team(interaction: discord.Interaction, team_name: str):
     standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
     merged_team = {**team_row, **standing_row}
     embed = build_roster_embed(merged_team, roster_rows, 1)
-    view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, 1)
-    await interaction.response.send_message(embed=embed, view=view)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="balance", description="Check your token balance.")
@@ -1425,71 +1386,6 @@ async def leaderboard(interaction: discord.Interaction):
     for page_num, chunk in enumerate(chunks[1:], start=2):
         await interaction.followup.send(
             embed=build_embed(f"🏆 Token Leaderboard (Page {page_num})", chunk, 0xFEE75C)
-        )
-
-
-
-@bot.tree.command(name="casinoleaderboard", description="Show casino leaders by highest win percentage (minimum 10 casino games).")
-async def casinoleaderboard(interaction: discord.Interaction):
-    with TOKEN_DB.connect() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT
-                user_id,
-                username,
-                casino_wins,
-                casino_losses,
-                (casino_wins + casino_losses) AS total_games,
-                CASE
-                    WHEN (casino_wins + casino_losses) > 0
-                    THEN CAST(casino_wins AS REAL) / (casino_wins + casino_losses)
-                    ELSE 0
-                END AS win_pct
-            FROM users
-            WHERE (casino_wins + casino_losses) >= 10
-            ORDER BY win_pct DESC, casino_wins DESC, total_games DESC, username ASC
-            """
-        )
-        rows = cur.fetchall()
-
-    if not rows:
-        await interaction.response.send_message("No users qualify yet. A minimum of **10 total casino games** is required.")
-        return
-
-    lines = []
-    for idx, row in enumerate(rows, start=1):
-        win_pct = (row["win_pct"] or 0) * 100
-        total_games = row["total_games"] or 0
-        lines.append(
-            f"**{idx}.** <@{row['user_id']}> — **{win_pct:.1f}%** win rate | **{row['casino_wins']}** wins | **{total_games}** games"
-        )
-
-    chunks = []
-    current = []
-    current_len = 0
-    for line in lines:
-        line_len = len(line) + 1
-        if current_len + line_len > 3800:
-            chunks.append("\n".join(current))
-            current = [line]
-            current_len = line_len
-        else:
-            current.append(line)
-            current_len += line_len
-    if current:
-        chunks.append("\n".join(current))
-
-    await interaction.response.send_message(
-        embed=build_embed(
-            "🎰 Casino Leaderboard",
-            chunks[0] + "\n\n*Minimum 10 total casino games required.*",
-            0xFEE75C,
-        )
-    )
-    for page_num, chunk in enumerate(chunks[1:], start=2):
-        await interaction.followup.send(
-            embed=build_embed(f"🎰 Casino Leaderboard (Page {page_num})", chunk, 0xFEE75C)
         )
 
 
@@ -2000,40 +1896,6 @@ async def addtokens(interaction: discord.Interaction, user: discord.Member, amou
     )
 
 
-
-@bot.tree.command(name="addroletokens", description="Admin: add tokens to everyone with a specific role.")
-@admin_only()
-@app_commands.describe(
-    role="Role to reward",
-    amount="Amount to give each member with that role",
-    reason="Reason shown in the ledger",
-)
-async def addroletokens(interaction: discord.Interaction, role: discord.Role, amount: float, reason: str):
-    if amount <= 0:
-        await interaction.response.send_message("Amount must be greater than 0.", ephemeral=True)
-        return
-
-    members = [member for member in role.members if not member.bot]
-    if not members:
-        await interaction.response.send_message(
-            f"No non-bot members were found with the role **{role.name}**.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(thinking=True)
-    awarded_count = TOKEN_DB.add_tokens_bulk(members, amount, reason, "admin")
-
-    await interaction.followup.send(
-        f"✅ Added **{fmt_tokens(amount)}** tokens to **{awarded_count}** members with the role {role.mention}.\n"
-        f"**Reason:** {reason}"
-    )
-    await send_log_message(
-        f"💰 ADMIN: {interaction.user.mention} added **{fmt_tokens(amount)}** tokens to "
-        f"**{awarded_count}** members with the role **{role.name}**. Reason: **{reason}**"
-    )
-
-
 @bot.tree.command(name="removetokens", description="Admin: remove tokens from a user.")
 @admin_only()
 @app_commands.describe(user="User losing tokens", amount="Amount to remove", reason="Reason shown in the ledger")
@@ -2228,16 +2090,6 @@ def safe_text(value, default: str = "Unknown") -> str:
     return text or default
 
 
-def display_ovr(row: dict) -> int:
-    primary = safe_int(row.get("overall_rating"))
-    if primary > 0:
-        return primary
-    fallback = safe_int(row.get("player_best_ovr"))
-    if fallback > 0:
-        return fallback
-    return 0
-
-
 def dev_trait_to_label(raw_value, existing_label: Optional[str] = None) -> str:
     if existing_label:
         return existing_label
@@ -2380,36 +2232,6 @@ def fetch_team_roster_rows(team_id: int) -> list[dict]:
                 LEFT JOIN teams t ON t.team_id = p.team_id
                 WHERE p.team_id = %s
                 ORDER BY
-                    CASE
-                        WHEN p.position = 'QB' THEN 1
-                        WHEN p.position = 'HB' THEN 2
-                        WHEN p.position = 'FB' THEN 3
-                        WHEN p.position = 'WR' THEN 4
-                        WHEN p.position = 'TE' THEN 5
-                        WHEN p.position = 'LT' THEN 6
-                        WHEN p.position = 'LG' THEN 7
-                        WHEN p.position = 'C' THEN 8
-                        WHEN p.position = 'RG' THEN 9
-                        WHEN p.position = 'RT' THEN 10
-                        WHEN p.position = 'LEDGE' THEN 11
-                        WHEN p.position = 'REDGE' THEN 12
-                        WHEN p.position = 'LE' THEN 13
-                        WHEN p.position = 'RE' THEN 14
-                        WHEN p.position = 'DT' THEN 15
-                        WHEN p.position = 'LOLB' THEN 16
-                        WHEN p.position = 'MLB' THEN 17
-                        WHEN p.position = 'ROLB' THEN 18
-                        WHEN p.position = 'SAM' THEN 19
-                        WHEN p.position = 'MIKE' THEN 20
-                        WHEN p.position = 'WILL' THEN 21
-                        WHEN p.position = 'CB' THEN 22
-                        WHEN p.position = 'FS' THEN 23
-                        WHEN p.position = 'SS' THEN 24
-                        WHEN p.position = 'K' THEN 25
-                        WHEN p.position = 'P' THEN 26
-                        WHEN p.position = 'LS' THEN 27
-                        ELSE 999
-                    END,
                     COALESCE(NULLIF(p.overall_rating, 0), p.player_best_ovr, 0) DESC,
                     p.full_name ASC
                 """,
@@ -2430,7 +2252,7 @@ def build_player_embed(row: dict) -> discord.Embed:
 
     embed = build_embed(
         title,
-        f"**{position}** • **{team_name}** • **{display_ovr(row)} OVR** • **{dev_label}**",
+        f"**{position}** • **{team_name}** • **{safe_int(row.get('overall_rating'))} OVR** • **{dev_label}**",
         0x5865F2,
     )
     embed.add_field(
@@ -2486,7 +2308,7 @@ def build_roster_embed(team_row: dict, roster_rows: list[dict], page: int) -> di
             dev_label = dev_trait_to_label(row.get("dev_trait"), row.get("resolved_dev_trait_label") or row.get("dev_trait_label"))
             lines.append(
                 f"**{idx}.** {safe_text(row.get('full_name'))} — {safe_text(row.get('position'))} | "
-                f"{display_ovr(row)} OVR | {dev_label}"
+                f"{safe_int(row.get('overall_rating'))} OVR | {dev_label}"
             )
         description = "\n".join(lines)
 
