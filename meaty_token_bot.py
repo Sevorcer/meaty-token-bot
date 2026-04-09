@@ -1058,6 +1058,32 @@ def fetch_top_rushing_leaders(limit: int = 5):
 
 
 
+
+def fetch_top_receiving_leaders(limit: int = 5):
+    season_index, stat_stage_index = get_active_stat_scope()
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    prs.roster_id,
+                    COALESCE(MAX(players.full_name), MAX(prs.full_name)) AS player_name,
+                    COALESCE(MAX(teams.team_name), 'Unknown Team') AS team_name,
+                    SUM(COALESCE(prs.rec_yds, 0)) AS total_rec_yds
+                FROM player_receiving_stats prs
+                LEFT JOIN players ON players.roster_id = prs.roster_id
+                LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, prs.team_id)
+                WHERE COALESCE(prs.season_index, 0) = %s
+                  AND COALESCE(prs.stage_index, 0) = %s
+                GROUP BY prs.roster_id
+                ORDER BY total_rec_yds DESC, player_name ASC
+                LIMIT %s
+                """,
+                (season_index, stat_stage_index, limit),
+            )
+            return cur.fetchall()
+
+
 def fetch_top_sack_leaders(limit: int = 5):
     season_index, stat_stage_index = get_active_stat_scope()
     with get_pg_conn() as conn:
@@ -1134,7 +1160,7 @@ def fetch_mvp_race_rows(limit: int = 10):
                     SELECT
                         pps.roster_id,
                         SUM(COALESCE(pps.pass_yds, 0)) AS pass_yds,
-                        SUM(COALESCE(pps.pass_td, 0)) AS pass_td,
+                        SUM(COALESCE(pps.pass_tds, 0)) AS pass_tds,
                         SUM(COALESCE(pps.pass_int, 0)) AS pass_int
                     FROM player_passing_stats pps
                     WHERE COALESCE(pps.season_index, 0) = %s
@@ -1157,14 +1183,14 @@ def fetch_mvp_race_rows(limit: int = 10):
                     COALESCE(t.team_name, 'Unknown Team') AS team_name,
                     COALESCE(p.position, '?') AS position,
                     COALESCE(ps.pass_yds, 0) AS pass_yds,
-                    COALESCE(ps.pass_td, 0) AS pass_td,
+                    COALESCE(ps.pass_tds, 0) AS pass_tds,
                     COALESCE(ps.pass_int, 0) AS pass_int,
                     COALESCE(rs.rush_yds, 0) AS rush_yds,
                     COALESCE(rs.rush_td, 0) AS rush_td,
                     COALESCE(s.wins, 0) AS team_wins,
                     ROUND(
                         (COALESCE(ps.pass_yds, 0) * 0.03) +
-                        (COALESCE(ps.pass_td, 0) * 6.0) -
+                        (COALESCE(ps.pass_tds, 0) * 6.0) -
                         (COALESCE(ps.pass_int, 0) * 2.5) +
                         (COALESCE(rs.rush_yds, 0) * 0.05) +
                         (COALESCE(rs.rush_td, 0) * 6.0) +
@@ -1197,7 +1223,7 @@ def fetch_opoty_race_rows(limit: int = 10, rookies_only: bool = False):
                     SELECT
                         pps.roster_id,
                         SUM(COALESCE(pps.pass_yds, 0)) AS pass_yds,
-                        SUM(COALESCE(pps.pass_td, 0)) AS pass_td
+                        SUM(COALESCE(pps.pass_tds, 0)) AS pass_tds
                     FROM player_passing_stats pps
                     WHERE COALESCE(pps.season_index, 0) = %s
                       AND COALESCE(pps.stage_index, 0) = %s
@@ -1219,12 +1245,12 @@ def fetch_opoty_race_rows(limit: int = 10, rookies_only: bool = False):
                     COALESCE(t.team_name, 'Unknown Team') AS team_name,
                     COALESCE(p.position, '?') AS position,
                     COALESCE(ps.pass_yds, 0) AS pass_yds,
-                    COALESCE(ps.pass_td, 0) AS pass_td,
+                    COALESCE(ps.pass_tds, 0) AS pass_tds,
                     COALESCE(rs.rush_yds, 0) AS rush_yds,
                     COALESCE(rs.rush_td, 0) AS rush_td,
                     ROUND(
                         (COALESCE(ps.pass_yds, 0) * 0.025) +
-                        (COALESCE(ps.pass_td, 0) * 5.5) +
+                        (COALESCE(ps.pass_tds, 0) * 5.5) +
                         (COALESCE(rs.rush_yds, 0) * 0.06) +
                         (COALESCE(rs.rush_td, 0) * 6.0),
                         2
@@ -1297,8 +1323,8 @@ def format_award_race_lines(rows, award_type: str):
             stat_bits = []
             if row.get("pass_yds"):
                 stat_bits.append(f"{int(row['pass_yds'])} PYDS")
-            if row.get("pass_td"):
-                stat_bits.append(f"{int(row['pass_td'])} PTD")
+            if row.get("pass_tds"):
+                stat_bits.append(f"{int(row['pass_tds'])} PTD")
             if row.get("rush_yds"):
                 stat_bits.append(f"{int(row['rush_yds'])} RYDS")
             if row.get("rush_td"):
@@ -1764,19 +1790,20 @@ def build_sportsbook_embed() -> discord.Embed:
     return embed
 
 
-def settle_open_bets_for_current_week() -> tuple[int, int]:
+def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
     season_index = get_current_season_index()
     stage_index, display_week = detect_current_stage_and_week()
     if stage_index is None or display_week is None:
-        return 0, 0
+        return 0, 0, []
     raw_week = max(display_week - 1, 0)
     games = fetch_games_for_stage_week(stage_index, display_week)
     game_map = {int(g["game_id"]): g for g in games if looks_like_completed_game(g)}
     if not game_map:
-        return 0, 0
+        return 0, 0, []
 
     settled = 0
     paid = 0
+    details: list[dict] = []
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1795,6 +1822,7 @@ def settle_open_bets_for_current_week() -> tuple[int, int]:
                     continue
                 away_score = int(game.get("away_score") or 0)
                 home_score = int(game.get("home_score") or 0)
+                matchup = f"{game['away_team_name']} {away_score}-{home_score} {game['home_team_name']}"
                 if away_score == home_score:
                     outcome = "push"
                     payout = float(bet["amount"])
@@ -1839,9 +1867,18 @@ def settle_open_bets_for_current_week() -> tuple[int, int]:
                     "UPDATE bot_sportsbook_bets SET status = %s, settled_at = NOW() WHERE id = %s",
                     (outcome, int(bet["id"])),
                 )
+                details.append({
+                    "username": bet["username"],
+                    "team_name": bet["team_name"],
+                    "amount": float(bet["amount"]),
+                    "multiplier": float(bet["multiplier"]),
+                    "outcome": outcome,
+                    "payout": payout,
+                    "matchup": matchup,
+                })
                 settled += 1
         conn.commit()
-    return settled, paid
+    return settled, paid, details
 
 
 def build_playoff_picture_embed() -> discord.Embed:
@@ -1875,7 +1912,7 @@ def build_potw_embed() -> discord.Embed:
             cur.execute(
                 """
                 WITH pass_week AS (
-                    SELECT pps.roster_id, SUM(COALESCE(pps.pass_yds,0)) AS pass_yds, SUM(COALESCE(pps.pass_td,0)) AS pass_td
+                    SELECT pps.roster_id, SUM(COALESCE(pps.pass_yds,0)) AS pass_yds, SUM(COALESCE(pps.pass_tds,0)) AS pass_tds
                     FROM player_passing_stats pps
                     WHERE COALESCE(pps.season_index,0) = %s AND COALESCE(pps.stage_index,0) = %s AND COALESCE(pps.week,0) = %s
                     GROUP BY pps.roster_id
@@ -1890,10 +1927,10 @@ def build_potw_embed() -> discord.Embed:
                        COALESCE(t.team_name,'Unknown Team') AS team_name,
                        COALESCE(p.position,'?') AS position,
                        COALESCE(pw.pass_yds,0) AS pass_yds,
-                       COALESCE(pw.pass_td,0) AS pass_td,
+                       COALESCE(pw.pass_tds,0) AS pass_tds,
                        COALESCE(rw.rush_yds,0) AS rush_yds,
                        COALESCE(rw.rush_td,0) AS rush_td,
-                       ROUND((COALESCE(pw.pass_yds,0)*0.03)+(COALESCE(pw.pass_td,0)*6)+(COALESCE(rw.rush_yds,0)*0.06)+(COALESCE(rw.rush_td,0)*6),2) AS score
+                       ROUND((COALESCE(pw.pass_yds,0)*0.03)+(COALESCE(pw.pass_tds,0)*6)+(COALESCE(rw.rush_yds,0)*0.06)+(COALESCE(rw.rush_td,0)*6),2) AS score
                 FROM players p
                 LEFT JOIN teams t ON t.team_id = p.team_id
                 LEFT JOIN pass_week pw ON pw.roster_id = p.roster_id
@@ -1931,7 +1968,7 @@ def build_potw_embed() -> discord.Embed:
         embed.add_field(
             name="Offensive Player of the Week",
             value=f"**{offense['player_name']}** ({offense['team_name']}) — {offense['position']}\n"
-                  f"{int(offense.get('pass_yds') or 0)} PYDS, {int(offense.get('pass_td') or 0)} PTD, "
+                  f"{int(offense.get('pass_yds') or 0)} PYDS, {int(offense.get('pass_tds') or 0)} PTD, "
                   f"{int(offense.get('rush_yds') or 0)} RYDS, {int(offense.get('rush_td') or 0)} RTD",
             inline=False
         )
@@ -5005,6 +5042,7 @@ async def post_season_leaders(
     try:
         passing_rows = fetch_top_passing_leaders()
         rushing_rows = fetch_top_rushing_leaders()
+        receiving_rows = fetch_top_receiving_leaders()
         sack_rows = fetch_top_sack_leaders()
         interception_rows = fetch_top_interception_leaders()
     except Exception as exc:
@@ -5035,6 +5073,7 @@ async def post_season_leaders(
     sections = [
         ("🏈 Passing Yards", format_leader_lines(passing_rows, "total_pass_yds", "Passing Yards")),
         ("🏃 Rushing Yards", format_leader_lines(rushing_rows, "total_rush_yds", "Rushing Yards")),
+        ("🧤 Receiving Yards", format_leader_lines(receiving_rows, "total_rec_yds", "Receiving Yards")),
         ("💥 Sacks", format_leader_lines(sack_rows, "total_sacks", "Sacks")),
         ("🖐️ Interceptions", format_leader_lines(interception_rows, "total_ints", "Interceptions")),
     ]
@@ -5653,8 +5692,30 @@ async def bet(interaction: discord.Interaction, team: str, amount: float):
 @bot.tree.command(name="settlebets", description="Admin: settle sportsbook bets for the current completed slate.")
 @admin_only()
 async def settlebets(interaction: discord.Interaction):
-    settled, paid = settle_open_bets_for_current_week()
-    await interaction.response.send_message(f"✅ Settled **{settled}** bets. Paid out **{paid}** winning/push bets.")
+    settled, paid, details = settle_open_bets_for_current_week()
+    if not details:
+        await interaction.response.send_message("No open completed bets were available to settle.", ephemeral=True)
+        return
+
+    lines = []
+    for item in details[:20]:
+        icon = "✅" if item["outcome"] == "won" else ("🟨" if item["outcome"] == "push" else "❌")
+        payout_text = f" -> paid {fmt_tokens(item['payout'])}" if item["payout"] > 0 else ""
+        lines.append(
+            f"{icon} **{item['username']}** bet **{fmt_tokens(item['amount'])}** on **{item['team_name']}** "
+            f"({item['multiplier']}x) — **{item['outcome'].upper()}**{payout_text}\n{item['matchup']}"
+        )
+
+    if len(details) > 20:
+        lines.append(f"...and {len(details) - 20} more settled bets.")
+
+    embed = build_embed(
+        "✅ Sportsbook Bets Settled",
+        "\n\n".join(lines),
+        0x57F287,
+    )
+    embed.set_footer(text=f"Settled {settled} bets • Paid {paid} winning/push bets")
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="playoffpicture", description="Show the current playoff field and bubble teams.")
