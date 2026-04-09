@@ -1171,7 +1171,7 @@ def fetch_mvp_race_rows(limit: int = 10):
                     SELECT
                         prs.roster_id,
                         SUM(COALESCE(prs.rush_yds, 0)) AS rush_yds,
-                        SUM(COALESCE(prs.rush_td, 0)) AS rush_td
+                        SUM(COALESCE(prs.rush_tds, 0)) AS rush_tds
                     FROM player_rushing_stats prs
                     WHERE COALESCE(prs.season_index, 0) = %s
                       AND COALESCE(prs.stage_index, 0) = %s
@@ -1186,14 +1186,14 @@ def fetch_mvp_race_rows(limit: int = 10):
                     COALESCE(ps.pass_tds, 0) AS pass_tds,
                     COALESCE(ps.pass_int, 0) AS pass_int,
                     COALESCE(rs.rush_yds, 0) AS rush_yds,
-                    COALESCE(rs.rush_td, 0) AS rush_td,
+                    COALESCE(rs.rush_tds, 0) AS rush_tds,
                     COALESCE(s.wins, 0) AS team_wins,
                     ROUND(
                         (COALESCE(ps.pass_yds, 0) * 0.03) +
                         (COALESCE(ps.pass_tds, 0) * 6.0) -
                         (COALESCE(ps.pass_int, 0) * 2.5) +
                         (COALESCE(rs.rush_yds, 0) * 0.05) +
-                        (COALESCE(rs.rush_td, 0) * 6.0) +
+                        (COALESCE(rs.rush_tds, 0) * 6.0) +
                         (COALESCE(s.wins, 0) * 1.5),
                         2
                     ) AS award_score
@@ -1233,7 +1233,7 @@ def fetch_opoty_race_rows(limit: int = 10, rookies_only: bool = False):
                     SELECT
                         prs.roster_id,
                         SUM(COALESCE(prs.rush_yds, 0)) AS rush_yds,
-                        SUM(COALESCE(prs.rush_td, 0)) AS rush_td
+                        SUM(COALESCE(prs.rush_tds, 0)) AS rush_tds
                     FROM player_rushing_stats prs
                     WHERE COALESCE(prs.season_index, 0) = %s
                       AND COALESCE(prs.stage_index, 0) = %s
@@ -1247,12 +1247,12 @@ def fetch_opoty_race_rows(limit: int = 10, rookies_only: bool = False):
                     COALESCE(ps.pass_yds, 0) AS pass_yds,
                     COALESCE(ps.pass_tds, 0) AS pass_tds,
                     COALESCE(rs.rush_yds, 0) AS rush_yds,
-                    COALESCE(rs.rush_td, 0) AS rush_td,
+                    COALESCE(rs.rush_tds, 0) AS rush_tds,
                     ROUND(
                         (COALESCE(ps.pass_yds, 0) * 0.025) +
                         (COALESCE(ps.pass_tds, 0) * 5.5) +
                         (COALESCE(rs.rush_yds, 0) * 0.06) +
-                        (COALESCE(rs.rush_td, 0) * 6.0),
+                        (COALESCE(rs.rush_tds, 0) * 6.0),
                         2
                     ) AS award_score
                 FROM players p
@@ -1285,11 +1285,10 @@ def fetch_dpoty_race_rows(limit: int = 10, rookies_only: bool = False):
                     SUM(COALESCE(pds.def_sacks, 0)) AS sacks,
                     SUM(COALESCE(pds.def_ints, 0)) AS ints,
                     0 AS tackles,
-                    ROUND(
-                        (SUM(COALESCE(pds.def_sacks, 0)) * 4.0) +
-                        (SUM(COALESCE(pds.def_ints, 0)) * 5.0),
-                        2
-                    ) AS award_score
+                    ROUND(((
+                        SUM(COALESCE(pds.def_sacks, 0)) * 4.0) +
+                        (SUM(COALESCE(pds.def_ints, 0)) * 5.0)
+                    )::numeric, 2) AS award_score
                 FROM player_defense_stats pds
                 LEFT JOIN players p ON p.roster_id = pds.roster_id
                 LEFT JOIN teams t ON t.team_id = COALESCE(p.team_id, pds.team_id)
@@ -1327,8 +1326,8 @@ def format_award_race_lines(rows, award_type: str):
                 stat_bits.append(f"{int(row['pass_tds'])} PTD")
             if row.get("rush_yds"):
                 stat_bits.append(f"{int(row['rush_yds'])} RYDS")
-            if row.get("rush_td"):
-                stat_bits.append(f"{int(row['rush_td'])} RTD")
+            if row.get("rush_tds"):
+                stat_bits.append(f"{int(row['rush_tds'])} RTD")
             if award_type == "mvp" and row.get("team_wins") is not None:
                 stat_bits.append(f"{int(row['team_wins'])} wins")
         else:
@@ -2934,10 +2933,10 @@ async def casinoleaderboard(interaction: discord.Interaction):
                 (casino_wins + casino_losses) AS total_games,
                 CASE
                     WHEN (casino_wins + casino_losses) > 0
-                    THEN CAST(casino_wins AS REAL) / (casino_wins + casino_losses)
+                    THEN CAST(casino_wins AS DOUBLE PRECISION) / (casino_wins + casino_losses)
                     ELSE 0
                 END AS win_pct
-            FROM users
+            FROM bot_users
             WHERE (casino_wins + casino_losses) >= 10
             ORDER BY win_pct DESC, casino_wins DESC, total_games DESC, username ASC
             """
