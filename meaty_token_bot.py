@@ -30,37 +30,32 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
 AUTO_POST_MATCHUP_PREVIEWS = os.getenv("AUTO_POST_MATCHUP_PREVIEWS", "true").lower() in {"1", "true", "yes", "on"}
 AUTO_POST_WEEKLY_NEWS = os.getenv("AUTO_POST_WEEKLY_NEWS", "true").lower() in {"1", "true", "yes", "on"}
-AUTO_POST_STORYLINES = os.getenv("AUTO_POST_STORYLINES", "true").lower() in {"1", "true", "yes", "on"}
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-LEVEL_UP_CHANNEL_ID = int(os.getenv("LEVEL_UP_CHANNEL_ID", "0"))
-XP_COOLDOWN_SECONDS = int(os.getenv("XP_COOLDOWN_SECONDS", "45"))
-XP_MIN_MESSAGE_LEN = int(os.getenv("XP_MIN_MESSAGE_LEN", "8"))
-XP_BLACKLIST_CHANNEL_IDS = {int(x.strip()) for x in os.getenv("XP_BLACKLIST_CHANNEL_IDS", "").split(",") if x.strip()}
 
 ADMIN_ROLE_NAMES = {"Commissioner", "Admin", "COMMISH"}
 
 STAGE_LABELS = {
-    0: "Preseason",
-    1: "Regular Season",
-    2: "Wild Card",
-    3: "Divisional",
-    4: "Conference Championship",
-    5: "Super Bowl",
-    6: "Offseason",
+    1: "Preseason",
+    2: "Regular Season",
+    3: "Wild Card",
+    4: "Divisional",
+    5: "Conference Championship",
+    6: "Super Bowl",
+    7: "Offseason",
 }
 STAGE_PARSE_MAP = {
     "auto": None,
-    "preseason": 0,
-    "regular": 1,
-    "regular season": 1,
-    "wild card": 2,
-    "wildcard": 2,
-    "divisional": 3,
-    "conference": 4,
-    "conference championship": 4,
-    "super bowl": 5,
-    "superbowl": 5,
-    "offseason": 6,
+    "preseason": 1,
+    "regular": 2,
+    "regular season": 2,
+    "wild card": 3,
+    "wildcard": 3,
+    "divisional": 4,
+    "conference": 5,
+    "conference championship": 5,
+    "super bowl": 6,
+    "superbowl": 6,
+    "offseason": 7,
 }
 COMPLETE_GAME_STATUS_VALUES = {2, 4, 5, 6, 7, 8}
 
@@ -138,7 +133,6 @@ BLACKJACK_FINISHED_DELETE_DELAY = 180
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
-intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -146,354 +140,216 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # -----------------------------
 # Token database helpers (SQLite)
 # -----------------------------
-
 class TokenDatabase:
     def __init__(self, path: str):
         self.path = path
         self._init_db()
 
     def connect(self):
-        if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL is not set.")
-        return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
     def _init_db(self):
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS bot_users (
-                        user_id BIGINT PRIMARY KEY,
-                        username TEXT NOT NULL,
-                        balance NUMERIC(12,2) NOT NULL DEFAULT 0,
-                        total_earned NUMERIC(12,2) NOT NULL DEFAULT 0,
-                        total_spent NUMERIC(12,2) NOT NULL DEFAULT 0,
-                        casino_wins INTEGER NOT NULL DEFAULT 0,
-                        casino_losses INTEGER NOT NULL DEFAULT 0,
-                        bounty_wins INTEGER NOT NULL DEFAULT 0,
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )
-                    """
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    balance REAL NOT NULL DEFAULT 0,
+                    total_earned REAL NOT NULL DEFAULT 0,
+                    total_spent REAL NOT NULL DEFAULT 0,
+                    casino_wins INTEGER NOT NULL DEFAULT 0,
+                    casino_losses INTEGER NOT NULL DEFAULT 0,
+                    bounty_wins INTEGER NOT NULL DEFAULT 0
                 )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS bot_ledger (
-                        id BIGSERIAL PRIMARY KEY,
-                        user_id BIGINT NOT NULL REFERENCES bot_users(user_id) ON DELETE CASCADE,
-                        amount NUMERIC(12,2) NOT NULL,
-                        reason TEXT NOT NULL,
-                        category TEXT NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )
-                    """
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    amount REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_ledger_user_id ON bot_ledger(user_id)")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_ledger_created_at ON bot_ledger(created_at)")
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS bot_bounties (
-                        id BIGSERIAL PRIMARY KEY,
-                        title TEXT NOT NULL,
-                        description TEXT NOT NULL,
-                        reward NUMERIC(12,2) NOT NULL,
-                        created_by BIGINT NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                        claimed_by BIGINT,
-                        claimed_at TIMESTAMPTZ
-                    )
-                    """
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bounties (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    reward REAL NOT NULL,
+                    created_by INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    claimed_by INTEGER,
+                    claimed_at TIMESTAMP
                 )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS bot_shop_purchases (
-                        id BIGSERIAL PRIMARY KEY,
-                        user_id BIGINT NOT NULL REFERENCES bot_users(user_id) ON DELETE CASCADE,
-                        item_name TEXT NOT NULL,
-                        cost NUMERIC(12,2) NOT NULL,
-                        notes TEXT,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )
-                    """
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS shop_purchases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    item_name TEXT NOT NULL,
+                    cost REAL NOT NULL,
+                    notes TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS bot_xp_users (
-                        user_id BIGINT PRIMARY KEY,
-                        username TEXT NOT NULL,
-                        xp INTEGER NOT NULL DEFAULT 0,
-                        level INTEGER NOT NULL DEFAULT 1,
-                        messages_counted INTEGER NOT NULL DEFAULT 0,
-                        last_xp_at DOUBLE PRECISION NOT NULL DEFAULT 0,
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )
-                    """
-                )
+                """
+            )
             conn.commit()
 
     def ensure_user(self, user: discord.abc.User):
         with self.connect() as conn:
-            with conn.cursor() as cur:
+            cur = conn.cursor()
+            cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user.id,))
+            if cur.fetchone() is None:
                 cur.execute(
-                    """
-                    INSERT INTO bot_users (user_id, username, updated_at)
-                    VALUES (%s, %s, NOW())
-                    ON CONFLICT (user_id)
-                    DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
-                    """,
+                    "INSERT INTO users (user_id, username) VALUES (?, ?)",
                     (user.id, str(user)),
+                )
+            else:
+                cur.execute(
+                    "UPDATE users SET username = ? WHERE user_id = ?",
+                    (str(user), user.id),
                 )
             conn.commit()
 
     def get_user(self, user: discord.abc.User):
         self.ensure_user(user)
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM bot_users WHERE user_id = %s", (user.id,))
-                return cur.fetchone()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM users WHERE user_id = ?", (user.id,))
+            return cur.fetchone()
 
     def add_tokens(self, user: discord.abc.User, amount: float, reason: str, category: str):
         self.ensure_user(user)
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE bot_users
-                    SET balance = balance + %s,
-                        total_earned = total_earned + %s,
-                        updated_at = NOW()
-                    WHERE user_id = %s
-                    """,
-                    (amount, max(amount, 0), user.id),
-                )
-                cur.execute(
-                    "INSERT INTO bot_ledger (user_id, amount, reason, category) VALUES (%s, %s, %s, %s)",
-                    (user.id, amount, reason, category),
-                )
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE users SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?",
+                (amount, max(amount, 0), user.id),
+            )
+            cur.execute(
+                "INSERT INTO ledger (user_id, amount, reason, category) VALUES (?, ?, ?, ?)",
+                (user.id, amount, reason, category),
+            )
             conn.commit()
-
-    def add_tokens_bulk(self, users: list[discord.abc.User], amount: float, reason: str, category: str) -> int:
-        valid_users = [user for user in users if not getattr(user, "bot", False)]
-        if not valid_users:
-            return 0
-        with self.connect() as conn:
-            with conn.cursor() as cur:
-                for user in valid_users:
-                    cur.execute(
-                        """
-                        INSERT INTO bot_users (user_id, username, updated_at)
-                        VALUES (%s, %s, NOW())
-                        ON CONFLICT (user_id)
-                        DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
-                        """,
-                        (user.id, str(user)),
-                    )
-                cur.executemany(
-                    """
-                    UPDATE bot_users
-                    SET balance = balance + %s,
-                        total_earned = total_earned + %s,
-                        updated_at = NOW()
-                    WHERE user_id = %s
-                    """,
-                    [(amount, max(amount, 0), user.id) for user in valid_users],
-                )
-                cur.executemany(
-                    "INSERT INTO bot_ledger (user_id, amount, reason, category) VALUES (%s, %s, %s, %s)",
-                    [(user.id, amount, reason, category) for user in valid_users],
-                )
-            conn.commit()
-        return len(valid_users)
 
     def spend_tokens(self, user: discord.abc.User, amount: float, reason: str, category: str) -> bool:
         self.ensure_user(user)
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT balance FROM bot_users WHERE user_id = %s", (user.id,))
-                row = cur.fetchone()
-                current_balance = float(row["balance"]) if row else 0.0
-                if current_balance < amount:
-                    return False
-                cur.execute(
-                    """
-                    UPDATE bot_users
-                    SET balance = balance - %s,
-                        total_spent = total_spent + %s,
-                        updated_at = NOW()
-                    WHERE user_id = %s
-                    """,
-                    (amount, amount, user.id),
-                )
-                cur.execute(
-                    "INSERT INTO bot_ledger (user_id, amount, reason, category) VALUES (%s, %s, %s, %s)",
-                    (user.id, -amount, reason, category),
-                )
+            cur = conn.cursor()
+            cur.execute("SELECT balance FROM users WHERE user_id = ?", (user.id,))
+            row = cur.fetchone()
+            if row is None or row["balance"] < amount:
+                return False
+            cur.execute(
+                "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id = ?",
+                (amount, amount, user.id),
+            )
+            cur.execute(
+                "INSERT INTO ledger (user_id, amount, reason, category) VALUES (?, ?, ?, ?)",
+                (user.id, -amount, reason, category),
+            )
             conn.commit()
             return True
 
     def record_shop_purchase(self, user: discord.abc.User, item_name: str, cost: float, notes: str = ""):
-        self.ensure_user(user)
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO bot_shop_purchases (user_id, item_name, cost, notes) VALUES (%s, %s, %s, %s)",
-                    (user.id, item_name, cost, notes),
-                )
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO shop_purchases (user_id, item_name, cost, notes) VALUES (?, ?, ?, ?)",
+                (user.id, item_name, cost, notes),
+            )
             conn.commit()
 
     def update_casino_result(self, user: discord.abc.User, won: bool):
         self.ensure_user(user)
-        field = "casino_wins" if won else "casino_losses"
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"UPDATE bot_users SET {field} = {field} + 1, updated_at = NOW() WHERE user_id = %s",
-                    (user.id,),
-                )
+            cur = conn.cursor()
+            field = "casino_wins" if won else "casino_losses"
+            cur.execute(f"UPDATE users SET {field} = {field} + 1 WHERE user_id = ?", (user.id,))
             conn.commit()
 
     def leaderboard(self):
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM bot_users WHERE balance > 0 ORDER BY balance DESC, total_earned DESC")
-                return cur.fetchall()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM users WHERE balance > 0 ORDER BY balance DESC, total_earned DESC")
+            return cur.fetchall()
 
     def recent_ledger(self, user: discord.abc.User, limit: int = 10):
         self.ensure_user(user)
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT * FROM bot_ledger WHERE user_id = %s ORDER BY id DESC LIMIT %s",
-                    (user.id, limit),
-                )
-                return cur.fetchall()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM ledger WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+                (user.id, limit),
+            )
+            return cur.fetchall()
 
     def create_bounty(self, title: str, description: str, reward: float, created_by: int):
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO bot_bounties (title, description, reward, created_by)
-                    VALUES (%s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (title, description, reward, created_by),
-                )
-                row = cur.fetchone()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO bounties (title, description, reward, created_by) VALUES (?, ?, ?, ?)",
+                (title, description, reward, created_by),
+            )
+            bounty_id = cur.lastrowid
             conn.commit()
-            return row["id"]
+            return bounty_id
 
     def list_active_bounties(self):
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM bot_bounties WHERE is_active = TRUE ORDER BY id DESC")
-                return cur.fetchall()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM bounties WHERE is_active = 1 ORDER BY id DESC")
+            return cur.fetchall()
 
-    def claim_bounty(self, bounty_id: int, user: discord.abc.User):
+    def claim_bounty(self, bounty_id: int, user: discord.abc.User) -> Optional[sqlite3.Row]:
         self.ensure_user(user)
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT * FROM bot_bounties WHERE id = %s AND is_active = TRUE FOR UPDATE",
-                    (bounty_id,),
-                )
-                bounty = cur.fetchone()
-                if bounty is None:
-                    return None
-                cur.execute(
-                    """
-                    UPDATE bot_bounties
-                    SET is_active = FALSE, claimed_by = %s, claimed_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (user.id, bounty_id),
-                )
-                cur.execute(
-                    """
-                    UPDATE bot_users
-                    SET balance = balance + %s,
-                        total_earned = total_earned + %s,
-                        bounty_wins = bounty_wins + 1,
-                        updated_at = NOW()
-                    WHERE user_id = %s
-                    """,
-                    (bounty["reward"], bounty["reward"], user.id),
-                )
-                cur.execute(
-                    """
-                    INSERT INTO bot_ledger (user_id, amount, reason, category)
-                    VALUES (%s, %s, %s, %s)
-                    """,
-                    (user.id, bounty["reward"], f"Claimed bounty #{bounty_id}: {bounty['title']}", "bounty"),
-                )
-                cur.execute("SELECT * FROM bot_bounties WHERE id = %s", (bounty_id,))
-                claimed = cur.fetchone()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM bounties WHERE id = ? AND is_active = 1", (bounty_id,))
+            bounty = cur.fetchone()
+            if bounty is None:
+                return None
+            cur.execute(
+                "UPDATE bounties SET is_active = 0, claimed_by = ?, claimed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (user.id, bounty_id),
+            )
+            cur.execute(
+                "UPDATE users SET balance = balance + ?, total_earned = total_earned + ?, bounty_wins = bounty_wins + 1 WHERE user_id = ?",
+                (bounty["reward"], bounty["reward"], user.id),
+            )
+            cur.execute(
+                "INSERT INTO ledger (user_id, amount, reason, category) VALUES (?, ?, ?, ?)",
+                (user.id, bounty["reward"], f"Claimed bounty #{bounty_id}: {bounty['title']}", "bounty"),
+            )
             conn.commit()
-            return claimed
+            cur.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,))
+            return cur.fetchone()
 
     def update_bounty_reward(self, bounty_id: int, reward: float) -> bool:
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE bot_bounties SET reward = %s WHERE id = %s", (reward, bounty_id))
-                updated = cur.rowcount > 0
+            cur = conn.cursor()
+            cur.execute("UPDATE bounties SET reward = ? WHERE id = ?", (reward, bounty_id))
             conn.commit()
-            return updated
+            return cur.rowcount > 0
 
     def get_bounty(self, bounty_id: int):
         with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM bot_bounties WHERE id = %s", (bounty_id,))
-                return cur.fetchone()
-
-
-    def ensure_xp_user(self, user: discord.abc.User):
-        with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO bot_xp_users (user_id, username)
-                    VALUES (%s, %s)
-                    ON CONFLICT (user_id) DO UPDATE
-                    SET username = EXCLUDED.username,
-                        updated_at = NOW()
-                    """,
-                    (int(user.id), str(user)),
-                )
-            conn.commit()
-
-    def get_xp_user(self, user: discord.abc.User):
-        self.ensure_xp_user(user)
-        with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM bot_xp_users WHERE user_id = %s", (int(user.id),))
-                return cur.fetchone()
-
-    def update_xp_progress(self, user: discord.abc.User, xp: int, level: int, messages_counted: int, last_xp_at: float):
-        self.ensure_xp_user(user)
-        with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE bot_xp_users
-                    SET xp = %s,
-                        level = %s,
-                        messages_counted = %s,
-                        last_xp_at = %s,
-                        username = %s,
-                        updated_at = NOW()
-                    WHERE user_id = %s
-                    """,
-                    (int(xp), int(level), int(messages_counted), float(last_xp_at), str(user), int(user.id)),
-                )
-            conn.commit()
-
-    def xp_leaderboard(self):
-        with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT * FROM bot_xp_users ORDER BY level DESC, xp DESC, messages_counted DESC, username ASC"
-                )
-                return cur.fetchall()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM bounties WHERE id = ?", (bounty_id,))
+            return cur.fetchone()
 
 
 TOKEN_DB = TokenDatabase(TOKEN_DB_PATH)
@@ -602,245 +458,6 @@ def fetch_standings_rows():
             return cur.fetchall()
 
 
-
-def fetch_recent_completed_games(limit: int = 64):
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    g.game_id,
-                    g.stage_index,
-                    g.week,
-                    (g.week + 1) AS display_week,
-                    g.away_score,
-                    g.home_score,
-                    away.team_name AS away_team_name,
-                    home.team_name AS home_team_name,
-                    g.away_team_id,
-                    g.home_team_id
-                FROM games g
-                JOIN teams away ON away.team_id = g.away_team_id
-                JOIN teams home ON home.team_id = g.home_team_id
-                WHERE g.season_index = (SELECT MAX(season_index) FROM games)
-                ORDER BY g.stage_index DESC, g.week DESC, g.game_id DESC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            rows = cur.fetchall()
-    return [row for row in rows if looks_like_completed_game(row)]
-
-
-def compute_team_streaks(recent_games: list[dict]) -> dict[str, dict]:
-    streaks: dict[str, dict] = {}
-    for row in recent_games:
-        away = row["away_team_name"]
-        home = row["home_team_name"]
-        away_score = int(row.get("away_score") or 0)
-        home_score = int(row.get("home_score") or 0)
-
-        if away_score == home_score:
-            results = [(away, "T"), (home, "T")]
-        elif away_score > home_score:
-            results = [(away, "W"), (home, "L")]
-        else:
-            results = [(away, "L"), (home, "W")]
-
-        for team_name, result in results:
-            bucket = streaks.setdefault(team_name, {"streak_type": None, "streak_count": 0, "recent": []})
-            bucket["recent"].append(result)
-            if bucket["streak_type"] is None:
-                bucket["streak_type"] = result
-                bucket["streak_count"] = 1
-            elif bucket["streak_type"] == result:
-                bucket["streak_count"] += 1
-    return streaks
-
-
-def compute_power_rankings(limit: int = 10):
-    standings = fetch_standings_rows()
-    recent_games = fetch_recent_completed_games(limit=96)
-    streaks = compute_team_streaks(recent_games)
-
-    ranked = []
-    for row in standings:
-        team_name = row["team_name"]
-        wins = int(row.get("wins") or 0)
-        losses = int(row.get("losses") or 0)
-        ties = int(row.get("ties") or 0)
-        team_ovr = int(row.get("team_ovr") or 0)
-        pts_for = int(row.get("pts_for") or 0)
-        pts_against = int(row.get("pts_against") or 0)
-        turnover_diff = int(row.get("turnover_diff") or 0)
-        win_pct = float(row.get("win_pct") or 0)
-        streak = streaks.get(team_name, {"streak_type": None, "streak_count": 0})
-
-        point_diff = pts_for - pts_against
-        streak_bonus = 0
-        if streak["streak_type"] == "W":
-            streak_bonus = streak["streak_count"] * 2.5
-        elif streak["streak_type"] == "L":
-            streak_bonus = -(streak["streak_count"] * 2.5)
-
-        score = (
-            (win_pct * 100)
-            + (wins * 2.0)
-            + (point_diff * 0.08)
-            + (turnover_diff * 1.2)
-            + ((team_ovr - 75) * 0.6)
-            + streak_bonus
-        )
-
-        ranked.append({
-            "team_name": team_name,
-            "wins": wins,
-            "losses": losses,
-            "ties": ties,
-            "win_pct": win_pct,
-            "team_ovr": team_ovr,
-            "pts_for": pts_for,
-            "pts_against": pts_against,
-            "turnover_diff": turnover_diff,
-            "streak_type": streak["streak_type"],
-            "streak_count": streak["streak_count"],
-            "power_score": round(score, 2),
-        })
-
-    ranked.sort(key=lambda item: (item["power_score"], item["wins"], item["team_ovr"]), reverse=True)
-    return ranked[:limit], ranked
-
-
-def build_power_rankings_embed(limit: int = 10) -> discord.Embed:
-    top_rows, _all_rows = compute_power_rankings(limit=max(limit, 10))
-    lines = []
-    for idx, row in enumerate(top_rows[:limit], start=1):
-        streak_text = ""
-        if row["streak_type"] in {"W", "L"} and row["streak_count"] > 0:
-            streak_text = f" | {row['streak_type']}{row['streak_count']}"
-        lines.append(
-            f"**{idx}. {row['team_name']}** ({row['wins']}-{row['losses']}-{row['ties']}) | "
-            f"Score: {row['power_score']:.1f} | OVR {row['team_ovr']}{streak_text}"
-        )
-
-    embed = build_embed("📈 Power Rankings", "\n".join(lines), 0x5865F2)
-    embed.set_footer(text="Bot-calculated using record, form, point differential, turnovers, and team OVR.")
-    return embed
-
-
-def detect_storylines(limit: int = 6):
-    standings = fetch_standings_rows()
-    recent_games = fetch_recent_completed_games(limit=96)
-    streaks = compute_team_streaks(recent_games)
-    top_passing = fetch_top_passing_leaders(limit=1)
-    top_rushing = fetch_top_rushing_leaders(limit=1)
-    top_sacks = fetch_top_sack_leaders(limit=1)
-    top_ints = fetch_top_interception_leaders(limit=1)
-    games = []
-    try:
-        stage_index, week = detect_current_stage_and_week()
-        if stage_index is not None and week is not None:
-            games = fetch_games_for_stage_week(stage_index, week)
-    except Exception:
-        games = []
-
-    storylines = []
-
-    undefeated = [row for row in standings if int(row.get("wins") or 0) > 0 and int(row.get("losses") or 0) == 0]
-    if undefeated:
-        team = sorted(undefeated, key=lambda r: (float(r.get("win_pct") or 0), int(r.get("wins") or 0)), reverse=True)[0]
-        storylines.append({
-            "title": "Undefeated Watch",
-            "text": f"{team['team_name']} is still unbeaten at {int(team['wins'])}-{int(team['losses'])}-{int(team['ties'])} and carries the league's cleanest record into the week."
-        })
-
-    hottest = None
-    coldest = None
-    for team_name, data in streaks.items():
-        if data["streak_type"] == "W":
-            if hottest is None or data["streak_count"] > hottest[1]["streak_count"]:
-                hottest = (team_name, data)
-        elif data["streak_type"] == "L":
-            if coldest is None or data["streak_count"] > coldest[1]["streak_count"]:
-                coldest = (team_name, data)
-
-    if hottest:
-        storylines.append({
-            "title": "Hottest Team",
-            "text": f"{hottest[0]} rides a {hottest[1]['streak_count']}-game win streak and enters the week with real momentum."
-        })
-    if coldest:
-        storylines.append({
-            "title": "Team Under Pressure",
-            "text": f"{coldest[0]} has dropped {coldest[1]['streak_count']} straight and badly needs a response this week."
-        })
-
-    if recent_games:
-        biggest_upset = None
-        standings_map = {row["team_name"]: float(row.get("win_pct") or 0) for row in standings}
-        for row in recent_games[:24]:
-            away = row["away_team_name"]
-            home = row["home_team_name"]
-            away_score = int(row.get("away_score") or 0)
-            home_score = int(row.get("home_score") or 0)
-            if away_score == home_score:
-                continue
-            winner = away if away_score > home_score else home
-            loser = home if winner == away else away
-            delta = standings_map.get(loser, 0) - standings_map.get(winner, 0)
-            margin = abs(away_score - home_score)
-            upset_score = (delta * 100) + margin
-            if biggest_upset is None or upset_score > biggest_upset[0]:
-                biggest_upset = (upset_score, winner, loser, away_score, home_score)
-        if biggest_upset:
-            _score, winner, loser, away_score, home_score = biggest_upset
-            storylines.append({
-                "title": "Biggest Recent Upset",
-                "text": f"{winner} just put the league on notice after knocking off {loser} in one of the biggest recent surprise results."
-            })
-
-    leader_blocks = [
-        ("Passing Spotlight", top_passing, "total_pass_yds", "passing yards"),
-        ("Ground Game Spotlight", top_rushing, "total_rush_yds", "rushing yards"),
-        ("Pass Rush Spotlight", top_sacks, "total_sacks", "sacks"),
-        ("Ballhawk Spotlight", top_ints, "total_ints", "interceptions"),
-    ]
-    for title, rows, key, label in leader_blocks:
-        if rows:
-            row = rows[0]
-            storylines.append({
-                "title": title,
-                "text": f"{row['player_name']} from {row['team_name']} currently leads the league in {label} with {row[key]}."
-            })
-            break
-
-    if games:
-        scored = sorted(games, key=compute_matchup_score, reverse=True)
-        gotw = scored[0]
-        storylines.append({
-            "title": "Game of the Week",
-            "text": f"{gotw['away_team_name']} vs {gotw['home_team_name']} shapes up as the biggest matchup on the board this week."
-        })
-
-    return storylines[:limit]
-
-
-def build_storylines_embed(limit: int = 6) -> discord.Embed:
-    storylines = detect_storylines(limit=limit)
-    if not storylines:
-        return build_embed("📰 Weekly Storylines", "No major storylines detected yet.", 0x5865F2)
-
-    embed = build_embed("📰 Weekly Storylines", "The biggest narratives shaping this week around the league.", 0x5865F2)
-    for item in storylines[:limit]:
-        embed.add_field(name=item["title"], value=item["text"], inline=False)
-    embed.set_footer(text="Bot-detected from standings, recent results, leaders, and upcoming matchups.")
-    return embed
-
-
-async def post_storylines_article(target_channel: discord.abc.Messageable, limit: int = 6):
-    embed = build_storylines_embed(limit=limit)
-    await target_channel.send(embed=embed)
-
 def slugify_channel_name(value: str) -> str:
     value = value.lower().strip()
     value = re.sub(r"[^a-z0-9]+", "-", value)
@@ -898,29 +515,29 @@ def stage_display_name(stage_index: int) -> str:
 
 def stage_channel_prefix(stage_index: int) -> str:
     return {
-        0: "pre-wk",
-        1: "wk",
-        2: "wc",
-        3: "div",
-        4: "conf",
-        5: "sb",
+        1: "pre-wk",
+        2: "wk",
+        3: "wc",
+        4: "div",
+        5: "conf",
+        6: "sb",
     }.get(stage_index, f"s{stage_index}-w")
 
 
 def stage_week_label(stage_index: int, display_week: int) -> str:
-    if stage_index == 1:
-        return f"Week {display_week}"
-    if stage_index == 0:
-        return f"Preseason Week {display_week}"
     if stage_index == 2:
-        return f"Wild Card Week {display_week}"
+        return f"Week {display_week}"
+    if stage_index == 1:
+        return f"Preseason Week {display_week}"
     if stage_index == 3:
-        return f"Divisional Week {display_week}"
+        return f"Wild Card Week {display_week}"
     if stage_index == 4:
-        return f"Conference Championship Week {display_week}"
+        return f"Divisional Week {display_week}"
     if stage_index == 5:
+        return f"Conference Championship Week {display_week}"
+    if stage_index == 6:
         return "Super Bowl"
-    return f"{stage_display_name(stage_index)} Week {display_week}" 
+    return f"{stage_display_name(stage_index)} Week {display_week}"
 
 
 def parse_phase_to_stage_index(phase: Optional[str]) -> Optional[int]:
@@ -1034,19 +651,6 @@ def fetch_games_for_week(week: int, stage_index: Optional[int] = None):
     return fetch_games_for_stage_week(resolved_stage, week)
 
 
-def get_active_stat_scope() -> tuple[int, int]:
-    stage_index, _display_week = detect_current_stage_and_week()
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COALESCE(MAX(season_index), 0) AS season_index FROM games")
-            row = cur.fetchone() or {}
-    season_index = int((row.get("season_index") or 0))
-    # Madden awards / season leaderboards should use preseason-only during preseason,
-    # and regular-season-only once the regular season has started.
-    stat_stage_index = 0 if stage_index == 0 else 1
-    return season_index, stat_stage_index
-
-
 def compute_matchup_score(game_row) -> float:
     away_wins = game_row["away_wins"] or 0
     away_win_pct = float(game_row["away_win_pct"] or 0)
@@ -1073,9 +677,7 @@ def compute_matchup_score(game_row) -> float:
     )
 
 
-
 def fetch_top_passing_leaders(limit: int = 5):
-    season_index, stat_stage_index = get_active_stat_scope()
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1088,20 +690,16 @@ def fetch_top_passing_leaders(limit: int = 5):
                 FROM player_passing_stats pps
                 LEFT JOIN players ON players.roster_id = pps.roster_id
                 LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, pps.team_id)
-                WHERE COALESCE(pps.season_index, 0) = %s
-                  AND COALESCE(pps.stage_index, 0) = %s
                 GROUP BY pps.roster_id
                 ORDER BY total_pass_yds DESC, player_name ASC
                 LIMIT %s
                 """,
-                (season_index, stat_stage_index, limit),
+                (limit,),
             )
             return cur.fetchall()
 
 
-
 def fetch_top_rushing_leaders(limit: int = 5):
-    season_index, stat_stage_index = get_active_stat_scope()
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1114,46 +712,16 @@ def fetch_top_rushing_leaders(limit: int = 5):
                 FROM player_rushing_stats prs
                 LEFT JOIN players ON players.roster_id = prs.roster_id
                 LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, prs.team_id)
-                WHERE COALESCE(prs.season_index, 0) = %s
-                  AND COALESCE(prs.stage_index, 0) = %s
                 GROUP BY prs.roster_id
                 ORDER BY total_rush_yds DESC, player_name ASC
                 LIMIT %s
                 """,
-                (season_index, stat_stage_index, limit),
-            )
-            return cur.fetchall()
-
-
-
-
-def fetch_top_receiving_leaders(limit: int = 5):
-    season_index, stat_stage_index = get_active_stat_scope()
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    prs.roster_id,
-                    COALESCE(MAX(players.full_name), MAX(prs.full_name)) AS player_name,
-                    COALESCE(MAX(teams.team_name), 'Unknown Team') AS team_name,
-                    SUM(COALESCE(prs.rec_yds, 0)) AS total_rec_yds
-                FROM player_receiving_stats prs
-                LEFT JOIN players ON players.roster_id = prs.roster_id
-                LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, prs.team_id)
-                WHERE COALESCE(prs.season_index, 0) = %s
-                  AND COALESCE(prs.stage_index, 0) = %s
-                GROUP BY prs.roster_id
-                ORDER BY total_rec_yds DESC, player_name ASC
-                LIMIT %s
-                """,
-                (season_index, stat_stage_index, limit),
+                (limit,),
             )
             return cur.fetchall()
 
 
 def fetch_top_sack_leaders(limit: int = 5):
-    season_index, stat_stage_index = get_active_stat_scope()
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1166,20 +734,16 @@ def fetch_top_sack_leaders(limit: int = 5):
                 FROM player_defense_stats pds
                 LEFT JOIN players ON players.roster_id = pds.roster_id
                 LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, pds.team_id)
-                WHERE COALESCE(pds.season_index, 0) = %s
-                  AND COALESCE(pds.stage_index, 0) = %s
                 GROUP BY pds.roster_id
                 ORDER BY total_sacks DESC, player_name ASC
                 LIMIT %s
                 """,
-                (season_index, stat_stage_index, limit),
+                (limit,),
             )
             return cur.fetchall()
 
 
-
 def fetch_top_interception_leaders(limit: int = 5):
-    season_index, stat_stage_index = get_active_stat_scope()
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1192,13 +756,11 @@ def fetch_top_interception_leaders(limit: int = 5):
                 FROM player_defense_stats pds
                 LEFT JOIN players ON players.roster_id = pds.roster_id
                 LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, pds.team_id)
-                WHERE COALESCE(pds.season_index, 0) = %s
-                  AND COALESCE(pds.stage_index, 0) = %s
                 GROUP BY pds.roster_id
                 ORDER BY total_ints DESC, player_name ASC
                 LIMIT %s
                 """,
-                (season_index, stat_stage_index, limit),
+                (limit,),
             )
             return cur.fetchall()
 
@@ -1213,269 +775,6 @@ def format_leader_lines(rows, stat_key: str, stat_label: str):
         stat_value = row.get(stat_key, 0)
         lines.append(f"{idx}. {player_name} ({team_name}) — {stat_value}")
     return lines
-
-
-
-
-
-def fetch_mvp_race_rows(limit: int = 10):
-    season_index, stat_stage_index = get_active_stat_scope()
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                WITH pass_stats AS (
-                    SELECT
-                        pps.roster_id,
-                        SUM(COALESCE(pps.pass_yds, 0)) AS pass_yds,
-                        SUM(COALESCE(pps.pass_tds, 0)) AS pass_tds,
-                        SUM(COALESCE(pps.pass_int, 0)) AS pass_int
-                    FROM player_passing_stats pps
-                    WHERE COALESCE(pps.season_index, 0) = %s
-                      AND COALESCE(pps.stage_index, 0) = %s
-                    GROUP BY pps.roster_id
-                ),
-                rush_stats AS (
-                    SELECT
-                        prs.roster_id,
-                        SUM(COALESCE(prs.rush_yds, 0)) AS rush_yds,
-                        SUM(COALESCE(prs.rush_tds, 0)) AS rush_tds
-                    FROM player_rushing_stats prs
-                    WHERE COALESCE(prs.season_index, 0) = %s
-                      AND COALESCE(prs.stage_index, 0) = %s
-                    GROUP BY prs.roster_id
-                )
-                SELECT
-                    p.roster_id,
-                    COALESCE(p.full_name, 'Unknown') AS player_name,
-                    COALESCE(t.team_name, 'Unknown Team') AS team_name,
-                    COALESCE(p.position, '?') AS position,
-                    COALESCE(ps.pass_yds, 0) AS pass_yds,
-                    COALESCE(ps.pass_tds, 0) AS pass_tds,
-                    COALESCE(ps.pass_int, 0) AS pass_int,
-                    COALESCE(rs.rush_yds, 0) AS rush_yds,
-                    COALESCE(rs.rush_tds, 0) AS rush_tds,
-                    COALESCE(s.wins, 0) AS team_wins,
-                    ROUND(
-                        (COALESCE(ps.pass_yds, 0) * 0.03) +
-                        (COALESCE(ps.pass_tds, 0) * 6.0) -
-                        (COALESCE(ps.pass_int, 0) * 2.5) +
-                        (COALESCE(rs.rush_yds, 0) * 0.05) +
-                        (COALESCE(rs.rush_tds, 0) * 6.0) +
-                        (COALESCE(s.wins, 0) * 1.5),
-                        2
-                    ) AS award_score
-                FROM players p
-                LEFT JOIN teams t ON t.team_id = p.team_id
-                LEFT JOIN standings s ON s.team_id = p.team_id
-                LEFT JOIN pass_stats ps ON ps.roster_id = p.roster_id
-                LEFT JOIN rush_stats rs ON rs.roster_id = p.roster_id
-                WHERE COALESCE(ps.pass_yds, 0) > 0 OR COALESCE(rs.rush_yds, 0) > 0
-                ORDER BY award_score DESC, team_wins DESC, player_name ASC
-                LIMIT %s
-                """,
-                (season_index, stat_stage_index, season_index, stat_stage_index, limit),
-            )
-            return cur.fetchall()
-
-
-
-def fetch_opoty_race_rows(limit: int = 10, rookies_only: bool = False):
-    season_index, stat_stage_index = get_active_stat_scope()
-    rookie_clause = "AND COALESCE(p.years_pro, 0) = 0" if rookies_only else ""
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                WITH pass_stats AS (
-                    SELECT
-                        pps.roster_id,
-                        SUM(COALESCE(pps.pass_yds, 0)) AS pass_yds,
-                        SUM(COALESCE(pps.pass_tds, 0)) AS pass_tds
-                    FROM player_passing_stats pps
-                    WHERE COALESCE(pps.season_index, 0) = %s
-                      AND COALESCE(pps.stage_index, 0) = %s
-                    GROUP BY pps.roster_id
-                ),
-                rush_stats AS (
-                    SELECT
-                        prs.roster_id,
-                        SUM(COALESCE(prs.rush_yds, 0)) AS rush_yds,
-                        SUM(COALESCE(prs.rush_tds, 0)) AS rush_tds
-                    FROM player_rushing_stats prs
-                    WHERE COALESCE(prs.season_index, 0) = %s
-                      AND COALESCE(prs.stage_index, 0) = %s
-                    GROUP BY prs.roster_id
-                )
-                SELECT
-                    p.roster_id,
-                    COALESCE(p.full_name, 'Unknown') AS player_name,
-                    COALESCE(t.team_name, 'Unknown Team') AS team_name,
-                    COALESCE(p.position, '?') AS position,
-                    COALESCE(ps.pass_yds, 0) AS pass_yds,
-                    COALESCE(ps.pass_tds, 0) AS pass_tds,
-                    COALESCE(rs.rush_yds, 0) AS rush_yds,
-                    COALESCE(rs.rush_tds, 0) AS rush_tds,
-                    ROUND(
-                        (COALESCE(ps.pass_yds, 0) * 0.025) +
-                        (COALESCE(ps.pass_tds, 0) * 5.5) +
-                        (COALESCE(rs.rush_yds, 0) * 0.06) +
-                        (COALESCE(rs.rush_tds, 0) * 6.0),
-                        2
-                    ) AS award_score
-                FROM players p
-                LEFT JOIN teams t ON t.team_id = p.team_id
-                LEFT JOIN pass_stats ps ON ps.roster_id = p.roster_id
-                LEFT JOIN rush_stats rs ON rs.roster_id = p.roster_id
-                WHERE (COALESCE(ps.pass_yds, 0) > 0 OR COALESCE(rs.rush_yds, 0) > 0)
-                {rookie_clause}
-                ORDER BY award_score DESC, player_name ASC
-                LIMIT %s
-                """,
-                (season_index, stat_stage_index, season_index, stat_stage_index, limit),
-            )
-            return cur.fetchall()
-
-
-
-def fetch_dpoty_race_rows(limit: int = 10, rookies_only: bool = False):
-    season_index, stat_stage_index = get_active_stat_scope()
-    rookie_clause = "AND COALESCE(p.years_pro, 0) = 0" if rookies_only else ""
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT
-                    p.roster_id,
-                    COALESCE(p.full_name, MAX(pds.full_name), 'Unknown') AS player_name,
-                    COALESCE(MAX(t.team_name), 'Unknown Team') AS team_name,
-                    COALESCE(p.position, '?') AS position,
-                    SUM(COALESCE(pds.def_sacks, 0)) AS sacks,
-                    SUM(COALESCE(pds.def_ints, 0)) AS ints,
-                    0 AS tackles,
-                    ROUND(((
-                        SUM(COALESCE(pds.def_sacks, 0)) * 4.0) +
-                        (SUM(COALESCE(pds.def_ints, 0)) * 5.0)
-                    )::numeric, 2) AS award_score
-                FROM player_defense_stats pds
-                LEFT JOIN players p ON p.roster_id = pds.roster_id
-                LEFT JOIN teams t ON t.team_id = COALESCE(p.team_id, pds.team_id)
-                WHERE COALESCE(pds.season_index, 0) = %s
-                  AND COALESCE(pds.stage_index, 0) = %s
-                  {rookie_clause}
-                GROUP BY p.roster_id, p.full_name, p.position
-                HAVING
-                    SUM(COALESCE(pds.def_sacks, 0)) > 0 OR
-                    SUM(COALESCE(pds.def_ints, 0)) > 0
-                ORDER BY award_score DESC, player_name ASC
-                LIMIT %s
-                """,
-                (season_index, stat_stage_index, limit),
-            )
-            return cur.fetchall()
-
-
-def format_award_race_lines(rows, award_type: str):
-    if not rows:
-        return ["No candidates found."]
-
-    lines = []
-    for idx, row in enumerate(rows, start=1):
-        player_name = row.get("player_name", "Unknown")
-        team_name = row.get("team_name", "Unknown Team")
-        position = row.get("position", "?")
-        score = row.get("award_score", 0)
-
-        if award_type in {"mvp", "opoty", "oroty"}:
-            stat_bits = []
-            if row.get("pass_yds"):
-                stat_bits.append(f"{int(row['pass_yds'])} PYDS")
-            if row.get("pass_tds"):
-                stat_bits.append(f"{int(row['pass_tds'])} PTD")
-            if row.get("rush_yds"):
-                stat_bits.append(f"{int(row['rush_yds'])} RYDS")
-            if row.get("rush_tds"):
-                stat_bits.append(f"{int(row['rush_tds'])} RTD")
-            if award_type == "mvp" and row.get("team_wins") is not None:
-                stat_bits.append(f"{int(row['team_wins'])} wins")
-        else:
-            stat_bits = [
-                f"{int(row.get('sacks', 0))} sacks",
-                f"{int(row.get('ints', 0))} ints",
-            ]
-
-        lines.append(
-            f"**{idx}. {player_name}** ({team_name}) — {position} | Score: **{score}** | " + ", ".join(stat_bits)
-        )
-
-    return lines
-
-
-def build_award_race_embed(title: str, rows, award_type: str) -> discord.Embed:
-    lines = format_award_race_lines(rows, award_type)
-    embed = discord.Embed(title=title, description="\n".join(lines[:10]), color=0x5865F2)
-    embed.set_footer(text="Award race score is bot-calculated from current export stats.")
-    return embed
-
-
-def xp_required_for_level(level: int) -> int:
-    if level <= 1:
-        return 0
-    return int(round(100 * ((level - 1) ** 1.5)))
-
-
-def level_from_xp(xp: int) -> int:
-    level = 1
-    while xp >= xp_required_for_level(level + 1):
-        level += 1
-    return level
-
-
-def xp_progress_text(xp: int) -> tuple[int, int, int]:
-    level = level_from_xp(xp)
-    current_floor = xp_required_for_level(level)
-    next_floor = xp_required_for_level(level + 1)
-    needed = max(next_floor - current_floor, 1)
-    progress = xp - current_floor
-    return level, progress, needed
-
-
-def level_reward(level: int) -> tuple[int, str]:
-    token_rewards = {
-        2: 1, 4: 1, 6: 2, 8: 2, 10: 3,
-        12: 2, 14: 2, 16: 3, 18: 3, 20: 4,
-        22: 3, 24: 3, 26: 4, 28: 4, 30: 5,
-        32: 4, 34: 4, 36: 5, 38: 5, 40: 6,
-        42: 5, 44: 5, 46: 6, 48: 6, 50: 10,
-    }
-    bonus_notes = {
-        10: "Prize Wheel spin voucher",
-        20: "Mystery Crate voucher",
-        30: "Boom or Bust voucher",
-        40: "Prize Wheel spin voucher",
-        50: "Premium reward voucher",
-    }
-    return token_rewards.get(level, 0), bonus_notes.get(level, "")
-
-
-async def post_level_up_announcement(guild: Optional[discord.Guild], user: discord.abc.User, level: int, token_reward: int, bonus_note: str):
-    if not guild or not LEVEL_UP_CHANNEL_ID:
-        return
-    channel = guild.get_channel(LEVEL_UP_CHANNEL_ID) or bot.get_channel(LEVEL_UP_CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(LEVEL_UP_CHANNEL_ID)
-        except Exception:
-            return
-    lines = [f"🎉 {user.mention} leveled up to **Level {level}**!"]
-    if token_reward > 0:
-        lines.append(f"Reward: **{fmt_tokens(token_reward)}** token{'s' if token_reward != 1 else ''}")
-    if bonus_note:
-        lines.append(f"Bonus: **{bonus_note}**")
-    try:
-        await channel.send("\n".join(lines))
-    except Exception:
-        pass
 
 
 # -----------------------------
@@ -1833,347 +1132,10 @@ class PrizeResult:
 
 
 # -----------------------------
-# Extra feature tables / helpers
-# -----------------------------
-def init_extra_feature_tables():
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bot_sportsbook_bets (
-                    id BIGSERIAL PRIMARY KEY,
-                    season_index INTEGER NOT NULL,
-                    stage_index INTEGER NOT NULL,
-                    week INTEGER NOT NULL,
-                    game_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    username TEXT NOT NULL,
-                    team_id BIGINT NOT NULL,
-                    team_name TEXT NOT NULL,
-                    amount NUMERIC(12,2) NOT NULL,
-                    multiplier NUMERIC(8,3) NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'open',
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    settled_at TIMESTAMPTZ
-                )
-                """
-            )
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_sportsbook_bets_lookup ON bot_sportsbook_bets(season_index, stage_index, week, game_id)")
-        conn.commit()
-
-
-def get_current_season_index() -> int:
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COALESCE(MAX(season_index), 0) AS season_index FROM games")
-            row = cur.fetchone() or {}
-    return int(row.get("season_index") or 0)
-
-
-def fetch_upcoming_games_for_current_week():
-    stage_index, display_week = detect_current_stage_and_week()
-    if stage_index is None or display_week is None:
-        return []
-    return fetch_games_for_stage_week(stage_index, display_week)
-
-
-def implied_multiplier_for_game_side(game_row, team_id: int) -> float:
-    away_score = compute_matchup_score(game_row)
-    flipped = dict(game_row)
-    flipped["away_wins"], flipped["home_wins"] = game_row["home_wins"], game_row["away_wins"]
-    flipped["away_win_pct"], flipped["home_win_pct"] = game_row["home_win_pct"], game_row["away_win_pct"]
-    flipped["away_ovr"], flipped["home_ovr"] = game_row["home_ovr"], game_row["away_ovr"]
-    home_score = compute_matchup_score(flipped)
-    diff = abs(float(away_score) - float(home_score))
-    favorite_mult = max(1.45, 1.92 - min(diff * 0.015, 0.42))
-    dog_mult = min(3.25, 2.08 + min(diff * 0.03, 1.1))
-    if away_score >= home_score:
-        away_mult, home_mult = favorite_mult, dog_mult
-    else:
-        away_mult, home_mult = dog_mult, favorite_mult
-    return round(away_mult if int(team_id) == int(game_row["away_team_id"]) else home_mult, 2)
-
-
-def build_sportsbook_embed() -> discord.Embed:
-    games = fetch_upcoming_games_for_current_week()
-    stage_index, display_week = detect_current_stage_and_week()
-    if not games:
-        return build_embed("🎟️ Sportsbook", "No upcoming games found for the current week.", 0x5865F2)
-
-    season_index = get_current_season_index()
-    lines = []
-    for game in games[:16]:
-        away_mult = implied_multiplier_for_game_side(game, game["away_team_id"])
-        home_mult = implied_multiplier_for_game_side(game, game["home_team_id"])
-        lines.append(
-            f"**{game['away_team_name']}** ({away_mult}x) at **{game['home_team_name']}** ({home_mult}x)"
-        )
-
-    embed = build_embed(
-        f"🎟️ Sportsbook — {stage_week_label(stage_index, display_week)}",
-        "\n".join(lines),
-        0x5865F2,
-    )
-    embed.set_footer(text="Bet with /bet team:<team name> amount:<tokens>. Payouts are stake included.")
-    return embed
-
-
-def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
-    season_index = get_current_season_index()
-    stage_index, display_week = detect_current_stage_and_week()
-    if stage_index is None or display_week is None:
-        return 0, 0, []
-    raw_week = max(display_week - 1, 0)
-    games = fetch_games_for_stage_week(stage_index, display_week)
-    game_map = {int(g["game_id"]): g for g in games if looks_like_completed_game(g)}
-    if not game_map:
-        return 0, 0, []
-
-    settled = 0
-    paid = 0
-    details: list[dict] = []
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT * FROM bot_sportsbook_bets
-                WHERE season_index = %s AND stage_index = %s AND week = %s AND status = 'open'
-                ORDER BY id ASC
-                """,
-                (season_index, stage_index, raw_week),
-            )
-            bets = cur.fetchall()
-
-            for bet in bets:
-                game = game_map.get(int(bet["game_id"]))
-                if not game:
-                    continue
-                away_score = int(game.get("away_score") or 0)
-                home_score = int(game.get("home_score") or 0)
-                matchup = f"{game['away_team_name']} {away_score}-{home_score} {game['home_team_name']}"
-                if away_score == home_score:
-                    outcome = "push"
-                    payout = float(bet["amount"])
-                else:
-                    winner_team_id = int(game["away_team_id"] if away_score > home_score else game["home_team_id"])
-                    if int(bet["team_id"]) == winner_team_id:
-                        outcome = "won"
-                        payout = round(float(bet["amount"]) * float(bet["multiplier"]), 2)
-                    else:
-                        outcome = "lost"
-                        payout = 0.0
-
-                if outcome in {"won", "push"} and payout > 0:
-                    cur.execute(
-                        """
-                        INSERT INTO bot_users (user_id, username)
-                        VALUES (%s, %s)
-                        ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
-                        """,
-                        (int(bet["user_id"]), bet["username"]),
-                    )
-                    cur.execute(
-                        """
-                        UPDATE bot_users
-                        SET balance = balance + %s,
-                            total_earned = total_earned + %s,
-                            updated_at = NOW()
-                        WHERE user_id = %s
-                        """,
-                        (payout, payout, int(bet["user_id"])),
-                    )
-                    cur.execute(
-                        """
-                        INSERT INTO bot_ledger (user_id, amount, reason, category)
-                        VALUES (%s, %s, %s, %s)
-                        """,
-                        (int(bet["user_id"]), payout, f"Sportsbook {outcome} payout for {bet['team_name']}", "sportsbook"),
-                    )
-                    paid += 1
-
-                cur.execute(
-                    "UPDATE bot_sportsbook_bets SET status = %s, settled_at = NOW() WHERE id = %s",
-                    (outcome, int(bet["id"])),
-                )
-                details.append({
-                    "username": bet["username"],
-                    "team_name": bet["team_name"],
-                    "amount": float(bet["amount"]),
-                    "multiplier": float(bet["multiplier"]),
-                    "outcome": outcome,
-                    "payout": payout,
-                    "matchup": matchup,
-                })
-                settled += 1
-        conn.commit()
-    return settled, paid, details
-
-
-def build_playoff_picture_embed() -> discord.Embed:
-    rows = fetch_standings_rows()
-    if not rows:
-        return build_embed("🏁 Playoff Picture", "No standings available yet.", 0x5865F2)
-    confs = {}
-    for row in rows:
-        confs.setdefault(row["conference_name"], []).append(row)
-    embed = build_embed("🏁 Playoff Picture", "Current playoff field and bubble teams.", 0x5865F2)
-    for conf_name, conf_rows in confs.items():
-        ordered = sorted(conf_rows, key=lambda r: (float(r.get("win_pct") or 0), int(r.get("wins") or 0), int(r.get("pts_for") or 0)), reverse=True)
-        field = ordered[:7]
-        bubble = ordered[7:9]
-        field_lines = [f"**{idx}. {r['team_name']}** ({int(r['wins'])}-{int(r['losses'])}-{int(r['ties'])})" for idx, r in enumerate(field, start=1)]
-        bubble_lines = [f"{r['team_name']} ({int(r['wins'])}-{int(r['losses'])}-{int(r['ties'])})" for r in bubble] or ["No bubble teams yet"]
-        embed.add_field(name=f"{conf_name} Field", value="\n".join(field_lines), inline=False)
-        embed.add_field(name=f"{conf_name} Bubble", value="\n".join(bubble_lines), inline=False)
-    return embed
-
-
-def build_potw_embed() -> discord.Embed:
-    stage_index, display_week = detect_current_stage_and_week()
-    if stage_index is None or display_week is None:
-        return build_embed("🌟 Players of the Week", "No eligible week found yet.", 0x5865F2)
-    target_week = max(display_week - 1, 1)
-    season_index = get_current_season_index()
-    stat_stage_index = 0 if stage_index == 0 else 1
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                WITH pass_week AS (
-                    SELECT pps.roster_id, SUM(COALESCE(pps.pass_yds,0)) AS pass_yds, SUM(COALESCE(pps.pass_tds,0)) AS pass_tds
-                    FROM player_passing_stats pps
-                    WHERE COALESCE(pps.season_index,0) = %s AND COALESCE(pps.stage_index,0) = %s AND COALESCE(pps.week,0) = %s
-                    GROUP BY pps.roster_id
-                ),
-                rush_week AS (
-                    SELECT prs.roster_id, SUM(COALESCE(prs.rush_yds,0)) AS rush_yds, SUM(COALESCE(prs.rush_td,0)) AS rush_td
-                    FROM player_rushing_stats prs
-                    WHERE COALESCE(prs.season_index,0) = %s AND COALESCE(prs.stage_index,0) = %s AND COALESCE(prs.week,0) = %s
-                    GROUP BY prs.roster_id
-                )
-                SELECT COALESCE(p.full_name,'Unknown') AS player_name,
-                       COALESCE(t.team_name,'Unknown Team') AS team_name,
-                       COALESCE(p.position,'?') AS position,
-                       COALESCE(pw.pass_yds,0) AS pass_yds,
-                       COALESCE(pw.pass_tds,0) AS pass_tds,
-                       COALESCE(rw.rush_yds,0) AS rush_yds,
-                       COALESCE(rw.rush_td,0) AS rush_td,
-                       ROUND((COALESCE(pw.pass_yds,0)*0.03)+(COALESCE(pw.pass_tds,0)*6)+(COALESCE(rw.rush_yds,0)*0.06)+(COALESCE(rw.rush_td,0)*6),2) AS score
-                FROM players p
-                LEFT JOIN teams t ON t.team_id = p.team_id
-                LEFT JOIN pass_week pw ON pw.roster_id = p.roster_id
-                LEFT JOIN rush_week rw ON rw.roster_id = p.roster_id
-                WHERE COALESCE(pw.pass_yds,0) > 0 OR COALESCE(rw.rush_yds,0) > 0
-                ORDER BY score DESC, player_name ASC
-                LIMIT 1
-                """,
-                (season_index, stat_stage_index, target_week-1, season_index, stat_stage_index, target_week-1),
-            )
-            offense = cur.fetchone()
-            cur.execute(
-                """
-                SELECT COALESCE(p.full_name, MAX(pds.full_name), 'Unknown') AS player_name,
-                       COALESCE(MAX(t.team_name), 'Unknown Team') AS team_name,
-                       COALESCE(p.position, '?') AS position,
-                       SUM(COALESCE(pds.def_sacks,0)) AS sacks,
-                       SUM(COALESCE(pds.def_ints,0)) AS ints,
-                       ROUND((SUM(COALESCE(pds.def_sacks,0))*4)+(SUM(COALESCE(pds.def_ints,0))*5),2) AS score
-                FROM player_defense_stats pds
-                LEFT JOIN players p ON p.roster_id = pds.roster_id
-                LEFT JOIN teams t ON t.team_id = COALESCE(p.team_id, pds.team_id)
-                WHERE COALESCE(pds.season_index,0) = %s AND COALESCE(pds.stage_index,0) = %s AND COALESCE(pds.week,0) = %s
-                GROUP BY p.roster_id, p.full_name, p.position
-                HAVING SUM(COALESCE(pds.def_sacks,0)) > 0 OR SUM(COALESCE(pds.def_ints,0)) > 0
-                ORDER BY score DESC, player_name ASC
-                LIMIT 1
-                """,
-                (season_index, stat_stage_index, target_week-1),
-            )
-            defense = cur.fetchone()
-    embed = build_embed(f"🌟 Players of the Week — {stage_week_label(stage_index, target_week)}", "", 0x5865F2)
-    embed.description = "Top weekly standouts based on the exported stats."
-    if offense:
-        embed.add_field(
-            name="Offensive Player of the Week",
-            value=f"**{offense['player_name']}** ({offense['team_name']}) — {offense['position']}\n"
-                  f"{int(offense.get('pass_yds') or 0)} PYDS, {int(offense.get('pass_tds') or 0)} PTD, "
-                  f"{int(offense.get('rush_yds') or 0)} RYDS, {int(offense.get('rush_td') or 0)} RTD",
-            inline=False
-        )
-    else:
-        embed.add_field(name="Offensive Player of the Week", value="No eligible offensive stats found.", inline=False)
-    if defense:
-        embed.add_field(
-            name="Defensive Player of the Week",
-            value=f"**{defense['player_name']}** ({defense['team_name']}) — {defense['position']}\n"
-                  f"{int(defense.get('sacks') or 0)} sacks, {int(defense.get('ints') or 0)} ints",
-            inline=False
-        )
-    else:
-        embed.add_field(name="Defensive Player of the Week", value="No eligible defensive stats found.", inline=False)
-    return embed
-
-
-# -----------------------------
 # Bot events
 # -----------------------------
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild:
-        return
-
-    if message.channel.id in XP_BLACKLIST_CHANNEL_IDS:
-        return
-
-    content = (message.content or "").strip()
-    if len(content) < XP_MIN_MESSAGE_LEN:
-        return
-
-    row = TOKEN_DB.get_xp_user(message.author)
-    now_ts = message.created_at.timestamp()
-    last_xp_at = float(row["last_xp_at"] or 0)
-    if now_ts - last_xp_at < XP_COOLDOWN_SECONDS:
-        return
-
-    gained = random.randint(15, 25)
-    new_xp = int(row["xp"]) + gained
-    old_level = int(row["level"])
-    new_level = level_from_xp(new_xp)
-    new_messages = int(row["messages_counted"]) + 1
-
-    TOKEN_DB.update_xp_progress(message.author, new_xp, new_level, new_messages, now_ts)
-
-    if new_level > old_level:
-        total_tokens = 0
-        bonus_notes = []
-        for reached_level in range(old_level + 1, new_level + 1):
-            token_reward, bonus_note = level_reward(reached_level)
-            if token_reward > 0:
-                total_tokens += token_reward
-                TOKEN_DB.add_tokens(message.author, token_reward, f"Level {reached_level} reward", "leveling")
-            if bonus_note:
-                bonus_notes.append(bonus_note)
-            await post_level_up_announcement(
-                message.guild,
-                message.author,
-                reached_level,
-                token_reward,
-                bonus_note,
-            )
-
-        if total_tokens > 0 or bonus_notes:
-            summary = f"{message.author.mention} leveled up to **Level {new_level}**"
-            if total_tokens > 0:
-                summary += f" and earned **{fmt_tokens(total_tokens)}** token{'s' if total_tokens != 1 else ''}"
-            if bonus_notes:
-                summary += f" | Bonus: {', '.join(bonus_notes)}"
-            await send_log_message(f"📈 LEVEL UP: {summary}")
-
 @bot.event
 async def on_ready():
-    init_extra_feature_tables()
     print(f"Logged in as {bot.user} ({bot.user.id})")
     print(f"LOG_CHANNEL_ID: {LOG_CHANNEL_ID}")
     print(f"LEADERS_CHANNEL_ID: {LEADERS_CHANNEL_ID}")
@@ -2209,521 +1171,9 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await interaction.response.send_message(f"Something went wrong: {error}", ephemeral=True)
 
 
-
-
-def fetch_rivalry_games(team1_id: int, team2_id: int):
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    g.game_id,
-                    g.week,
-                    g.stage_index,
-                    g.status,
-                    g.away_score,
-                    g.home_score,
-                    away.team_id AS away_team_id,
-                    away.team_name AS away_team_name,
-                    home.team_id AS home_team_id,
-                    home.team_name AS home_team_name
-                FROM games g
-                JOIN teams away ON away.team_id = g.away_team_id
-                JOIN teams home ON home.team_id = g.home_team_id
-                WHERE (
-                    (g.away_team_id = %s AND g.home_team_id = %s) OR
-                    (g.away_team_id = %s AND g.home_team_id = %s)
-                )
-                ORDER BY g.stage_index ASC, g.week ASC, g.game_id ASC
-                """,
-                (team1_id, team2_id, team2_id, team1_id),
-            )
-            return cur.fetchall()
-
-
-def summarize_rivalry(team1: dict, team2: dict, games: list[dict]) -> dict:
-    team1_id = safe_int(team1.get("team_id"))
-    team2_id = safe_int(team2.get("team_id"))
-    team1_name = safe_text(team1.get("team_name"))
-    team2_name = safe_text(team2.get("team_name"))
-
-    summary = {
-        "team1_name": team1_name,
-        "team2_name": team2_name,
-        "team1_wins": 0,
-        "team2_wins": 0,
-        "ties": 0,
-        "total_games": 0,
-        "team1_points": 0,
-        "team2_points": 0,
-        "last_result": "No completed matchups yet.",
-        "current_streak": "No streak yet.",
-        "biggest_margin": "No completed matchups yet.",
-        "playoff_games": 0,
-    }
-
-    completed = [g for g in games if looks_like_completed_game(g)]
-    if not completed:
-        return summary
-
-    biggest = None
-    streak_owner = None
-    streak_count = 0
-
-    for g in completed:
-        away_id = safe_int(g.get("away_team_id"))
-        home_id = safe_int(g.get("home_team_id"))
-        away_score = safe_int(g.get("away_score"))
-        home_score = safe_int(g.get("home_score"))
-        stage_index = safe_int(g.get("stage_index"))
-
-        team1_score = away_score if away_id == team1_id else home_score
-        team2_score = away_score if away_id == team2_id else home_score
-
-        summary["team1_points"] += team1_score
-        summary["team2_points"] += team2_score
-        summary["total_games"] += 1
-        if stage_index >= 3:
-            summary["playoff_games"] += 1
-
-        if team1_score > team2_score:
-            winner = 1
-            summary["team1_wins"] += 1
-        elif team2_score > team1_score:
-            winner = 2
-            summary["team2_wins"] += 1
-        else:
-            winner = 0
-            summary["ties"] += 1
-
-        margin = abs(team1_score - team2_score)
-        if biggest is None or margin > biggest["margin"]:
-            winner_name = team1_name if winner == 1 else team2_name if winner == 2 else "Tie"
-            biggest = {
-                "margin": margin,
-                "text": f"{winner_name} by {margin} ({team1_score}-{team2_score})"
-            }
-
-        if winner == 0:
-            streak_owner = None
-            streak_count = 0
-        elif winner == streak_owner:
-            streak_count += 1
-        else:
-            streak_owner = winner
-            streak_count = 1
-
-    last = completed[-1]
-    last_stage = stage_display_name(safe_int(last.get("stage_index")))
-    last_week = safe_int(last.get("week")) + 1
-    away_id = safe_int(last.get("away_team_id"))
-    away_score = safe_int(last.get("away_score"))
-    home_score = safe_int(last.get("home_score"))
-    team1_score = away_score if away_id == team1_id else safe_int(last.get("home_score"))
-    team2_score = away_score if away_id == team2_id else safe_int(last.get("home_score"))
-    summary["last_result"] = f"{last_stage} Wk {last_week}: {team1_name} {team1_score} - {team2_score} {team2_name}"
-
-    if streak_owner == 1:
-        summary["current_streak"] = f"{team1_name} W{streak_count}"
-    elif streak_owner == 2:
-        summary["current_streak"] = f"{team2_name} W{streak_count}"
-    else:
-        summary["current_streak"] = "No active streak"
-
-    if biggest:
-        summary["biggest_margin"] = biggest["text"]
-
-    return summary
-
-
-def build_rivalry_embed(team1: dict, team2: dict, summary: dict) -> discord.Embed:
-    title = f"🔥 Rivalry Report: {summary['team1_name']} vs {summary['team2_name']}"
-    desc = (
-        f"**Series Record:** {summary['team1_name']} {summary['team1_wins']} - "
-        f"{summary['team2_wins']} {summary['team2_name']}"
-    )
-    if summary["ties"]:
-        desc += f" - {summary['ties']} ties"
-
-    embed = discord.Embed(title=title, description=desc, color=0xE67E22)
-    embed.add_field(name="Total Games", value=str(summary["total_games"]), inline=True)
-    embed.add_field(name="Current Streak", value=summary["current_streak"], inline=True)
-    embed.add_field(name="Playoff Meetings", value=str(summary["playoff_games"]), inline=True)
-    embed.add_field(
-        name="Points Scored",
-        value=f"{summary['team1_name']}: {summary['team1_points']}\n{summary['team2_name']}: {summary['team2_points']}",
-        inline=False,
-    )
-    embed.add_field(name="Last Matchup", value=summary["last_result"], inline=False)
-    embed.add_field(name="Biggest Margin", value=summary["biggest_margin"], inline=False)
-    return embed
-
-
-def fetch_rivalry_leaderboard_rows(limit: int = 10):
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                WITH completed_games AS (
-                    SELECT
-                        LEAST(g.away_team_id, g.home_team_id) AS team_a_id,
-                        GREATEST(g.away_team_id, g.home_team_id) AS team_b_id,
-                        g.away_team_id,
-                        g.home_team_id,
-                        g.away_score,
-                        g.home_score
-                    FROM games g
-                    WHERE
-                        (COALESCE(g.away_score, 0) > 0 OR COALESCE(g.home_score, 0) > 0 OR g.status = ANY(%s))
-                )
-                SELECT
-                    ta.team_name AS team_a_name,
-                    tb.team_name AS team_b_name,
-                    COUNT(*) AS total_games,
-                    SUM(CASE
-                        WHEN cg.away_team_id = cg.team_a_id AND cg.away_score > cg.home_score THEN 1
-                        WHEN cg.home_team_id = cg.team_a_id AND cg.home_score > cg.away_score THEN 1
-                        ELSE 0
-                    END) AS team_a_wins,
-                    SUM(CASE
-                        WHEN cg.away_team_id = cg.team_b_id AND cg.away_score > cg.home_score THEN 1
-                        WHEN cg.home_team_id = cg.team_b_id AND cg.home_score > cg.away_score THEN 1
-                        ELSE 0
-                    END) AS team_b_wins
-                FROM completed_games cg
-                JOIN teams ta ON ta.team_id = cg.team_a_id
-                JOIN teams tb ON tb.team_id = cg.team_b_id
-                GROUP BY ta.team_name, tb.team_name
-                HAVING COUNT(*) > 0
-                ORDER BY total_games DESC, ABS(
-                    SUM(CASE
-                        WHEN cg.away_team_id = cg.team_a_id AND cg.away_score > cg.home_score THEN 1
-                        WHEN cg.home_team_id = cg.team_a_id AND cg.home_score > cg.away_score THEN 1
-                        ELSE 0
-                    END) -
-                    SUM(CASE
-                        WHEN cg.away_team_id = cg.team_b_id AND cg.away_score > cg.home_score THEN 1
-                        WHEN cg.home_team_id = cg.team_b_id AND cg.home_score > cg.away_score THEN 1
-                        ELSE 0
-                    END)
-                ) ASC, ta.team_name ASC
-                LIMIT %s
-                """,
-                (list(COMPLETE_GAME_STATUS_VALUES), limit),
-            )
-            return cur.fetchall()
-
 # -----------------------------
 # Public commands
 # -----------------------------
-
-
-def fetch_all_regular_season_games_current_season():
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    g.game_id,
-                    g.season_index,
-                    g.stage_index,
-                    g.week,
-                    (g.week + 1) AS display_week,
-                    g.status,
-                    g.away_score,
-                    g.home_score,
-                    g.away_team_id,
-                    g.home_team_id,
-                    away.team_name AS away_team_name,
-                    away.division_name AS away_division_name,
-                    home.team_name AS home_team_name,
-                    home.division_name AS home_division_name,
-                    COALESCE(away_standings.wins, 0) AS away_wins,
-                    COALESCE(away_standings.losses, 0) AS away_losses,
-                    COALESCE(away_standings.ties, 0) AS away_ties,
-                    COALESCE(away_standings.win_pct, 0) AS away_win_pct,
-                    COALESCE(away.team_ovr, 0) AS away_ovr,
-                    COALESCE(home_standings.wins, 0) AS home_wins,
-                    COALESCE(home_standings.losses, 0) AS home_losses,
-                    COALESCE(home_standings.ties, 0) AS home_ties,
-                    COALESCE(home_standings.win_pct, 0) AS home_win_pct,
-                    COALESCE(home.team_ovr, 0) AS home_ovr
-                FROM games g
-                JOIN teams away ON away.team_id = g.away_team_id
-                JOIN teams home ON home.team_id = g.home_team_id
-                LEFT JOIN standings away_standings ON away_standings.team_id = g.away_team_id
-                LEFT JOIN standings home_standings ON home_standings.team_id = g.home_team_id
-                WHERE g.season_index = (SELECT MAX(season_index) FROM games)
-                  AND g.stage_index = 1
-                ORDER BY g.week ASC, g.game_id ASC
-                """
-            )
-            return cur.fetchall()
-
-
-def fetch_completed_team_games_current_season(team_id: int):
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    g.game_id,
-                    g.season_index,
-                    g.stage_index,
-                    g.week,
-                    (g.week + 1) AS display_week,
-                    g.status,
-                    g.away_team_id,
-                    g.home_team_id,
-                    g.away_score,
-                    g.home_score,
-                    away.team_name AS away_team_name,
-                    home.team_name AS home_team_name
-                FROM games g
-                JOIN teams away ON away.team_id = g.away_team_id
-                JOIN teams home ON home.team_id = g.home_team_id
-                WHERE g.season_index = (SELECT MAX(season_index) FROM games)
-                  AND g.stage_index = 1
-                  AND (g.away_team_id = %s OR g.home_team_id = %s)
-                ORDER BY g.week DESC, g.game_id DESC
-                """,
-                (team_id, team_id),
-            )
-            rows = cur.fetchall()
-    return [row for row in rows if looks_like_completed_game(row)]
-
-
-def compute_team_streak(team_id: int) -> tuple[str, int]:
-    games = fetch_completed_team_games_current_season(team_id)
-    if not games:
-        return ("N/A", 0)
-
-    streak_type = None
-    streak_count = 0
-    for game in games:
-        away_id = safe_int(game.get("away_team_id"))
-        home_id = safe_int(game.get("home_team_id"))
-        away_score = safe_int(game.get("away_score"))
-        home_score = safe_int(game.get("home_score"))
-
-        if away_score == home_score:
-            result = "T"
-        elif (away_id == team_id and away_score > home_score) or (home_id == team_id and home_score > away_score):
-            result = "W"
-        else:
-            result = "L"
-
-        if streak_type is None:
-            streak_type = result
-            streak_count = 1
-            continue
-
-        if result == streak_type:
-            streak_count += 1
-        else:
-            break
-
-    return (streak_type or "N/A", streak_count)
-
-
-def detect_profile_storyline(team_row: dict) -> str:
-    wins = safe_int(team_row.get("wins"))
-    losses = safe_int(team_row.get("losses"))
-    seed = safe_int(team_row.get("seed"))
-    streak_type, streak_count = compute_team_streak(safe_int(team_row.get("team_id")))
-
-    if wins > 0 and losses == 0:
-        return "Undefeated and hunting statement wins"
-    if streak_type == "W" and streak_count >= 4:
-        return f"On a {streak_count}-game heater"
-    if streak_type == "L" and streak_count >= 3:
-        return f"Slipping with {streak_count} straight losses"
-    if seed and seed <= 4 and wins >= max(6, losses):
-        return "Division bully with playoff control"
-    if wins >= losses and abs(wins - losses) <= 1:
-        return "Fighting for playoff position"
-    if losses > wins and streak_type == "L":
-        return "Under pressure to stop the slide"
-    return "Grinding through the season"
-
-
-def compute_gotw_assignments() -> dict[int, list[dict]]:
-    all_games = fetch_all_regular_season_games_current_season()
-    by_week = {}
-    for game in all_games:
-        by_week.setdefault(safe_int(game.get("display_week")), []).append(game)
-
-    assignments = {}
-    for week, games in by_week.items():
-        scored_games = sorted(((game, compute_matchup_score(game)) for game in games), key=lambda item: item[1], reverse=True)
-        for game, score in scored_games[:2]:
-            game_id = safe_int(game.get("game_id"))
-            assignments[game_id] = {
-                "week": week,
-                "score": score,
-                "away_team_id": safe_int(game.get("away_team_id")),
-                "home_team_id": safe_int(game.get("home_team_id")),
-            }
-    return assignments
-
-
-def compute_rivalry_assignments() -> dict[int, dict]:
-    standings = fetch_standings_rows()
-    standing_map = {safe_text(row.get("team_name")): row for row in standings}
-
-    all_games = fetch_all_regular_season_games_current_season()
-    candidates = []
-    for game in all_games:
-        if normalize_team_name(game.get("away_division_name")) != normalize_team_name(game.get("home_division_name")):
-            continue
-        away_name = safe_text(game.get("away_team_name"))
-        home_name = safe_text(game.get("home_team_name"))
-        away_stand = standing_map.get(away_name, {})
-        home_stand = standing_map.get(home_name, {})
-        combined_wins = safe_int(away_stand.get("wins")) + safe_int(home_stand.get("wins"))
-        combined_win_pct = float(away_stand.get("win_pct") or 0) + float(home_stand.get("win_pct") or 0)
-        candidates.append({
-            "game": game,
-            "combined_wins": combined_wins,
-            "combined_win_pct": combined_win_pct,
-        })
-
-    def game_priority(item, counts):
-        game = item["game"]
-        away_id = safe_int(game.get("away_team_id"))
-        home_id = safe_int(game.get("home_team_id"))
-        under_min_bonus = 0
-        if counts.get(away_id, 0) < 2:
-            under_min_bonus += 1000
-        if counts.get(home_id, 0) < 2:
-            under_min_bonus += 1000
-        return (
-            under_min_bonus,
-            item["combined_wins"] * 10,
-            item["combined_win_pct"] * 100,
-            -safe_int(game.get("display_week")),
-        )
-
-    counts = {}
-    assigned = {}
-
-    remaining = candidates[:]
-    while True:
-        teams_below_min = {team_id for team_id, count in counts.items() if count < 2}
-        if not teams_below_min:
-            # include teams not seen yet
-            team_ids_in_candidates = {safe_int(c["game"].get("away_team_id")) for c in candidates} | {safe_int(c["game"].get("home_team_id")) for c in candidates}
-            teams_below_min = {tid for tid in team_ids_in_candidates if counts.get(tid, 0) < 2}
-        if not teams_below_min:
-            break
-
-        eligible = []
-        for item in remaining:
-            game = item["game"]
-            away_id = safe_int(game.get("away_team_id"))
-            home_id = safe_int(game.get("home_team_id"))
-            if counts.get(away_id, 0) >= 4 or counts.get(home_id, 0) >= 4:
-                continue
-            if counts.get(away_id, 0) < 2 or counts.get(home_id, 0) < 2:
-                eligible.append(item)
-
-        if not eligible:
-            break
-
-        eligible.sort(key=lambda item: game_priority(item, counts), reverse=True)
-        chosen = eligible[0]
-        game = chosen["game"]
-        game_id = safe_int(game.get("game_id"))
-        away_id = safe_int(game.get("away_team_id"))
-        home_id = safe_int(game.get("home_team_id"))
-        assigned[game_id] = {
-            "week": safe_int(game.get("display_week")),
-            "away_team_id": away_id,
-            "home_team_id": home_id,
-        }
-        counts[away_id] = counts.get(away_id, 0) + 1
-        counts[home_id] = counts.get(home_id, 0) + 1
-        remaining = [item for item in remaining if safe_int(item["game"].get("game_id")) != game_id]
-
-    extra_candidates = []
-    for item in remaining:
-        game = item["game"]
-        away_id = safe_int(game.get("away_team_id"))
-        home_id = safe_int(game.get("home_team_id"))
-        if counts.get(away_id, 0) >= 4 or counts.get(home_id, 0) >= 4:
-            continue
-        if item["combined_win_pct"] >= 1.0 or item["combined_wins"] >= 10:
-            extra_candidates.append(item)
-
-    extra_candidates.sort(key=lambda item: game_priority(item, counts), reverse=True)
-    for item in extra_candidates:
-        game = item["game"]
-        game_id = safe_int(game.get("game_id"))
-        away_id = safe_int(game.get("away_team_id"))
-        home_id = safe_int(game.get("home_team_id"))
-        if counts.get(away_id, 0) >= 4 or counts.get(home_id, 0) >= 4:
-            continue
-        assigned[game_id] = {
-            "week": safe_int(game.get("display_week")),
-            "away_team_id": away_id,
-            "home_team_id": home_id,
-        }
-        counts[away_id] = counts.get(away_id, 0) + 1
-        counts[home_id] = counts.get(home_id, 0) + 1
-
-    return assigned
-
-
-def resolve_member_team_row(member: discord.Member):
-    possible_names = [member.display_name or "", member.name or "", getattr(member, "global_name", "") or ""]
-    for raw_name in possible_names:
-        if not raw_name:
-            continue
-        team_row = resolve_team_row(raw_name)
-        if team_row:
-            return team_row
-    return None
-
-
-def build_profile_embed(member: discord.Member, team_row: dict) -> discord.Embed:
-    standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
-    merged_team = {**team_row, **standing_row}
-    token_row = TOKEN_DB.get_user(member)
-
-    gotw_assignments = compute_gotw_assignments()
-    rivalry_assignments = compute_rivalry_assignments()
-    team_id = safe_int(merged_team.get("team_id"))
-
-    gotw_count = sum(1 for item in gotw_assignments.values() if item["away_team_id"] == team_id or item["home_team_id"] == team_id)
-    rivalry_count = sum(1 for item in rivalry_assignments.values() if item["away_team_id"] == team_id or item["home_team_id"] == team_id)
-
-    casino_games = safe_int(token_row["casino_wins"]) + safe_int(token_row["casino_losses"])
-    casino_win_pct = (safe_int(token_row["casino_wins"]) / casino_games * 100) if casino_games else 0.0
-
-    wins = safe_int(merged_team.get("wins"))
-    losses = safe_int(merged_team.get("losses"))
-    ties = safe_int(merged_team.get("ties"))
-    record_text = f"{wins}-{losses}-{ties}" if ties else f"{wins}-{losses}"
-
-    streak_type, streak_count = compute_team_streak(team_id)
-    streak_text = f"{streak_type}{streak_count}" if streak_count else "N/A"
-    storyline = detect_profile_storyline(merged_team)
-
-    embed = discord.Embed(
-        title=f"👤 {member.display_name} Profile",
-        description=f"**Team:** {safe_text(merged_team.get('team_name'))}\n**Record:** {record_text}\n**Storyline:** {storyline}",
-        color=0x5865F2,
-    )
-    embed.add_field(name="Tokens", value=fmt_tokens(token_row["balance"]), inline=True)
-    embed.add_field(name="Casino", value=f"{token_row['casino_wins']}-{token_row['casino_losses']} ({casino_win_pct:.1f}%)", inline=True)
-    embed.add_field(name="Bounties", value=str(token_row["bounty_wins"]), inline=True)
-    embed.add_field(name="Rivalry Games", value=str(rivalry_count), inline=True)
-    embed.add_field(name="GOTW Appearances", value=str(gotw_count), inline=True)
-    embed.add_field(name="Streak", value=streak_text, inline=True)
-    embed.set_footer(text=f"{safe_text(merged_team.get('conference_name'))} / {safe_text(merged_team.get('division_name'))}")
-    return embed
-
-
 @bot.tree.command(name="ping", description="Check if the bot is online.")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong. Meaty Token Bot is online.", ephemeral=True)
@@ -2784,78 +1234,6 @@ async def standings(interaction: discord.Interaction):
         )
 
 
-
-
-@bot.tree.command(name="mvp_race", description="Show the current MVP race.")
-async def mvp_race(interaction: discord.Interaction):
-    try:
-        rows = fetch_mvp_race_rows()
-    except Exception as exc:
-        await interaction.response.send_message(f"Failed to load MVP race: {exc}", ephemeral=True)
-        return
-    await interaction.response.send_message(embed=build_award_race_embed("🏆 MVP Race", rows, "mvp"))
-
-
-@bot.tree.command(name="opoty_race", description="Show the current Offensive Player of the Year race.")
-async def opoty_race(interaction: discord.Interaction):
-    try:
-        rows = fetch_opoty_race_rows()
-    except Exception as exc:
-        await interaction.response.send_message(f"Failed to load OPOY race: {exc}", ephemeral=True)
-        return
-    await interaction.response.send_message(embed=build_award_race_embed("⚡ Offensive Player of the Year Race", rows, "opoty"))
-
-
-@bot.tree.command(name="dpoty_race", description="Show the current Defensive Player of the Year race.")
-async def dpoty_race(interaction: discord.Interaction):
-    try:
-        rows = fetch_dpoty_race_rows()
-    except Exception as exc:
-        await interaction.response.send_message(f"Failed to load DPOY race: {exc}", ephemeral=True)
-        return
-    await interaction.response.send_message(embed=build_award_race_embed("🛡️ Defensive Player of the Year Race", rows, "dpoty"))
-
-
-@bot.tree.command(name="oroty_race", description="Show the current Offensive Rookie of the Year race.")
-async def oroty_race(interaction: discord.Interaction):
-    try:
-        rows = fetch_opoty_race_rows(rookies_only=True)
-    except Exception as exc:
-        await interaction.response.send_message(f"Failed to load OROY race: {exc}", ephemeral=True)
-        return
-    await interaction.response.send_message(embed=build_award_race_embed("🌟 Offensive Rookie of the Year Race", rows, "oroty"))
-
-
-@bot.tree.command(name="droty_race", description="Show the current Defensive Rookie of the Year race.")
-async def droty_race(interaction: discord.Interaction):
-    try:
-        rows = fetch_dpoty_race_rows(rookies_only=True)
-    except Exception as exc:
-        await interaction.response.send_message(f"Failed to load DROY race: {exc}", ephemeral=True)
-        return
-    await interaction.response.send_message(embed=build_award_race_embed("🔥 Defensive Rookie of the Year Race", rows, "droty"))
-
-
-@bot.tree.command(name="powerrankings", description="Show the current bot-calculated power rankings.")
-async def powerrankings(interaction: discord.Interaction):
-    try:
-        embed = build_power_rankings_embed(limit=10)
-    except Exception as exc:
-        await interaction.response.send_message(f"Failed to load power rankings: {exc}", ephemeral=True)
-        return
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="storylines", description="Show the biggest league storylines this week.")
-async def storylines(interaction: discord.Interaction):
-    try:
-        embed = build_storylines_embed(limit=6)
-    except Exception as exc:
-        await interaction.response.send_message(f"Failed to load storylines: {exc}", ephemeral=True)
-        return
-    await interaction.response.send_message(embed=embed)
-
-
 @bot.tree.command(name="player", description="Look up a player card with dev trait and ratings.")
 @app_commands.describe(name="Player name to search")
 async def player(interaction: discord.Interaction, name: str):
@@ -2874,7 +1252,7 @@ async def player(interaction: discord.Interaction, name: str):
         f"🔎 Player Search: {name}",
         "\n".join(
             f"**{idx}.** {safe_text(row.get('full_name'))} — {safe_text(row.get('team_name'), 'Free Agent')} | "
-            f"{safe_text(row.get('position'))} | {resolve_display_overall(row)} OVR | "
+            f"{safe_text(row.get('position'))} | {safe_int(row.get('overall_rating'))} OVR | "
             f"{dev_trait_to_label(row.get('dev_trait'), row.get('resolved_dev_trait_label') or row.get('dev_trait_label'))}"
             for idx, row in enumerate(results[:10], start=1)
         ),
@@ -2906,10 +1284,6 @@ class RosterPaginationView(discord.ui.View):
             return False
         return True
 
-    async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
-
     @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
     async def prev_page(self, interaction: discord.Interaction, _: discord.ui.Button):
         if self.page > 1:
@@ -2940,10 +1314,8 @@ async def roster(interaction: discord.Interaction, team_name: str, page: Optiona
 
     standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
     merged_team = {**team_row, **standing_row}
-    current_page = max(1, page or 1)
-    embed = build_roster_embed(merged_team, roster_rows, current_page)
-    view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, page=current_page)
-    await interaction.response.send_message(embed=embed, view=view)
+    embed = build_roster_embed(merged_team, roster_rows, page or 1)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="team", description="Show a team summary and its first roster page.")
@@ -2958,91 +1330,6 @@ async def team(interaction: discord.Interaction, team_name: str):
     standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
     merged_team = {**team_row, **standing_row}
     embed = build_roster_embed(merged_team, roster_rows, 1)
-    view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, page=1)
-    await interaction.response.send_message(embed=embed, view=view)
-
-
-
-
-@bot.tree.command(name="rivalry", description="Show the rivalry history between two teams.")
-@app_commands.describe(team1="First team name or mascot", team2="Second team name or mascot")
-async def rivalry(interaction: discord.Interaction, team1: str, team2: str):
-    team1_row = resolve_team_row(team1)
-    team2_row = resolve_team_row(team2)
-
-    if not team1_row or not team2_row:
-        await interaction.response.send_message("Could not find one or both teams for that rivalry search.", ephemeral=True)
-        return
-
-    if safe_int(team1_row.get("team_id")) == safe_int(team2_row.get("team_id")):
-        await interaction.response.send_message("Pick two different teams.", ephemeral=True)
-        return
-
-    try:
-        games = fetch_rivalry_games(safe_int(team1_row.get("team_id")), safe_int(team2_row.get("team_id")))
-    except Exception as exc:
-        await interaction.response.send_message(f"Failed to load rivalry data: {exc}", ephemeral=True)
-        return
-
-    summary = summarize_rivalry(team1_row, team2_row, games)
-    await interaction.response.send_message(embed=build_rivalry_embed(team1_row, team2_row, summary))
-
-
-@bot.tree.command(name="headtohead", description="Alias for rivalry report between two teams.")
-@app_commands.describe(team1="First team name or mascot", team2="Second team name or mascot")
-async def headtohead(interaction: discord.Interaction, team1: str, team2: str):
-    await rivalry.callback(interaction, team1, team2)
-
-
-@bot.tree.command(name="rivalryleaderboard", description="Show the most-played rivalry matchups in the league.")
-async def rivalryleaderboard(interaction: discord.Interaction):
-    try:
-        rows = fetch_rivalry_leaderboard_rows()
-    except Exception as exc:
-        await interaction.response.send_message(f"Failed to load rivalry leaderboard: {exc}", ephemeral=True)
-        return
-
-    if not rows:
-        await interaction.response.send_message("No rivalry matchups found yet.")
-        return
-
-    lines = []
-    for idx, row in enumerate(rows, start=1):
-        lines.append(
-            f"**{idx}.** {safe_text(row.get('team_a_name'))} vs {safe_text(row.get('team_b_name'))} — "
-            f"{safe_int(row.get('total_games'))} games | "
-            f"{safe_int(row.get('team_a_wins'))}-{safe_int(row.get('team_b_wins'))}"
-        )
-
-    await interaction.response.send_message(
-        embed=build_embed("🔥 Rivalry Leaderboard", "\n".join(lines), 0xE67E22)
-    )
-
-
-
-
-@bot.tree.command(name="profile", description="Show a coach profile based on Discord nickname to team matching.")
-@app_commands.describe(user="Optional: check another user's profile")
-async def profile(interaction: discord.Interaction, user: Optional[discord.Member] = None):
-    target = user or interaction.user
-    if not isinstance(target, discord.Member):
-        await interaction.response.send_message("This command must be used inside a server.", ephemeral=True)
-        return
-
-    team_row = resolve_member_team_row(target)
-    if not team_row:
-        await interaction.response.send_message(
-            f"Could not match **{target.display_name}** to a franchise team. Their nickname should match the team name.",
-            ephemeral=True,
-        )
-        return
-
-    try:
-        embed = build_profile_embed(target, team_row)
-    except Exception as exc:
-        await interaction.response.send_message(f"Failed to build profile: {exc}", ephemeral=True)
-        return
-
     await interaction.response.send_message(embed=embed)
 
 
@@ -3100,67 +1387,6 @@ async def leaderboard(interaction: discord.Interaction):
         await interaction.followup.send(
             embed=build_embed(f"🏆 Token Leaderboard (Page {page_num})", chunk, 0xFEE75C)
         )
-
-
-@bot.tree.command(name="casinoleaderboard", description="Show casino leaders by highest win percentage (minimum 10 casino games).")
-async def casinoleaderboard(interaction: discord.Interaction):
-    with TOKEN_DB.connect() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT
-                user_id,
-                username,
-                casino_wins,
-                casino_losses,
-                (casino_wins + casino_losses) AS total_games,
-                CASE
-                    WHEN (casino_wins + casino_losses) > 0
-                    THEN CAST(casino_wins AS DOUBLE PRECISION) / (casino_wins + casino_losses)
-                    ELSE 0
-                END AS win_pct
-            FROM bot_users
-            WHERE (casino_wins + casino_losses) >= 10
-            ORDER BY win_pct DESC, casino_wins DESC, total_games DESC, username ASC
-            """
-        )
-        rows = cur.fetchall()
-
-    if not rows:
-        await interaction.response.send_message("No users qualify yet. A minimum of **10 total casino games** is required.")
-        return
-
-    lines = []
-    for idx, row in enumerate(rows, start=1):
-        win_pct = (row["win_pct"] or 0) * 100
-        total_games = row["total_games"] or 0
-        lines.append(
-            f"**{idx}.** <@{row['user_id']}> — **{win_pct:.1f}%** win rate | **{row['casino_wins']}** wins | **{total_games}** games"
-        )
-
-    chunks = []
-    current = []
-    current_len = 0
-    for line in lines:
-        line_len = len(line) + 1
-        if current_len + line_len > 3800:
-            chunks.append("\n".join(current))
-            current = [line]
-            current_len = line_len
-        else:
-            current.append(line)
-            current_len += line_len
-    if current:
-        chunks.append("\n".join(current))
-
-    await interaction.response.send_message(
-        embed=build_embed("🎰 Casino Leaderboard", chunks[0] + "\n\n*Minimum 10 total casino games required.*", 0xFEE75C)
-    )
-    for page_num, chunk in enumerate(chunks[1:], start=2):
-        await interaction.followup.send(
-            embed=build_embed(f"🎰 Casino Leaderboard (Page {page_num})", chunk, 0xFEE75C)
-        )
-
 
 
 @bot.tree.command(name="history", description="Show your most recent token activity.")
@@ -3268,13 +1494,15 @@ async def buy_devopportunity(interaction: discord.Interaction, player_name: str)
 
 @bot.tree.command(name="wheel", description="Spin the Prize Wheel.")
 async def wheel(interaction: discord.Interaction):
-    ok = TOKEN_DB.spend_tokens(interaction.user, PRIZE_WHEEL_COST, "Prize Wheel spin", "casino")
-    if not ok:
-        await interaction.response.send_message(
-            f"You need **{PRIZE_WHEEL_COST}** tokens to spin the Prize Wheel.",
-            ephemeral=True,
-        )
-        return
+    used_voucher = TOKEN_DB.consume_voucher(interaction.user, "wheel_spin", 1)
+    if not used_voucher:
+        ok = TOKEN_DB.spend_tokens(interaction.user, PRIZE_WHEEL_COST, "Prize Wheel spin", "casino")
+        if not ok:
+            await interaction.response.send_message(
+                f"You need **{PRIZE_WHEEL_COST}** tokens to spin the Prize Wheel.",
+                ephemeral=True,
+            )
+            return
 
     roll = random.randint(1, 100)
     if roll <= 30:
@@ -3304,10 +1532,16 @@ async def wheel(interaction: discord.Interaction):
         TOKEN_DB.add_tokens(interaction.user, result.payout, f"Prize Wheel reward: {result.title}", "casino")
     TOKEN_DB.update_casino_result(interaction.user, result.won)
 
-    extra = f"\n\n**Manual Bonus To Honor:** {result.bonus_note}" if result.bonus_note else ""
+    if result.bonus_note:
+        voucher_type = voucher_type_from_note(result.bonus_note)
+        if voucher_type:
+            TOKEN_DB.add_voucher(interaction.user, voucher_type, 1)
+
+    extra = f"\n\n**Voucher Added:** {result.bonus_note}" if result.bonus_note else ""
+    cost_line = "Used **1 Prize Wheel voucher**" if used_voucher else f"**Cost:** {PRIZE_WHEEL_COST} tokens"
     embed = build_embed(
         f"🎡 Prize Wheel — {result.title}",
-        f"**Cost:** {PRIZE_WHEEL_COST} tokens\n{result.description}{extra}",
+        f"{cost_line}\n{result.description}{extra}",
         0xFEE75C if result.won else 0xED4245,
     )
     await interaction.response.send_message(embed=embed)
@@ -3327,13 +1561,15 @@ async def wheel(interaction: discord.Interaction):
 @bot.tree.command(name="boomorbust", description="Risk tokens on a Boom or Bust roll.")
 @app_commands.describe(player_name="Player attached to the gamble")
 async def boomorbust(interaction: discord.Interaction, player_name: str):
-    ok = TOKEN_DB.spend_tokens(interaction.user, BOOM_OR_BUST_COST, f"Boom or Bust on {player_name}", "casino")
-    if not ok:
-        await interaction.response.send_message(
-            f"You need **{BOOM_OR_BUST_COST}** tokens to use Boom or Bust.",
-            ephemeral=True,
-        )
-        return
+    used_voucher = TOKEN_DB.consume_voucher(interaction.user, "boom_or_bust", 1)
+    if not used_voucher:
+        ok = TOKEN_DB.spend_tokens(interaction.user, BOOM_OR_BUST_COST, f"Boom or Bust on {player_name}", "casino")
+        if not ok:
+            await interaction.response.send_message(
+                f"You need **{BOOM_OR_BUST_COST}** tokens to use Boom or Bust.",
+                ephemeral=True,
+            )
+            return
 
     hit = random.randint(1, 100) <= 35
     TOKEN_DB.update_casino_result(interaction.user, hit)
@@ -3352,7 +1588,8 @@ async def boomorbust(interaction: discord.Interaction, player_name: str):
         color = 0xED4245
         title = "💀 Boom or Bust — BUST"
 
-    embed = build_embed(title, f"**Cost:** {BOOM_OR_BUST_COST} tokens\n{desc}", color)
+    cost_line = "Used **1 Boom or Bust voucher**" if used_voucher else f"**Cost:** {BOOM_OR_BUST_COST} tokens"
+    embed = build_embed(title, f"{cost_line}\n{desc}", color)
     await interaction.response.send_message(embed=embed)
 
     try:
@@ -3369,13 +1606,15 @@ async def boomorbust(interaction: discord.Interaction, player_name: str):
 
 @bot.tree.command(name="mysterycrate", description="Open a Mystery Crate.")
 async def mysterycrate(interaction: discord.Interaction):
-    ok = TOKEN_DB.spend_tokens(interaction.user, MYSTERY_CRATE_COST, "Mystery Crate purchase", "casino")
-    if not ok:
-        await interaction.response.send_message(
-            f"You need **{MYSTERY_CRATE_COST}** tokens to open a Mystery Crate.",
-            ephemeral=True,
-        )
-        return
+    used_voucher = TOKEN_DB.consume_voucher(interaction.user, "mystery_crate", 1)
+    if not used_voucher:
+        ok = TOKEN_DB.spend_tokens(interaction.user, MYSTERY_CRATE_COST, "Mystery Crate purchase", "casino")
+        if not ok:
+            await interaction.response.send_message(
+                f"You need **{MYSTERY_CRATE_COST}** tokens to open a Mystery Crate.",
+                ephemeral=True,
+            )
+            return
 
     roll = random.randint(1, 100)
     payout = 0
@@ -3415,10 +1654,16 @@ async def mysterycrate(interaction: discord.Interaction):
         TOKEN_DB.add_tokens(interaction.user, payout, f"Mystery Crate reward: {title}", "casino")
     TOKEN_DB.update_casino_result(interaction.user, won)
 
-    extra = f"\n\n**Manual Bonus To Honor:** {bonus_note}" if bonus_note else ""
+    if bonus_note:
+        voucher_type = voucher_type_from_note(bonus_note)
+        if voucher_type:
+            TOKEN_DB.add_voucher(interaction.user, voucher_type, 1)
+
+    extra = f"\n\n**Voucher Added:** {bonus_note}" if bonus_note else ""
+    cost_line = "Used **1 Mystery Crate voucher**" if used_voucher else f"**Cost:** {MYSTERY_CRATE_COST} tokens"
     embed = build_embed(
         f"📦 Mystery Crate — {title}",
-        f"**Cost:** {MYSTERY_CRATE_COST} tokens\n{desc}{extra}",
+        f"{cost_line}\n{desc}{extra}",
         0x5865F2 if won else 0xED4245,
     )
     await interaction.response.send_message(embed=embed)
@@ -3652,38 +1897,19 @@ async def claimbounty(interaction: discord.Interaction, bounty_id: int):
 
 
 
-@bot.tree.command(name="rank", description="Show your current XP rank and progress.")
-@app_commands.describe(user="Optional: check another user's rank")
-async def rank(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+
+@bot.tree.command(name="vouchers", description="Show your available automatic vouchers.")
+@app_commands.describe(user="Optional: check another user's vouchers")
+async def vouchers(interaction: discord.Interaction, user: Optional[discord.Member] = None):
     target = user or interaction.user
-    row = TOKEN_DB.get_xp_user(target)
-    xp = int(row["xp"])
-    level, progress, needed = xp_progress_text(xp)
-    desc = (
-        f"**Level:** {level}\n"
-        f"**XP:** {xp}\n"
-        f"**Progress to next level:** {progress}/{needed}\n"
-        f"**Messages Counted:** {row['messages_counted']}"
-    )
-    await interaction.response.send_message(embed=build_embed(f"📈 {target.display_name}'s Rank", desc, 0x5865F2))
-
-
-@bot.tree.command(name="xpleaderboard", description="Show the server XP leaderboard.")
-async def xpleaderboard(interaction: discord.Interaction):
-    rows = TOKEN_DB.xp_leaderboard()
-    rows = [row for row in rows if int(row["xp"]) > 0][:25]
+    rows = TOKEN_DB.list_vouchers(target)
     if not rows:
-        await interaction.response.send_message("No XP data found yet.")
+        await interaction.response.send_message(f"No vouchers found for {target.display_name}.", ephemeral=(target == interaction.user))
         return
-
-    lines = []
-    for idx, row in enumerate(rows, start=1):
-        lines.append(
-            f"**{idx}.** <@{row['user_id']}> — Level **{row['level']}** | XP **{row['xp']}** | Messages **{row['messages_counted']}**"
-        )
-
+    lines = [f"**{voucher_label(row['voucher_type'])}:** {int(row['quantity'])}" for row in rows]
     await interaction.response.send_message(
-        embed=build_embed("📚 XP Leaderboard", "\n".join(lines), 0xFEE75C)
+        embed=build_embed(f"🎟️ {target.display_name}'s Vouchers", "\n".join(lines), 0x9B59B6),
+        ephemeral=(target == interaction.user),
     )
 
 
@@ -3704,42 +1930,6 @@ async def addtokens(interaction: discord.Interaction, user: discord.Member, amou
     await send_log_message(
         f"💰 ADMIN: {interaction.user.mention} added **{fmt_tokens(amount)}** tokens to {user.mention}. Reason: **{reason}**"
     )
-
-
-@bot.tree.command(name="addroletokens", description="Admin: add tokens to everyone with a specific role.")
-@admin_only()
-@app_commands.describe(
-    role="Role to reward",
-    amount="Amount to give each member with that role",
-    reason="Reason shown in the ledger",
-)
-async def addroletokens(interaction: discord.Interaction, role: discord.Role, amount: float, reason: str):
-    if amount <= 0:
-        await interaction.response.send_message("Amount must be greater than 0.", ephemeral=True)
-        return
-
-    members = [member for member in role.members if not member.bot]
-
-    if not members:
-        await interaction.response.send_message(
-            f"No non-bot members were found with the role **{role.name}**.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(thinking=True)
-
-    awarded_count = TOKEN_DB.add_tokens_bulk(members, amount, reason, "admin")
-
-    await interaction.followup.send(
-        f"✅ Added **{fmt_tokens(amount)}** tokens to **{awarded_count}** members with the role {role.mention}.\n"
-        f"**Reason:** {reason}"
-    )
-    await send_log_message(
-        f"💰 ADMIN: {interaction.user.mention} added **{fmt_tokens(amount)}** tokens to "
-        f"**{awarded_count}** members with the role **{role.name}**. Reason: **{reason}**"
-    )
-
 
 
 @bot.tree.command(name="removetokens", description="Admin: remove tokens from a user.")
@@ -4083,32 +2273,7 @@ def fetch_team_roster_rows(team_id: int) -> list[dict]:
                 """,
                 (team_id,),
             )
-            rows = [record_to_dict(row) for row in cur.fetchall()]
-            rows.sort(
-                key=lambda row: (
-                    -resolve_display_overall(row),
-                    roster_position_sort_value(safe_text(row.get("position"))),
-                    safe_text(row.get("full_name")).lower(),
-                )
-            )
-            return rows
-
-
-
-def resolve_display_overall(row: dict) -> int:
-    overall = safe_int(row.get("overall_rating"))
-    if overall > 0:
-        return overall
-    best = safe_int(row.get("player_best_ovr"))
-    if best > 0:
-        return best
-    return overall
-
-
-def roster_position_sort_value(position: str) -> int:
-    return POSITION_SORT_ORDER.get((position or "").upper(), 999)
-
-
+            return [record_to_dict(row) for row in cur.fetchall()]
 
 
 def build_player_embed(row: dict) -> discord.Embed:
@@ -4123,7 +2288,7 @@ def build_player_embed(row: dict) -> discord.Embed:
 
     embed = build_embed(
         title,
-        f"**{position}** • **{team_name}** • **{resolve_display_overall(row)} OVR** • **{dev_label}**",
+        f"**{position}** • **{team_name}** • **{safe_int(row.get('overall_rating'))} OVR** • **{dev_label}**",
         0x5865F2,
     )
     embed.add_field(
@@ -4179,7 +2344,7 @@ def build_roster_embed(team_row: dict, roster_rows: list[dict], page: int) -> di
             dev_label = dev_trait_to_label(row.get("dev_trait"), row.get("resolved_dev_trait_label") or row.get("dev_trait_label"))
             lines.append(
                 f"**{idx}.** {safe_text(row.get('full_name'))} — {safe_text(row.get('position'))} | "
-                f"{resolve_display_overall(row)} OVR | {dev_label}"
+                f"{safe_int(row.get('overall_rating'))} OVR | {dev_label}"
             )
         description = "\n".join(lines)
 
@@ -4987,20 +3152,6 @@ async def create_week_channels(
         except Exception as exc:
             print(f"Weekly news auto-post failed for {week_label}: {exc}")
 
-    if AUTO_POST_STORYLINES:
-        try:
-            news_channel = None
-            if NEWS_CHANNEL_ID:
-                guessed = bot.get_channel(NEWS_CHANNEL_ID)
-                if isinstance(guessed, discord.TextChannel):
-                    news_channel = guessed
-            if news_channel is None:
-                news_channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
-            if news_channel is not None:
-                await post_storylines_article(news_channel)
-        except Exception as exc:
-            print(f"Storyline auto-post failed for {week_label}: {exc}")
-
     summary_lines = [f"Created {len(created_channels)} channel(s) in **{category_title}** for **{week_label}**."]
     if created_channels:
         summary_lines.append("Created:\n" + "\n".join(f"• {name}" for name in created_channels[:20]))
@@ -5088,37 +3239,6 @@ async def post_weekly_news(
         f"using {'AI' if used_ai else 'template'} mode."
     )
 
-
-
-@bot.tree.command(name="post_storylines", description="Admin: post the weekly storyline article.")
-@admin_only()
-@app_commands.describe(channel="Optional channel to post in. Defaults to NEWS_CHANNEL_ID or current channel.")
-async def post_storylines(
-    interaction: discord.Interaction,
-    channel: Optional[discord.TextChannel] = None,
-):
-    await interaction.response.defer(ephemeral=True)
-    target_channel = channel
-
-    if target_channel is None and NEWS_CHANNEL_ID:
-        guessed = bot.get_channel(NEWS_CHANNEL_ID)
-        if isinstance(guessed, discord.TextChannel):
-            target_channel = guessed
-
-    if target_channel is None:
-        target_channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
-
-    if target_channel is None:
-        await interaction.followup.send("Could not determine a channel to post the storyline article in.", ephemeral=True)
-        return
-
-    try:
-        await post_storylines_article(target_channel)
-    except Exception as exc:
-        await interaction.followup.send(f"Failed to post storyline article: {exc}", ephemeral=True)
-        return
-
-    await interaction.followup.send(f"Posted the weekly storyline article in {target_channel.mention}.", ephemeral=True)
 
 @bot.tree.command(name="preview_matchup_article", description="Admin: post one matchup preview article in the current channel.")
 @admin_only()
@@ -5260,7 +3380,6 @@ async def post_season_leaders(
     try:
         passing_rows = fetch_top_passing_leaders()
         rushing_rows = fetch_top_rushing_leaders()
-        receiving_rows = fetch_top_receiving_leaders()
         sack_rows = fetch_top_sack_leaders()
         interception_rows = fetch_top_interception_leaders()
     except Exception as exc:
@@ -5291,7 +3410,6 @@ async def post_season_leaders(
     sections = [
         ("🏈 Passing Yards", format_leader_lines(passing_rows, "total_pass_yds", "Passing Yards")),
         ("🏃 Rushing Yards", format_leader_lines(rushing_rows, "total_rush_yds", "Rushing Yards")),
-        ("🧤 Receiving Yards", format_leader_lines(receiving_rows, "total_rec_yds", "Receiving Yards")),
         ("💥 Sacks", format_leader_lines(sack_rows, "total_sacks", "Sacks")),
         ("🖐️ Interceptions", format_leader_lines(interception_rows, "total_ints", "Interceptions")),
     ]
@@ -5855,103 +3973,128 @@ async def generate_weekly_news_text(week: int, games, gotw_game_ids: set[int]) -
         print(f"OpenAI weekly news failed, using template fallback | week={week} error={exc}")
         return fallback, False
 
-
-@bot.tree.command(name="sportsbook", description="Show the current sportsbook lines.")
-async def sportsbook(interaction: discord.Interaction):
-    await interaction.response.send_message(embed=build_sportsbook_embed())
-
-
-@bot.tree.command(name="bet", description="Place a sportsbook bet on a team in the current week's slate.")
-@app_commands.describe(team="Team name to bet on", amount="How many tokens to bet")
-async def bet(interaction: discord.Interaction, team: str, amount: float):
-    if amount <= 0:
-        await interaction.response.send_message("Bet amount must be greater than 0.", ephemeral=True)
-        return
-
-    games = fetch_upcoming_games_for_current_week()
-    stage_index, display_week = detect_current_stage_and_week()
-    season_index = get_current_season_index()
-    raw_week = max((display_week or 1) - 1, 0)
-    chosen = None
-    norm = normalize_team_name(team)
-    for game in games:
-        if normalize_team_name(game["away_team_name"]) == norm or normalize_team_name(game["home_team_name"]) == norm:
-            chosen = game
-            break
-    if not chosen:
-        await interaction.response.send_message("Could not find that team on the current sportsbook slate.", ephemeral=True)
-        return
-
-    team_id = int(chosen["away_team_id"]) if normalize_team_name(chosen["away_team_name"]) == norm else int(chosen["home_team_id"])
-    team_name = chosen["away_team_name"] if team_id == int(chosen["away_team_id"]) else chosen["home_team_name"]
-    multiplier = implied_multiplier_for_game_side(chosen, team_id)
-
-    if not TOKEN_DB.spend_tokens(interaction.user, amount, f"Sportsbook bet on {team_name}", "sportsbook"):
-        await interaction.response.send_message("You do not have enough tokens for that bet.", ephemeral=True)
-        return
-
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO bot_sportsbook_bets
-                (season_index, stage_index, week, game_id, user_id, username, team_id, team_name, amount, multiplier, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
-                """,
-                (season_index, int(stage_index or 0), raw_week, int(chosen["game_id"]), int(interaction.user.id), str(interaction.user), team_id, team_name, float(amount), float(multiplier)),
-            )
-        conn.commit()
-
-    await interaction.response.send_message(
-        f"✅ Bet placed: **{fmt_tokens(amount)}** on **{team_name}** at **{multiplier}x**."
-    )
-
-
-@bot.tree.command(name="settlebets", description="Admin: settle sportsbook bets for the current completed slate.")
-@admin_only()
-async def settlebets(interaction: discord.Interaction):
-    settled, paid, details = settle_open_bets_for_current_week()
-    if not details:
-        await interaction.response.send_message("No open completed bets were available to settle.", ephemeral=True)
-        return
-
-    lines = []
-    for item in details[:20]:
-        icon = "✅" if item["outcome"] == "won" else ("🟨" if item["outcome"] == "push" else "❌")
-        payout_text = f" -> paid {fmt_tokens(item['payout'])}" if item["payout"] > 0 else ""
-        lines.append(
-            f"{icon} **{item['username']}** bet **{fmt_tokens(item['amount'])}** on **{item['team_name']}** "
-            f"({item['multiplier']}x) — **{item['outcome'].upper()}**{payout_text}\n{item['matchup']}"
-        )
-
-    if len(details) > 20:
-        lines.append(f"...and {len(details) - 20} more settled bets.")
-
-    embed = build_embed(
-        "✅ Sportsbook Bets Settled",
-        "\n\n".join(lines),
-        0x57F287,
-    )
-    embed.set_footer(text=f"Settled {settled} bets • Paid {paid} winning/push bets")
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="playoffpicture", description="Show the current playoff field and bubble teams.")
-async def playoffpicture(interaction: discord.Interaction):
-    await interaction.response.send_message(embed=build_playoff_picture_embed())
-
-
-@bot.tree.command(name="potw", description="Show the current weekly offensive and defensive players of the week.")
-async def potw(interaction: discord.Interaction):
-    try:
-        embed = build_potw_embed()
-    except Exception as exc:
-        await interaction.response.send_message(f"Failed to build POTW: {exc}", ephemeral=True)
-        return
-    await interaction.response.send_message(embed=embed)
-
-
 if not BOT_TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN is missing. Set it as an environment variable before running the bot.")
 
 bot.run(BOT_TOKEN)
+
+def fetch_weekly_rivalry_games_for_current_week():
+    stage_index, display_week = detect_current_stage_and_week()
+    if stage_index is None or display_week is None:
+        return []
+    games = fetch_games_for_stage_week(stage_index, display_week)
+    if stage_index != 1:
+        return []
+    rivalry_games = []
+    for game in games:
+        away_team = resolve_team_row(str(game.get("away_team_name") or ""))
+        home_team = resolve_team_row(str(game.get("home_team_name") or ""))
+        if not away_team or not home_team:
+            continue
+        away_div = safe_text(away_team.get("division_name")).lower()
+        home_div = safe_text(home_team.get("division_name")).lower()
+        away_conf = safe_text(away_team.get("conference_name")).lower()
+        home_conf = safe_text(home_team.get("conference_name")).lower()
+        if away_div and away_div == home_div and away_conf == home_conf:
+            rivalry_games.append(game)
+    return rivalry_games
+
+
+def build_weekly_rivalries_embed() -> discord.Embed:
+    games = fetch_weekly_rivalry_games_for_current_week()
+    stage_index, display_week = detect_current_stage_and_week()
+    title = f"🔥 Weekly Rivalries — {stage_week_label(stage_index or 1, display_week or 1)}"
+    if not games:
+        return build_embed(title, "No rivalry games detected for the current week.", 0xE67E22)
+    lines = []
+    for game in games:
+        away_mult = implied_multiplier_for_game_side(game, game["away_team_id"])
+        home_mult = implied_multiplier_for_game_side(game, game["home_team_id"])
+        lines.append(
+            f"**{safe_text(game.get('away_team_name'))}** at **{safe_text(game.get('home_team_name'))}** "
+            f"— sportsbook: {away_mult}x / {home_mult}x"
+        )
+    return build_embed(title, "\n".join(lines), 0xE67E22)
+
+
+@bot.tree.command(name="weeklyrivalries", description="Show this week's rivalry games.")
+async def weeklyrivalries(interaction: discord.Interaction):
+    try:
+        embed = build_weekly_rivalries_embed()
+    except Exception as exc:
+        await interaction.response.send_message(f"Failed to load weekly rivalries: {exc}", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=embed)
+
+
+
+
+
+def fetch_open_sportsbook_bets(limit: int = 50):
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    b.*,
+                    g.away_team_id,
+                    g.home_team_id,
+                    away.team_name AS away_team_name,
+                    home.team_name AS home_team_name
+                FROM bot_sportsbook_bets b
+                LEFT JOIN games g
+                    ON g.game_id = b.game_id
+                   AND g.season_index = b.season_index
+                   AND g.stage_index = b.stage_index
+                   AND g.week = b.week
+                LEFT JOIN teams away ON away.team_id = g.away_team_id
+                LEFT JOIN teams home ON home.team_id = g.home_team_id
+                WHERE b.status = 'open'
+                  AND b.season_index = (SELECT COALESCE(MAX(season_index), 0) FROM games)
+                ORDER BY b.created_at DESC, b.id DESC
+                LIMIT %s
+                """,
+                (int(limit),),
+            )
+            return cur.fetchall()
+
+
+@bot.tree.command(name="activebets", description="Show all currently open sportsbook bets.")
+async def activebets(interaction: discord.Interaction):
+    try:
+        rows = fetch_open_sportsbook_bets(limit=50)
+    except Exception as exc:
+        await interaction.response.send_message(f"Failed to load active bets: {exc}", ephemeral=True)
+        return
+
+    if not rows:
+        await interaction.response.send_message("There are no active sportsbook bets right now.")
+        return
+
+    lines = []
+    for row in rows[:25]:
+        matchup = "Unknown matchup"
+        away_name = row.get("away_team_name")
+        home_name = row.get("home_team_name")
+        if away_name and home_name:
+            matchup = f"{away_name} at {home_name}"
+
+        week_value = int(row.get("week") or 0) + 1
+        stage_value = int(row.get("stage_index") or 0)
+        stage_label = STAGE_LABELS.get(stage_value, f"Stage {stage_value}")
+        if stage_value == 1:
+            slate_label = f"Week {week_value}"
+        elif stage_value == 0:
+            slate_label = f"Preseason Week {week_value}"
+        else:
+            slate_label = f"{stage_label} Week {week_value}"
+
+        lines.append(
+            f"**<@{row['user_id']}>** — {fmt_tokens(float(row['amount']))} on **{row['team_name']}** at **{float(row['multiplier']):.2f}x**\n"
+            f"{matchup} | {slate_label}"
+        )
+
+    embed = build_embed("🎟️ Active Sportsbook Bets", "\n\n".join(lines), 0x5865F2)
+    if len(rows) > 25:
+        embed.set_footer(text=f"Showing 25 of {len(rows)} open bets.")
+    await interaction.response.send_message(embed=embed)
