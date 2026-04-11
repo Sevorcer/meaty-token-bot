@@ -4140,6 +4140,223 @@ async def generate_weekly_news_text(week: int, games, gotw_game_ids: set[int]) -
         return fallback, False
 
 
+
+
+# -----------------------------
+# Sportsbook helpers
+# -----------------------------
+def init_extra_feature_tables():
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_sportsbook_bets (
+                    id BIGSERIAL PRIMARY KEY,
+                    season_index INTEGER NOT NULL,
+                    stage_index INTEGER NOT NULL,
+                    week INTEGER NOT NULL,
+                    game_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    username TEXT NOT NULL,
+                    team_id BIGINT NOT NULL,
+                    team_name TEXT NOT NULL,
+                    amount NUMERIC(12,2) NOT NULL,
+                    multiplier NUMERIC(8,3) NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    settled_at TIMESTAMPTZ
+                )
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_sportsbook_bets_lookup ON bot_sportsbook_bets(season_index, stage_index, week, game_id)")
+        conn.commit()
+
+
+def get_current_season_index() -> int:
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(MAX(season_index), 0) AS season_index FROM games")
+            row = cur.fetchone() or {}
+    return int(row.get("season_index") or 0)
+
+
+def fetch_upcoming_games_for_current_week():
+    stage_index, display_week = detect_current_stage_and_week()
+    if stage_index is None or display_week is None:
+        return []
+    return fetch_games_for_stage_week(stage_index, display_week)
+
+
+def _team_strength_for_odds(team_row: dict, is_home: bool) -> float:
+    wins = float(team_row.get("wins") or 0)
+    losses = float(team_row.get("losses") or 0)
+    ties = float(team_row.get("ties") or 0)
+    games_played = wins + losses + ties
+    win_pct = float(team_row.get("win_pct") or 0)
+    ovr = float(team_row.get("team_ovr") or 0)
+    pf = float(team_row.get("pts_for") or 0)
+    pa = float(team_row.get("pts_against") or 0)
+    turnover = float(team_row.get("turnover_diff") or 0)
+
+    points_margin = 0.0
+    if games_played > 0:
+        points_margin = (pf - pa) / games_played
+
+    strength = (
+        (win_pct * 100.0)
+        + (wins * 2.5)
+        + (ovr * 0.45)
+        + (points_margin * 1.5)
+        + (turnover * 1.2)
+        + (2.0 if is_home else 0.0)
+    )
+    return strength
+
+
+def implied_multiplier_for_game_side(game_row, team_id: int) -> float:
+    away_team = fetch_team_standing(int(game_row["away_team_id"])) or {
+        "wins": game_row.get("away_wins", 0),
+        "losses": game_row.get("away_losses", 0),
+        "ties": game_row.get("away_ties", 0),
+        "win_pct": game_row.get("away_win_pct", 0),
+        "team_ovr": game_row.get("away_ovr", 0),
+        "pts_for": 0,
+        "pts_against": 0,
+        "turnover_diff": 0,
+    }
+    home_team = fetch_team_standing(int(game_row["home_team_id"])) or {
+        "wins": game_row.get("home_wins", 0),
+        "losses": game_row.get("home_losses", 0),
+        "ties": game_row.get("home_ties", 0),
+        "win_pct": game_row.get("home_win_pct", 0),
+        "team_ovr": game_row.get("home_ovr", 0),
+        "pts_for": 0,
+        "pts_against": 0,
+        "turnover_diff": 0,
+    }
+
+    away_strength = _team_strength_for_odds(away_team, is_home=False)
+    home_strength = _team_strength_for_odds(home_team, is_home=True)
+    total = max(away_strength + home_strength, 1.0)
+
+    away_prob = max(0.10, min(0.90, away_strength / total))
+    home_prob = max(0.10, min(0.90, home_strength / total))
+
+    away_mult = round(max(1.12, min(5.0, 0.96 / away_prob)), 2)
+    home_mult = round(max(1.12, min(5.0, 0.96 / home_prob)), 2)
+    return away_mult if int(team_id) == int(game_row["away_team_id"]) else home_mult
+
+
+def build_sportsbook_embed() -> discord.Embed:
+    games = fetch_upcoming_games_for_current_week()
+    stage_index, display_week = detect_current_stage_and_week()
+    if not games:
+        return build_embed("🎟️ Sportsbook", "No upcoming games found for the current week.", 0x5865F2)
+
+    lines = []
+    for game in games[:16]:
+        away_mult = implied_multiplier_for_game_side(game, game["away_team_id"])
+        home_mult = implied_multiplier_for_game_side(game, game["home_team_id"])
+        lines.append(f"**{game['away_team_name']}** ({away_mult}x) at **{game['home_team_name']}** ({home_mult}x)")
+
+    embed = build_embed(
+        f"🎟️ Sportsbook — {stage_week_label(stage_index or 2, display_week or 1)}",
+        "\n".join(lines),
+        0x5865F2,
+    )
+    embed.set_footer(text="Bet with /bet team:<team name> amount:<tokens>. Payouts include your stake.")
+    return embed
+
+
+def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
+    season_index = get_current_season_index()
+    stage_index, display_week = detect_current_stage_and_week()
+    if stage_index is None or display_week is None:
+        return 0, 0, []
+    raw_week = max(display_week - 1, 0)
+    games = fetch_games_for_stage_week(stage_index, display_week)
+    game_map = {int(g["game_id"]): g for g in games if looks_like_completed_game(g)}
+    if not game_map:
+        return 0, 0, []
+
+    settled = 0
+    paid = 0
+    details: list[dict] = []
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM bot_sportsbook_bets
+                WHERE season_index = %s AND stage_index = %s AND week = %s AND status = 'open'
+                ORDER BY id ASC
+                """,
+                (season_index, stage_index, raw_week),
+            )
+            bets = cur.fetchall()
+
+            for bet in bets:
+                game = game_map.get(int(bet["game_id"]))
+                if not game:
+                    continue
+                away_score = int(game.get("away_score") or 0)
+                home_score = int(game.get("home_score") or 0)
+                matchup = f"{game['away_team_name']} {away_score}-{home_score} {game['home_team_name']}"
+
+                if away_score == home_score:
+                    outcome = "push"
+                    payout = float(bet["amount"])
+                else:
+                    winner_team_id = int(game["away_team_id"] if away_score > home_score else game["home_team_id"])
+                    if int(bet["team_id"]) == winner_team_id:
+                        outcome = "won"
+                        payout = round(float(bet["amount"]) * float(bet["multiplier"]), 2)
+                    else:
+                        outcome = "lost"
+                        payout = 0.0
+
+                if outcome in {"won", "push"} and payout > 0:
+                    cur.execute(
+                        """
+                        INSERT INTO bot_users (user_id, username)
+                        VALUES (%s, %s)
+                        ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
+                        """,
+                        (int(bet["user_id"]), bet["username"]),
+                    )
+                    cur.execute(
+                        """
+                        UPDATE bot_users
+                        SET balance = balance + %s,
+                            total_earned = total_earned + %s,
+                            updated_at = NOW()
+                        WHERE user_id = %s
+                        """,
+                        (payout, payout, int(bet["user_id"])),
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO bot_ledger (user_id, amount, reason, category)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (int(bet["user_id"]), payout, f"Sportsbook {outcome} payout for {bet['team_name']}", "sportsbook"),
+                    )
+                    paid += 1
+
+                cur.execute("UPDATE bot_sportsbook_bets SET status = %s, settled_at = NOW() WHERE id = %s", (outcome, int(bet["id"])))
+                details.append({
+                    "username": bet["username"],
+                    "team_name": bet["team_name"],
+                    "amount": float(bet["amount"]),
+                    "multiplier": float(bet["multiplier"]),
+                    "outcome": outcome,
+                    "payout": payout,
+                    "matchup": matchup,
+                })
+                settled += 1
+        conn.commit()
+    return settled, paid, details
+
+
 def fetch_weekly_rivalry_games_for_current_week():
     stage_index, display_week = detect_current_stage_and_week()
     if stage_index is None or display_week is None:
@@ -4165,7 +4382,7 @@ def fetch_weekly_rivalry_games_for_current_week():
 def build_weekly_rivalries_embed() -> discord.Embed:
     games = fetch_weekly_rivalry_games_for_current_week()
     stage_index, display_week = detect_current_stage_and_week()
-    title = f"🔥 Weekly Rivalries — {stage_week_label(stage_index or 1, display_week or 1)}"
+    title = f"🔥 Weekly Rivalries — {stage_week_label(stage_index or 2, display_week or 1)}"
     if not games:
         return build_embed(title, "No rivalry games detected for the current week.", 0xE67E22)
     lines = []
@@ -4261,7 +4478,186 @@ async def activebets(interaction: discord.Interaction):
         embed.set_footer(text=f"Showing 25 of {len(rows)} open bets.")
     await interaction.response.send_message(embed=embed)
 
+
+
+def compute_power_ranking_score(row: dict) -> float:
+    wins = safe_int(row.get("wins"))
+    losses = safe_int(row.get("losses"))
+    ties = safe_int(row.get("ties"))
+    win_pct = float(row.get("win_pct") or 0)
+    team_ovr = safe_int(row.get("team_ovr"))
+    pts_for = safe_int(row.get("pts_for"))
+    pts_against = safe_int(row.get("pts_against"))
+    turnover_diff = safe_int(row.get("turnover_diff"))
+    games_played = max(wins + losses + ties, 1)
+    point_margin_per_game = (pts_for - pts_against) / games_played
+    return (win_pct * 100.0) + (wins * 3.0) + (team_ovr * 0.35) + (point_margin_per_game * 0.9) + (turnover_diff * 1.5)
+
+
+def fetch_power_ranking_rows():
+    rows = [record_to_dict(row) for row in fetch_standings_rows()]
+    rows.sort(key=lambda r: (compute_power_ranking_score(r), safe_int(r.get("wins")), safe_int(r.get("pts_for"))), reverse=True)
+    return rows
+
+
+@bot.tree.command(name="powerankings", description="Show current league power rankings.")
+async def powerrankings(interaction: discord.Interaction):
+    try:
+        rows = fetch_power_ranking_rows()
+    except Exception as exc:
+        await interaction.response.send_message(f"Failed to load power rankings: {exc}", ephemeral=True)
+        return
+
+    if not rows:
+        await interaction.response.send_message("No standings data found.")
+        return
+
+    lines = []
+    for idx, row in enumerate(rows[:20], start=1):
+        team_name = safe_text(row.get("team_name"))
+        record = wins_losses_ties_text(row)
+        score = compute_power_ranking_score(row)
+        lines.append(
+            f"**{idx}. {team_name}** ({record}) | OVR: {safe_int(row.get('team_ovr'))} | "
+            f"PF: {safe_int(row.get('pts_for'))} | PA: {safe_int(row.get('pts_against'))} | TO: {safe_int(row.get('turnover_diff')):+d} | Score: {score:.1f}"
+        )
+
+    await interaction.response.send_message(
+        embed=build_embed("📈 Power Rankings", "\n".join(lines), 0xF39C12)
+    )
+
+
+def build_storyline_blurbs() -> list[str]:
+    rows = fetch_power_ranking_rows()
+    if not rows:
+        return ["No standings data found."]
+
+    top = rows[0]
+    second = rows[1] if len(rows) > 1 else None
+    hottest_offense = max(rows, key=lambda r: safe_int(r.get("pts_for")))
+    stingiest_defense = min(rows, key=lambda r: safe_int(r.get("pts_against")))
+    takeaway_team = max(rows, key=lambda r: safe_int(r.get("turnover_diff")))
+    struggling = rows[-1]
+
+    blurbs = [
+        f"**Top dog:** {safe_text(top.get('team_name'))} sits at {wins_losses_ties_text(top)} with a {safe_int(top.get('team_ovr'))} OVR and the best overall profile in the league.",
+        f"**Best offense:** {safe_text(hottest_offense.get('team_name'))} leads the scoring race with {safe_int(hottest_offense.get('pts_for'))} points.",
+        f"**Best defense:** {safe_text(stingiest_defense.get('team_name'))} has allowed only {safe_int(stingiest_defense.get('pts_against'))} points.",
+        f"**Turnover kings:** {safe_text(takeaway_team.get('team_name'))} are pacing the league at {safe_int(takeaway_team.get('turnover_diff')):+d} in turnover differential.",
+        f"**Under pressure:** {safe_text(struggling.get('team_name'))} is trying to claw out of the basement at {wins_losses_ties_text(struggling)}.",
+    ]
+    if second is not None:
+        blurbs.insert(1, f"**Closest challenger:** {safe_text(second.get('team_name'))} is right there at {wins_losses_ties_text(second)} and keeping pressure on the top spot.")
+    return blurbs[:6]
+
+
+@bot.tree.command(name="storylines", description="Show current league storylines.")
+async def storylines(interaction: discord.Interaction):
+    try:
+        blurbs = build_storyline_blurbs()
+    except Exception as exc:
+        await interaction.response.send_message(f"Failed to load storylines: {exc}", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        embed=build_embed("📰 League Storylines", "\n\n".join(blurbs), 0x1ABC9C)
+    )
+
+
+
+@bot.tree.command(name="sportsbook", description="Show the current sportsbook lines.")
+async def sportsbook(interaction: discord.Interaction):
+    try:
+        init_extra_feature_tables()
+        await interaction.response.send_message(embed=build_sportsbook_embed())
+    except Exception as exc:
+        await interaction.response.send_message(f"Failed to load sportsbook: {exc}", ephemeral=True)
+
+
+@bot.tree.command(name="bet", description="Place a sportsbook bet on a team in the current week's slate.")
+@app_commands.describe(team="Team name to bet on", amount="How many tokens to bet")
+async def bet(interaction: discord.Interaction, team: str, amount: float):
+    init_extra_feature_tables()
+    if amount <= 0:
+        await interaction.response.send_message("Bet amount must be greater than 0.", ephemeral=True)
+        return
+
+    games = fetch_upcoming_games_for_current_week()
+    stage_index, display_week = detect_current_stage_and_week()
+    season_index = get_current_season_index()
+    raw_week = max((display_week or 1) - 1, 0)
+    chosen = None
+    norm = normalize_team_name(team)
+    for game in games:
+        if normalize_team_name(game["away_team_name"]) == norm or normalize_team_name(game["home_team_name"]) == norm:
+            chosen = game
+            break
+    if not chosen:
+        await interaction.response.send_message("Could not find that team on the current sportsbook slate.", ephemeral=True)
+        return
+
+    team_id = int(chosen["away_team_id"]) if normalize_team_name(chosen["away_team_name"]) == norm else int(chosen["home_team_id"])
+    team_name = chosen["away_team_name"] if team_id == int(chosen["away_team_id"]) else chosen["home_team_name"]
+    multiplier = implied_multiplier_for_game_side(chosen, team_id)
+
+    if not TOKEN_DB.spend_tokens(interaction.user, amount, f"Sportsbook bet on {team_name}", "sportsbook"):
+        await interaction.response.send_message("You do not have enough tokens for that bet.", ephemeral=True)
+        return
+
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bot_sportsbook_bets
+                (season_index, stage_index, week, game_id, user_id, username, team_id, team_name, amount, multiplier, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
+                """,
+                (
+                    season_index,
+                    int(stage_index or 0),
+                    raw_week,
+                    int(chosen["game_id"]),
+                    int(interaction.user.id),
+                    str(interaction.user),
+                    team_id,
+                    team_name,
+                    float(amount),
+                    float(multiplier),
+                ),
+            )
+        conn.commit()
+
+    await interaction.response.send_message(f"✅ Bet placed: **{fmt_tokens(amount)}** on **{team_name}** at **{multiplier}x**.")
+
+
+@bot.tree.command(name="settlebets", description="Admin: settle sportsbook bets for the current completed slate.")
+@admin_only()
+async def settlebets(interaction: discord.Interaction):
+    init_extra_feature_tables()
+    settled, paid, details = settle_open_bets_for_current_week()
+    if not details:
+        await interaction.response.send_message("No open completed bets were available to settle.", ephemeral=True)
+        return
+
+    lines = []
+    for item in details[:20]:
+        icon = "✅" if item["outcome"] == "won" else ("🟨" if item["outcome"] == "push" else "❌")
+        payout_text = f" -> paid {fmt_tokens(item['payout'])}" if item["payout"] > 0 else ""
+        lines.append(
+            f"{icon} **{item['username']}** bet **{fmt_tokens(item['amount'])}** on **{item['team_name']}** "
+            f"({item['multiplier']}x) — **{item['outcome'].upper()}**{payout_text}\n{item['matchup']}"
+        )
+
+    if len(details) > 20:
+        lines.append(f"...and {len(details) - 20} more settled bets.")
+
+    embed = build_embed("✅ Sportsbook Bets Settled", "\n\n".join(lines), 0x57F287)
+    embed.set_footer(text=f"Settled {settled} bets • Paid {paid} winning/push bets")
+    await interaction.response.send_message(embed=embed)
+
+
 if not BOT_TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN is missing. Set it as an environment variable before running the bot.")
 
+init_extra_feature_tables()
 bot.run(BOT_TOKEN)
