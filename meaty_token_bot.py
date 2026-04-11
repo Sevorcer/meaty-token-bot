@@ -1310,6 +1310,195 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # -----------------------------
 # Public commands
 # -----------------------------
+
+
+def resolve_member_team_row(member: discord.Member):
+    possible_names = [member.display_name or "", member.name or "", getattr(member, "global_name", "") or ""]
+    for raw_name in possible_names:
+        if not raw_name:
+            continue
+        team_row = resolve_team_row(raw_name)
+        if team_row:
+            return team_row
+    return None
+
+
+def compute_profile_gotw_count(team_id: int) -> int:
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COALESCE(MAX(season_index), 0) AS season_index FROM games")
+                season_row = cur.fetchone()
+                season_index = int((season_row or {}).get("season_index") or 0)
+                cur.execute(
+                    """
+                    SELECT DISTINCT week
+                    FROM games
+                    WHERE season_index = %s AND stage_index = 2
+                    ORDER BY week ASC
+                    """,
+                    (season_index,),
+                )
+                weeks = [int(r["week"]) for r in cur.fetchall()]
+        count = 0
+        for raw_week in weeks:
+            games = fetch_games_for_stage_week(2, raw_week + 1)
+            if not games:
+                continue
+            scored = sorted(games, key=compute_matchup_score, reverse=True)
+            top_two = {g["game_id"] for g in scored[:2]}
+            for game in games:
+                if game["game_id"] in top_two and (int(game["away_team_id"]) == team_id or int(game["home_team_id"]) == team_id):
+                    count += 1
+                    break
+        return count
+    except Exception:
+        return 0
+
+
+def compute_profile_rivalry_count(team_id: int) -> int:
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS total
+                    FROM games g
+                    JOIN teams away ON away.team_id = g.away_team_id
+                    JOIN teams home ON home.team_id = g.home_team_id
+                    WHERE g.season_index = (SELECT MAX(season_index) FROM games)
+                      AND g.stage_index = 2
+                      AND (g.away_team_id = %s OR g.home_team_id = %s)
+                      AND lower(COALESCE(away.conference_name, '')) = lower(COALESCE(home.conference_name, ''))
+                      AND lower(COALESCE(away.division_name, '')) = lower(COALESCE(home.division_name, ''))
+                    """,
+                    (team_id, team_id),
+                )
+                row = cur.fetchone()
+                return int((row or {}).get("total") or 0)
+    except Exception:
+        return 0
+
+
+def compute_team_streak(team_id: int) -> tuple[str, int]:
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT away_team_id, home_team_id, away_score, home_score, status, week, game_id
+                    FROM games
+                    WHERE season_index = (SELECT MAX(season_index) FROM games)
+                      AND stage_index = 2
+                      AND (away_team_id = %s OR home_team_id = %s)
+                    ORDER BY week DESC, game_id DESC
+                    """,
+                    (team_id, team_id),
+                )
+                rows = cur.fetchall()
+        streak_type = None
+        streak_count = 0
+        for row in rows:
+            if not looks_like_completed_game(row):
+                continue
+            away_id = int(row["away_team_id"])
+            home_id = int(row["home_team_id"])
+            away_score = int(row.get("away_score") or 0)
+            home_score = int(row.get("home_score") or 0)
+            if away_score == home_score:
+                outcome = 'T'
+            else:
+                team_won = (away_id == team_id and away_score > home_score) or (home_id == team_id and home_score > away_score)
+                outcome = 'W' if team_won else 'L'
+            if streak_type is None:
+                streak_type = outcome
+                streak_count = 1
+            elif outcome == streak_type:
+                streak_count += 1
+            else:
+                break
+        return (streak_type or 'N/A', streak_count)
+    except Exception:
+        return ('N/A', 0)
+
+
+def detect_profile_storyline(team_row: dict) -> str:
+    wins = safe_int(team_row.get('wins'))
+    losses = safe_int(team_row.get('losses'))
+    pf = safe_int(team_row.get('pts_for'))
+    pa = safe_int(team_row.get('pts_against'))
+    turnover_diff = safe_int(team_row.get('turnover_diff'))
+    if wins >= 8 and wins >= losses + 4:
+        return 'Rolling like a contender'
+    if losses >= 3 and wins == 0:
+        return 'Still searching for a breakthrough'
+    if losses > wins + 2:
+        return 'Under pressure to stop the slide'
+    if turnover_diff >= 5:
+        return 'Winning the possession battle lately'
+    if pf > pa + 40:
+        return 'Offense is carrying real momentum'
+    if pa < pf - 20:
+        return 'Defense is keeping them in every game'
+    return 'Trying to build weekly momentum'
+
+
+def build_profile_embed(member: discord.Member, team_row: dict) -> discord.Embed:
+    standing_row = fetch_team_standing(safe_int(team_row.get('team_id'))) or {}
+    merged_team = {**team_row, **standing_row}
+    token_row = TOKEN_DB.get_user(member)
+    team_id = safe_int(merged_team.get('team_id'))
+    gotw_count = compute_profile_gotw_count(team_id)
+    rivalry_count = compute_profile_rivalry_count(team_id)
+    casino_games = safe_int(token_row['casino_wins']) + safe_int(token_row['casino_losses'])
+    casino_win_pct = (safe_int(token_row['casino_wins']) / casino_games * 100.0) if casino_games else 0.0
+    wins = safe_int(merged_team.get('wins'))
+    losses = safe_int(merged_team.get('losses'))
+    ties = safe_int(merged_team.get('ties'))
+    record_text = f"{wins}-{losses}-{ties}" if ties else f"{wins}-{losses}"
+    streak_type, streak_count = compute_team_streak(team_id)
+    streak_text = f"{streak_type}{streak_count}" if streak_count else 'N/A'
+    storyline = detect_profile_storyline(merged_team)
+    embed = discord.Embed(
+        title=f"👤 {member.display_name} Profile",
+        description=(
+            f"**Team:** {safe_text(merged_team.get('team_name'))}\n"
+            f"**Record:** {record_text}\n"
+            f"**Storyline:** {storyline}"
+        ),
+        color=0x5865F2,
+    )
+    embed.add_field(name='Tokens', value=fmt_tokens(token_row['balance']), inline=True)
+    embed.add_field(name='Casino', value=f"{token_row['casino_wins']}-{token_row['casino_losses']} ({casino_win_pct:.1f}%)", inline=True)
+    embed.add_field(name='Bounties', value=str(token_row['bounty_wins']), inline=True)
+    embed.add_field(name='Rivalry Games', value=str(rivalry_count), inline=True)
+    embed.add_field(name='GOTW Appearances', value=str(gotw_count), inline=True)
+    embed.add_field(name='Streak', value=streak_text, inline=True)
+    embed.set_footer(text=f"{safe_text(merged_team.get('conference_name'))} / {safe_text(merged_team.get('division_name'))}")
+    return embed
+
+
+@bot.tree.command(name="profile", description="Show a coach profile based on Discord nickname to team matching.")
+@app_commands.describe(user="Optional: check another user's profile")
+async def profile(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    if not isinstance(target, discord.Member):
+        await interaction.response.send_message("This command must be used inside a server.", ephemeral=True)
+        return
+    team_row = resolve_member_team_row(target)
+    if not team_row:
+        await interaction.response.send_message(
+            f"Could not match **{target.display_name}** to a franchise team. Their nickname should match the team name.",
+            ephemeral=True,
+        )
+        return
+    try:
+        embed = build_profile_embed(target, team_row)
+    except Exception as exc:
+        await interaction.response.send_message(f"Failed to build profile: {exc}", ephemeral=True)
+        return
+    await interaction.followup.send(embed=embed)
+
 @bot.tree.command(name="ping", description="Check if the bot is online.")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong. Meaty Token Bot is online.", ephemeral=True)
@@ -1317,14 +1506,15 @@ async def ping(interaction: discord.Interaction):
 
 @bot.tree.command(name="standings", description="Show current league standings.")
 async def standings(interaction: discord.Interaction):
+    await interaction.response.defer()
     try:
         rows = fetch_standings_rows()
     except Exception as exc:
-        await interaction.response.send_message(f"Failed to load standings: {exc}", ephemeral=True)
+        await interaction.followup.send(f"Failed to load standings: {exc}", ephemeral=True)
         return
 
     if not rows:
-        await interaction.response.send_message("No standings data found.")
+        await interaction.followup.send("No standings data found.")
         return
 
     lines = []
@@ -1361,7 +1551,7 @@ async def standings(interaction: discord.Interaction):
     if current:
         chunks.append("\n".join(current))
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=build_embed("🏈 League Standings", chunks[0], 0x5865F2)
     )
     for page_num, chunk in enumerate(chunks[1:], start=2):
@@ -1491,9 +1681,10 @@ async def balance(interaction: discord.Interaction, user: Optional[discord.Membe
 
 @bot.tree.command(name="leaderboard", description="Show everyone who currently has tokens.")
 async def leaderboard(interaction: discord.Interaction):
+    await interaction.response.defer()
     rows = TOKEN_DB.leaderboard()
     if not rows:
-        await interaction.response.send_message("No users currently have tokens.")
+        await interaction.followup.send("No users currently have tokens.")
         return
 
     lines = []
@@ -1518,7 +1709,7 @@ async def leaderboard(interaction: discord.Interaction):
     if current:
         chunks.append("\n".join(current))
 
-    await interaction.response.send_message(embed=build_embed("🏆 Token Leaderboard", chunks[0], 0xFEE75C))
+    await interaction.followup.send(embed=build_embed("🏆 Token Leaderboard", chunks[0], 0xFEE75C))
     for page_num, chunk in enumerate(chunks[1:], start=2):
         await interaction.followup.send(
             embed=build_embed(f"🏆 Token Leaderboard (Page {page_num})", chunk, 0xFEE75C)
@@ -4448,8 +4639,7 @@ def build_weekly_rivalries_embed(display_week: Optional[int] = None, phase: Opti
             f"**{safe_text(game.get('away_team_name'))}** at **{safe_text(game.get('home_team_name'))}** "
             f"— sportsbook: {away_mult}x / {home_mult}x"
         )
-    return build_embed(title, "
-".join(lines), 0xE67E22)
+    return build_embed(title, "\n".join(lines), 0xE67E22)
 
 
 @bot.tree.command(name="weeklyrivalries", description="Show rivalry games for a selected week and phase.")
@@ -4466,19 +4656,14 @@ def build_weekly_rivalries_embed(display_week: Optional[int] = None, phase: Opti
     app_commands.Choice(name="Super Bowl", value="super bowl"),
 ])
 async def weeklyrivalries(interaction: discord.Interaction, week: Optional[int] = None, phase: Optional[str] = None):
+    await interaction.response.defer()
     try:
         embed = build_weekly_rivalries_embed(display_week=week, phase=phase)
     except Exception as exc:
-        if interaction.response.is_done():
-            await interaction.followup.send(f"Failed to load weekly rivalries: {exc}", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"Failed to load weekly rivalries: {exc}", ephemeral=True)
+        await interaction.followup.send(f"Failed to load weekly rivalries: {exc}", ephemeral=True)
         return
 
-    if interaction.response.is_done():
-        await interaction.followup.send(embed=embed)
-    else:
-        await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 
@@ -4515,14 +4700,15 @@ def fetch_open_sportsbook_bets(limit: int = 50):
 
 @bot.tree.command(name="activebets", description="Show all currently open sportsbook bets.")
 async def activebets(interaction: discord.Interaction):
+    await interaction.response.defer()
     try:
         rows = fetch_open_sportsbook_bets(limit=50)
     except Exception as exc:
-        await interaction.response.send_message(f"Failed to load active bets: {exc}", ephemeral=True)
+        await interaction.followup.send(f"Failed to load active bets: {exc}", ephemeral=True)
         return
 
     if not rows:
-        await interaction.response.send_message("There are no active sportsbook bets right now.")
+        await interaction.followup.send("There are no active sportsbook bets right now.")
         return
 
     lines = []
@@ -4536,9 +4722,9 @@ async def activebets(interaction: discord.Interaction):
         week_value = int(row.get("week") or 0) + 1
         stage_value = int(row.get("stage_index") or 0)
         stage_label = STAGE_LABELS.get(stage_value, f"Stage {stage_value}")
-        if stage_value == 1:
+        if stage_value == 2:
             slate_label = f"Week {week_value}"
-        elif stage_value == 0:
+        elif stage_value == 1:
             slate_label = f"Preseason Week {week_value}"
         else:
             slate_label = f"{stage_label} Week {week_value}"
@@ -4577,14 +4763,15 @@ def fetch_power_ranking_rows():
 
 @bot.tree.command(name="powerankings", description="Show current league power rankings.")
 async def powerrankings(interaction: discord.Interaction):
+    await interaction.response.defer()
     try:
         rows = fetch_power_ranking_rows()
     except Exception as exc:
-        await interaction.response.send_message(f"Failed to load power rankings: {exc}", ephemeral=True)
+        await interaction.followup.send(f"Failed to load power rankings: {exc}", ephemeral=True)
         return
 
     if not rows:
-        await interaction.response.send_message("No standings data found.")
+        await interaction.followup.send("No standings data found.")
         return
 
     lines = []
