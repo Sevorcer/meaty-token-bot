@@ -4357,13 +4357,46 @@ def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
     return settled, paid, details
 
 
+def detect_display_week_for_stage(stage_index: int) -> Optional[int]:
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT g.week, g.status, g.away_score, g.home_score
+                FROM games g
+                WHERE g.season_index = (SELECT MAX(season_index) FROM games)
+                  AND g.stage_index = %s
+                ORDER BY g.week ASC, g.game_id ASC
+                """,
+                (stage_index,),
+            )
+            rows = cur.fetchall()
+
+    if not rows:
+        return None
+
+    progress = {}
+    for row in rows:
+        raw_week = int(row["week"] or 0)
+        bucket = progress.setdefault(raw_week, {"total": 0, "completed": 0})
+        bucket["total"] += 1
+        if looks_like_completed_game(row):
+            bucket["completed"] += 1
+
+    for raw_week in sorted(progress.keys()):
+        counts = progress[raw_week]
+        if counts["completed"] < counts["total"]:
+            return raw_week + 1
+
+    return max(progress.keys()) + 1
+
+
 def fetch_weekly_rivalry_games_for_current_week():
-    stage_index, display_week = detect_current_stage_and_week()
-    if stage_index is None or display_week is None:
+    stage_index = 2
+    display_week = detect_display_week_for_stage(stage_index)
+    if display_week is None:
         return []
     games = fetch_games_for_stage_week(stage_index, display_week)
-    if stage_index != 2:
-        return []
     rivalry_games = []
     for game in games:
         away_team = resolve_team_row(str(game.get("away_team_name") or ""))
@@ -4379,31 +4412,73 @@ def fetch_weekly_rivalry_games_for_current_week():
     return rivalry_games
 
 
-def build_weekly_rivalries_embed() -> discord.Embed:
-    games = fetch_weekly_rivalry_games_for_current_week()
-    stage_index, display_week = detect_current_stage_and_week()
-    title = f"🔥 Weekly Rivalries — {stage_week_label(stage_index or 2, display_week or 1)}"
-    if not games:
-        return build_embed(title, "No rivalry games detected for the current week.", 0xE67E22)
-    lines = []
+def build_weekly_rivalries_embed(display_week: Optional[int] = None, phase: Optional[str] = None) -> discord.Embed:
+    stage_index = parse_phase_to_stage_index(phase) if phase else 2
+    if stage_index is None:
+        stage_index = 2
+    if display_week is None:
+        display_week = detect_display_week_for_stage(stage_index)
+    if display_week is None:
+        return build_embed("🔥 Weekly Rivalries", "No games found for the selected phase/week.", 0xE67E22)
+
+    games = fetch_games_for_stage_week(stage_index, display_week)
+    title = f"🔥 Weekly Rivalries — {stage_week_label(stage_index, display_week)}"
+
+    rivalry_games = []
     for game in games:
+        away_team = resolve_team_row(str(game.get("away_team_name") or ""))
+        home_team = resolve_team_row(str(game.get("home_team_name") or ""))
+        if not away_team or not home_team:
+            continue
+        away_div = safe_text(away_team.get("division_name")).lower()
+        home_div = safe_text(home_team.get("division_name")).lower()
+        away_conf = safe_text(away_team.get("conference_name")).lower()
+        home_conf = safe_text(home_team.get("conference_name")).lower()
+        if away_div and away_div == home_div and away_conf == home_conf:
+            rivalry_games.append(game)
+
+    if not rivalry_games:
+        return build_embed(title, "No rivalry games detected for the selected phase/week.", 0xE67E22)
+
+    lines = []
+    for game in rivalry_games:
         away_mult = implied_multiplier_for_game_side(game, game["away_team_id"])
         home_mult = implied_multiplier_for_game_side(game, game["home_team_id"])
         lines.append(
             f"**{safe_text(game.get('away_team_name'))}** at **{safe_text(game.get('home_team_name'))}** "
             f"— sportsbook: {away_mult}x / {home_mult}x"
         )
-    return build_embed(title, "\n".join(lines), 0xE67E22)
+    return build_embed(title, "
+".join(lines), 0xE67E22)
 
 
-@bot.tree.command(name="weeklyrivalries", description="Show this week's rivalry games.")
-async def weeklyrivalries(interaction: discord.Interaction):
+@bot.tree.command(name="weeklyrivalries", description="Show rivalry games for a selected week and phase.")
+@app_commands.describe(
+    week="Optional human week number. Leave empty to use the current week in the selected phase.",
+    phase="Optional phase. Defaults to Regular Season."
+)
+@app_commands.choices(phase=[
+    app_commands.Choice(name="Regular Season", value="regular"),
+    app_commands.Choice(name="Preseason", value="preseason"),
+    app_commands.Choice(name="Wild Card", value="wild card"),
+    app_commands.Choice(name="Divisional", value="divisional"),
+    app_commands.Choice(name="Conference Championship", value="conference championship"),
+    app_commands.Choice(name="Super Bowl", value="super bowl"),
+])
+async def weeklyrivalries(interaction: discord.Interaction, week: Optional[int] = None, phase: Optional[str] = None):
     try:
-        embed = build_weekly_rivalries_embed()
+        embed = build_weekly_rivalries_embed(display_week=week, phase=phase)
     except Exception as exc:
-        await interaction.response.send_message(f"Failed to load weekly rivalries: {exc}", ephemeral=True)
+        if interaction.response.is_done():
+            await interaction.followup.send(f"Failed to load weekly rivalries: {exc}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Failed to load weekly rivalries: {exc}", ephemeral=True)
         return
-    await interaction.response.send_message(embed=embed)
+
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed)
+    else:
+        await interaction.response.send_message(embed=embed)
 
 
 
@@ -4569,9 +4644,16 @@ async def storylines(interaction: discord.Interaction):
 async def sportsbook(interaction: discord.Interaction):
     try:
         init_extra_feature_tables()
-        await interaction.response.send_message(embed=build_sportsbook_embed())
+        embed = build_sportsbook_embed()
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.response.send_message(embed=embed)
     except Exception as exc:
-        await interaction.response.send_message(f"Failed to load sportsbook: {exc}", ephemeral=True)
+        if interaction.response.is_done():
+            await interaction.followup.send(f"Failed to load sportsbook: {exc}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Failed to load sportsbook: {exc}", ephemeral=True)
 
 
 @bot.tree.command(name="bet", description="Place a sportsbook bet on a team in the current week's slate.")
