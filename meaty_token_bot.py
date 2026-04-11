@@ -1485,9 +1485,10 @@ async def profile(interaction: discord.Interaction, user: Optional[discord.Membe
     if not isinstance(target, discord.Member):
         await interaction.response.send_message("This command must be used inside a server.", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=False)
     team_row = resolve_member_team_row(target)
     if not team_row:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Could not match **{target.display_name}** to a franchise team. Their nickname should match the team name.",
             ephemeral=True,
         )
@@ -1495,12 +1496,9 @@ async def profile(interaction: discord.Interaction, user: Optional[discord.Membe
     try:
         embed = build_profile_embed(target, team_row)
     except Exception as exc:
-        await interaction.response.send_message(f"Failed to build profile: {exc}", ephemeral=True)
+        await interaction.followup.send(f"Failed to build profile: {exc}", ephemeral=True)
         return
-    if interaction.response.is_done():
-        await interaction.followup.send(embed=embed)
-    else:
-        await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="ping", description="Check if the bot is online.")
 async def ping(interaction: discord.Interaction):
@@ -4382,19 +4380,39 @@ def get_current_season_index() -> int:
     return int(row.get("season_index") or 0)
 
 
+def sportsbook_stage_label(stage_index: int, display_week: int) -> str:
+    if stage_index == 1:
+        return f"Week {display_week}"
+    if stage_index == 0:
+        return f"Preseason Week {display_week}"
+    return stage_week_label(stage_index, display_week)
+
+
+def sportsbook_phase_choices() -> list[tuple[int,int]]:
+    season_index = get_current_season_index()
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT stage_index, week
+                FROM games
+                WHERE season_index = %s
+                ORDER BY stage_index DESC, week DESC
+                """,
+                (season_index,),
+            )
+            rows = cur.fetchall()
+    return [(int(r["stage_index"]), int(r["week"]) + 1) for r in rows]
+
+
 def detect_current_sportsbook_stage_and_week() -> tuple[Optional[int], Optional[int]]:
-    # Prefer regular season once regular season games exist in the current season.
-    regular_week = detect_display_week_for_stage(2)
-    if regular_week is not None:
-        return 2, regular_week
-    return detect_current_stage_and_week()
-
-
-def fetch_upcoming_games_for_current_week():
-    stage_index, display_week = detect_current_sportsbook_stage_and_week()
-    if stage_index is None or display_week is None:
-        return []
-    return fetch_games_for_stage_week(stage_index, display_week)
+    phases = sportsbook_phase_choices()
+    if not phases:
+        return None, None
+    for stage_index, display_week in phases:
+        if stage_index == 1:
+            return stage_index, display_week
+    return phases[0]
 
 
 def _team_strength_for_odds(team_row: dict, is_home: bool) -> float:
@@ -4470,7 +4488,7 @@ def build_sportsbook_embed() -> discord.Embed:
         lines.append(f"**{game['away_team_name']}** ({away_mult}x) at **{game['home_team_name']}** ({home_mult}x)")
 
     embed = build_embed(
-        f"🎟️ Sportsbook — {stage_week_label(stage_index or 2, display_week or 1)}",
+        f"🎟️ Sportsbook — {sportsbook_stage_label(stage_index or 1, display_week or 1)}",
         "\n".join(lines),
         0x5865F2,
     )
@@ -4877,13 +4895,7 @@ async def activebets(interaction: discord.Interaction):
 
         week_value = int((row.get("g_week") if row.get("g_week") is not None else row.get("week")) or 0) + 1
         stage_value = int((row.get("g_stage_index") if row.get("g_stage_index") is not None else row.get("stage_index")) or 0)
-        stage_label = STAGE_LABELS.get(stage_value, f"Stage {stage_value}")
-        if stage_value == 2:
-            slate_label = f"Week {week_value}"
-        elif stage_value == 1:
-            slate_label = f"Preseason Week {week_value}"
-        else:
-            slate_label = f"{stage_label} Week {week_value}"
+        slate_label = sportsbook_stage_label(stage_value, week_value)
 
         lines.append(
             f"**<@{row['user_id']}>** — {fmt_tokens(float(row['amount']))} on **{row['team_name']}** at **{float(row['multiplier']):.2f}x**\n"
