@@ -1500,7 +1500,7 @@ async def profile(interaction: discord.Interaction, user: Optional[discord.Membe
     if interaction.response.is_done():
         await interaction.followup.send(embed=embed)
     else:
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="ping", description="Check if the bot is online.")
 async def ping(interaction: discord.Interaction):
@@ -4382,8 +4382,16 @@ def get_current_season_index() -> int:
     return int(row.get("season_index") or 0)
 
 
+def detect_current_sportsbook_stage_and_week() -> tuple[Optional[int], Optional[int]]:
+    # Prefer regular season once regular season games exist in the current season.
+    regular_week = detect_display_week_for_stage(2)
+    if regular_week is not None:
+        return 2, regular_week
+    return detect_current_stage_and_week()
+
+
 def fetch_upcoming_games_for_current_week():
-    stage_index, display_week = detect_current_stage_and_week()
+    stage_index, display_week = detect_current_sportsbook_stage_and_week()
     if stage_index is None or display_week is None:
         return []
     return fetch_games_for_stage_week(stage_index, display_week)
@@ -4451,7 +4459,7 @@ def implied_multiplier_for_game_side(game_row, team_id: int) -> float:
 
 def build_sportsbook_embed() -> discord.Embed:
     games = fetch_upcoming_games_for_current_week()
-    stage_index, display_week = detect_current_stage_and_week()
+    stage_index, display_week = detect_current_sportsbook_stage_and_week()
     if not games:
         return build_embed("🎟️ Sportsbook", "No upcoming games found for the current week.", 0x5865F2)
 
@@ -4472,7 +4480,7 @@ def build_sportsbook_embed() -> discord.Embed:
 
 def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
     season_index = get_current_season_index()
-    stage_index, display_week = detect_current_stage_and_week()
+    stage_index, display_week = detect_current_sportsbook_stage_and_week()
     if stage_index is None or display_week is None:
         return 0, 0, []
     raw_week = max(display_week - 1, 0)
@@ -4824,6 +4832,8 @@ def fetch_open_sportsbook_bets(limit: int = 50):
                     b.*,
                     g.away_team_id,
                     g.home_team_id,
+                    g.stage_index AS g_stage_index,
+                    g.week AS g_week,
                     away.team_name AS away_team_name,
                     home.team_name AS home_team_name
                 FROM bot_sportsbook_bets b
@@ -4865,8 +4875,8 @@ async def activebets(interaction: discord.Interaction):
         if away_name and home_name:
             matchup = f"{away_name} at {home_name}"
 
-        week_value = int(row.get("week") or 0) + 1
-        stage_value = int(row.get("stage_index") or 0)
+        week_value = int((row.get("g_week") if row.get("g_week") is not None else row.get("week")) or 0) + 1
+        stage_value = int((row.get("g_stage_index") if row.get("g_stage_index") is not None else row.get("stage_index")) or 0)
         stage_label = STAGE_LABELS.get(stage_value, f"Stage {stage_value}")
         if stage_value == 2:
             slate_label = f"Week {week_value}"
@@ -4999,7 +5009,7 @@ async def bet(interaction: discord.Interaction, team: str, amount: float):
         return
 
     games = fetch_upcoming_games_for_current_week()
-    stage_index, display_week = detect_current_stage_and_week()
+    stage_index, display_week = detect_current_sportsbook_stage_and_week()
     season_index = get_current_season_index()
     raw_week = max((display_week or 1) - 1, 0)
     chosen = None
@@ -5049,10 +5059,11 @@ async def bet(interaction: discord.Interaction, team: str, amount: float):
 @bot.tree.command(name="settlebets", description="Admin: settle sportsbook bets for the current completed slate.")
 @admin_only()
 async def settlebets(interaction: discord.Interaction):
+    await interaction.response.defer()
     init_extra_feature_tables()
     settled, paid, details = settle_open_bets_for_current_week()
     if not details:
-        await interaction.response.send_message("No open completed bets were available to settle.", ephemeral=True)
+        await interaction.followup.send("No open completed bets were available to settle.", ephemeral=True)
         return
 
     lines = []
