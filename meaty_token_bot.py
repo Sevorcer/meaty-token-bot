@@ -1497,7 +1497,10 @@ async def profile(interaction: discord.Interaction, user: Optional[discord.Membe
     except Exception as exc:
         await interaction.response.send_message(f"Failed to build profile: {exc}", ephemeral=True)
         return
-    await interaction.followup.send(embed=embed)
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed)
+    else:
+        await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="ping", description="Check if the bot is online.")
 async def ping(interaction: discord.Interaction):
@@ -3477,6 +3480,14 @@ async def create_week_channels(
 
         await channel.send("\n".join(message_lines))
 
+        try:
+            weekly_rivalries = generate_weekly_rivalries(game_stage_index, game_week) if game_stage_index == 2 else []
+            rivalry_game_ids = {int(r["game_id"]) for r in weekly_rivalries}
+            if int(game_id) in rivalry_game_ids:
+                await channel.send("🔥 **This matchup has been tagged as a Rivalry Game.**")
+        except Exception as exc:
+            await channel.send(f"Rivalry tag lookup failed: {exc}")
+
         if AUTO_POST_MATCHUP_PREVIEWS:
             try:
                 preview_text, used_ai = await generate_matchup_preview_text(game, is_gotw)
@@ -4582,25 +4593,173 @@ def detect_display_week_for_stage(stage_index: int) -> Optional[int]:
     return max(progress.keys()) + 1
 
 
+
+def ensure_weekly_rivalries_table():
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_weekly_rivalries (
+                    season_index INTEGER NOT NULL,
+                    stage_index INTEGER NOT NULL,
+                    week INTEGER NOT NULL,
+                    game_id BIGINT NOT NULL,
+                    away_team_id BIGINT NOT NULL,
+                    home_team_id BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (season_index, stage_index, week, game_id)
+                )
+                """
+            )
+            conn.commit()
+
+
+def fetch_existing_weekly_rivalries(stage_index: int, display_week: int):
+    ensure_weekly_rivalries_table()
+    raw_week = max(int(display_week) - 1, 0)
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.*, g.away_team_name, g.home_team_name
+                FROM bot_weekly_rivalries r
+                LEFT JOIN (
+                    SELECT
+                        game_id,
+                        season_index,
+                        stage_index,
+                        week,
+                        away_team_id,
+                        home_team_id,
+                        away.team_name AS away_team_name,
+                        home.team_name AS home_team_name
+                    FROM games
+                    JOIN teams away ON away.team_id = games.away_team_id
+                    JOIN teams home ON home.team_id = games.home_team_id
+                ) g
+                  ON g.game_id = r.game_id
+                 AND g.season_index = r.season_index
+                 AND g.stage_index = r.stage_index
+                 AND g.week = r.week
+                WHERE r.season_index = (SELECT COALESCE(MAX(season_index), 0) FROM games)
+                  AND r.stage_index = %s
+                  AND r.week = %s
+                ORDER BY r.game_id ASC
+                """,
+                (int(stage_index), raw_week),
+            )
+            return cur.fetchall()
+
+
+def fetch_rivalry_count_map_for_season(season_index: int):
+    ensure_weekly_rivalries_table()
+    counts = {}
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT away_team_id, home_team_id
+                FROM bot_weekly_rivalries
+                WHERE season_index = %s AND stage_index = 2
+                """,
+                (int(season_index),),
+            )
+            for row in cur.fetchall():
+                counts[int(row["away_team_id"])] = counts.get(int(row["away_team_id"]), 0) + 1
+                counts[int(row["home_team_id"])] = counts.get(int(row["home_team_id"]), 0) + 1
+    return counts
+
+
+def is_divisional_matchup(game) -> bool:
+    away_team = resolve_team_row(str(game.get("away_team_name") or ""))
+    home_team = resolve_team_row(str(game.get("home_team_name") or ""))
+    if not away_team or not home_team:
+        return False
+    away_div = safe_text(away_team.get("division_name")).lower()
+    home_div = safe_text(home_team.get("division_name")).lower()
+    away_conf = safe_text(away_team.get("conference_name")).lower()
+    home_conf = safe_text(home_team.get("conference_name")).lower()
+    return bool(away_div and away_div == home_div and away_conf == home_conf)
+
+
+def generate_weekly_rivalries(stage_index: int, display_week: int):
+    ensure_weekly_rivalries_table()
+    if int(stage_index) != 2:
+        return []
+
+    existing = fetch_existing_weekly_rivalries(stage_index, display_week)
+    if existing:
+        return existing
+
+    games = fetch_games_for_stage_week(stage_index, display_week)
+    if not games:
+        return []
+
+    season_index = max(int(g.get("season_index") or 0) for g in games)
+    counts = fetch_rivalry_count_map_for_season(season_index)
+
+    divisional_games = [g for g in games if is_divisional_matchup(g)]
+    if not divisional_games:
+        return []
+
+    def score_game(game):
+        away_id = int(game["away_team_id"])
+        home_id = int(game["home_team_id"])
+        away_count = counts.get(away_id, 0)
+        home_count = counts.get(home_id, 0)
+        if away_count >= 4 or home_count >= 4:
+            return -9999
+        wins_score = int(game.get("away_wins") or 0) + int(game.get("home_wins") or 0)
+        win_pct_score = float(game.get("away_win_pct") or 0) + float(game.get("home_win_pct") or 0)
+        scarcity_bonus = max(0, 2 - away_count) + max(0, 2 - home_count)
+        return (scarcity_bonus * 100) + (wins_score * 10) + int(win_pct_score * 100)
+
+    divisional_games.sort(key=score_game, reverse=True)
+
+    selected = []
+    used_teams = set()
+    for game in divisional_games:
+        away_id = int(game["away_team_id"])
+        home_id = int(game["home_team_id"])
+        if score_game(game) < 0:
+            continue
+        if away_id in used_teams or home_id in used_teams:
+            continue
+        selected.append(game)
+        used_teams.add(away_id)
+        used_teams.add(home_id)
+
+    raw_week = max(int(display_week) - 1, 0)
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            for game in selected:
+                cur.execute(
+                    """
+                    INSERT INTO bot_weekly_rivalries (
+                        season_index, stage_index, week, game_id, away_team_id, home_team_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (
+                        season_index,
+                        int(stage_index),
+                        raw_week,
+                        int(game["game_id"]),
+                        int(game["away_team_id"]),
+                        int(game["home_team_id"]),
+                    ),
+                )
+            conn.commit()
+
+    return fetch_existing_weekly_rivalries(stage_index, display_week)
+
+
 def fetch_weekly_rivalry_games_for_current_week():
     stage_index = 2
     display_week = detect_display_week_for_stage(stage_index)
     if display_week is None:
         return []
-    games = fetch_games_for_stage_week(stage_index, display_week)
-    rivalry_games = []
-    for game in games:
-        away_team = resolve_team_row(str(game.get("away_team_name") or ""))
-        home_team = resolve_team_row(str(game.get("home_team_name") or ""))
-        if not away_team or not home_team:
-            continue
-        away_div = safe_text(away_team.get("division_name")).lower()
-        home_div = safe_text(home_team.get("division_name")).lower()
-        away_conf = safe_text(away_team.get("conference_name")).lower()
-        home_conf = safe_text(home_team.get("conference_name")).lower()
-        if away_div and away_div == home_div and away_conf == home_conf:
-            rivalry_games.append(game)
-    return rivalry_games
+    return generate_weekly_rivalries(stage_index, display_week)
 
 
 def build_weekly_rivalries_embed(display_week: Optional[int] = None, phase: Optional[str] = None) -> discord.Embed:
@@ -4612,24 +4771,11 @@ def build_weekly_rivalries_embed(display_week: Optional[int] = None, phase: Opti
     if display_week is None:
         return build_embed("🔥 Weekly Rivalries", "No games found for the selected phase/week.", 0xE67E22)
 
-    games = fetch_games_for_stage_week(stage_index, display_week)
     title = f"🔥 Weekly Rivalries — {stage_week_label(stage_index, display_week)}"
-
-    rivalry_games = []
-    for game in games:
-        away_team = resolve_team_row(str(game.get("away_team_name") or ""))
-        home_team = resolve_team_row(str(game.get("home_team_name") or ""))
-        if not away_team or not home_team:
-            continue
-        away_div = safe_text(away_team.get("division_name")).lower()
-        home_div = safe_text(home_team.get("division_name")).lower()
-        away_conf = safe_text(away_team.get("conference_name")).lower()
-        home_conf = safe_text(home_team.get("conference_name")).lower()
-        if away_div and away_div == home_div and away_conf == home_conf:
-            rivalry_games.append(game)
+    rivalry_games = generate_weekly_rivalries(stage_index, display_week)
 
     if not rivalry_games:
-        return build_embed(title, "No rivalry games detected for the selected phase/week.", 0xE67E22)
+        return build_embed(title, "No rivalry games assigned for the selected phase/week.", 0xE67E22)
 
     lines = []
     for game in rivalry_games:
@@ -4737,7 +4883,7 @@ async def activebets(interaction: discord.Interaction):
     embed = build_embed("🎟️ Active Sportsbook Bets", "\n\n".join(lines), 0x5865F2)
     if len(rows) > 25:
         embed.set_footer(text=f"Showing 25 of {len(rows)} open bets.")
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 
@@ -4784,7 +4930,7 @@ async def powerrankings(interaction: discord.Interaction):
             f"PF: {safe_int(row.get('pts_for'))} | PA: {safe_int(row.get('pts_against'))} | TO: {safe_int(row.get('turnover_diff')):+d} | Score: {score:.1f}"
         )
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=build_embed("📈 Power Rankings", "\n".join(lines), 0xF39C12)
     )
 
@@ -4815,13 +4961,14 @@ def build_storyline_blurbs() -> list[str]:
 
 @bot.tree.command(name="storylines", description="Show current league storylines.")
 async def storylines(interaction: discord.Interaction):
+    await interaction.response.defer()
     try:
         blurbs = build_storyline_blurbs()
     except Exception as exc:
-        await interaction.response.send_message(f"Failed to load storylines: {exc}", ephemeral=True)
+        await interaction.followup.send(f"Failed to load storylines: {exc}", ephemeral=True)
         return
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=build_embed("📰 League Storylines", "\n\n".join(blurbs), 0x1ABC9C)
     )
 
