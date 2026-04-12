@@ -34,6 +34,10 @@ TRADE_REVIEW_CHANNEL_ID = int(os.getenv("TRADE_REVIEW_CHANNEL_ID", "0"))
 TRADE_ANNOUNCEMENTS_CHANNEL_ID = int(os.getenv("TRADE_ANNOUNCEMENTS_CHANNEL_ID", "0"))
 TRADE_REQUIRED_APPROVALS = int(os.getenv("TRADE_REQUIRED_APPROVALS", "2"))
 TRADE_REQUIRED_DENIALS = int(os.getenv("TRADE_REQUIRED_DENIALS", "2"))
+LEVEL_UP_CHANNEL_ID = int(os.getenv("LEVEL_UP_CHANNEL_ID", "0"))
+XP_COOLDOWN_SECONDS = int(os.getenv("XP_COOLDOWN_SECONDS", "45"))
+XP_MIN_MESSAGE_LEN = int(os.getenv("XP_MIN_MESSAGE_LEN", "8"))
+XP_BLACKLIST_CHANNEL_IDS = {int(x.strip()) for x in os.getenv("XP_BLACKLIST_CHANNEL_IDS", "").split(",") if x.strip()}
 
 ADMIN_ROLE_NAMES = {"Commissioner", "Admin", "COMMISH"}
 
@@ -136,6 +140,7 @@ BLACKJACK_FINISHED_DELETE_DELAY = 180
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -250,6 +255,17 @@ class TokenDatabase:
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         UNIQUE (trade_id, voter_user_id)
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_xp_users (
+                        user_id BIGINT PRIMARY KEY,
+                        username TEXT NOT NULL,
+                        xp INTEGER NOT NULL DEFAULT 0,
+                        level INTEGER NOT NULL DEFAULT 1,
+                        messages_counted INTEGER NOT NULL DEFAULT 0,
+                        last_xp_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
                 """)
             conn.commit()
@@ -533,6 +549,53 @@ class TokenDatabase:
             conn.commit()
             return True
 
+
+    def ensure_xp_user(self, user: discord.abc.User):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bot_xp_users (user_id, username, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (user_id) DO UPDATE
+                    SET username = EXCLUDED.username, updated_at = NOW()
+                    """,
+                    (int(user.id), str(user)),
+                )
+            conn.commit()
+
+    def get_xp_user(self, user: discord.abc.User):
+        self.ensure_xp_user(user)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_xp_users WHERE user_id = %s", (int(user.id),))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def update_xp_progress(self, user: discord.abc.User, xp: int, level: int, messages_counted: int, last_xp_at: float):
+        self.ensure_xp_user(user)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE bot_xp_users
+                    SET xp = %s,
+                        level = %s,
+                        messages_counted = %s,
+                        last_xp_at = %s,
+                        username = %s,
+                        updated_at = NOW()
+                    WHERE user_id = %s
+                    """,
+                    (int(xp), int(level), int(messages_counted), float(last_xp_at), str(user), int(user.id)),
+                )
+            conn.commit()
+
+    def xp_leaderboard(self):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_xp_users ORDER BY level DESC, xp DESC, messages_counted DESC, username ASC")
+                return [dict(row) for row in cur.fetchall()]
 
     def create_trade(
         self,
@@ -1551,6 +1614,73 @@ def format_leader_lines(rows, stat_key: str, stat_label: str):
     return lines
 
 
+def xp_required_for_level(level: int) -> int:
+    if level <= 1:
+        return 0
+    return int(round(100 * ((level - 1) ** 1.5)))
+
+
+def level_from_xp(xp: int) -> int:
+    level = 1
+    while xp >= xp_required_for_level(level + 1):
+        level += 1
+    return level
+
+
+def xp_progress_text(xp: int) -> tuple[int, int, int]:
+    level = level_from_xp(xp)
+    current_floor = xp_required_for_level(level)
+    next_floor = xp_required_for_level(level + 1)
+    needed = max(next_floor - current_floor, 1)
+    progress = xp - current_floor
+    return level, progress, needed
+
+
+def level_reward(level: int) -> tuple[int, str]:
+    token_rewards = {
+        2: 1, 4: 1, 6: 2, 8: 2, 10: 3,
+        12: 2, 14: 2, 16: 3, 18: 3, 20: 4,
+        22: 3, 24: 3, 26: 4, 28: 4, 30: 5,
+        32: 4, 34: 4, 36: 5, 38: 5, 40: 6,
+        42: 5, 44: 5, 46: 6, 48: 6, 50: 10,
+    }
+    bonus_notes = {
+        10: "Prize Wheel spin voucher",
+        20: "Mystery Crate voucher",
+        30: "Boom or Bust voucher",
+        40: "Prize Wheel spin voucher",
+        50: "Premium reward voucher",
+    }
+    return token_rewards.get(level, 0), bonus_notes.get(level, "")
+
+
+async def post_level_up_announcement(guild: Optional[discord.Guild], user: discord.abc.User, level: int, token_reward: int, bonus_note: str):
+    if not guild or not LEVEL_UP_CHANNEL_ID:
+        return
+    channel = guild.get_channel(LEVEL_UP_CHANNEL_ID)
+    if channel is None:
+        try:
+            fetched = await bot.fetch_channel(LEVEL_UP_CHANNEL_ID)
+            if isinstance(fetched, discord.abc.Messageable):
+                channel = fetched
+        except Exception:
+            return
+    if channel is None:
+        return
+
+    desc = f"🎉 {user.mention} leveled up to **Level {level}**"
+    if token_reward > 0:
+        desc += f" and earned **{token_reward}** token{'s' if token_reward != 1 else ''}"
+    desc += "!"
+    if bonus_note:
+        desc += f"\n**Bonus to honor:** {bonus_note}"
+
+    try:
+        await channel.send(embed=build_embed("⬆️ Level Up!", desc, 0x57F287))
+    except Exception:
+        pass
+
+
 # -----------------------------
 # Blackjack
 # -----------------------------
@@ -1909,6 +2039,55 @@ class PrizeResult:
 # Bot events
 # -----------------------------
 @bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+
+    if message.channel.id in XP_BLACKLIST_CHANNEL_IDS:
+        return
+
+    content = (message.content or "").strip()
+    if len(content) < XP_MIN_MESSAGE_LEN:
+        return
+
+    row = TOKEN_DB.get_xp_user(message.author)
+    now_ts = message.created_at.timestamp()
+    last_xp_at = float((row or {}).get("last_xp_at") or 0)
+    if now_ts - last_xp_at < XP_COOLDOWN_SECONDS:
+        return
+
+    gained = random.randint(15, 25)
+    new_xp = int((row or {}).get("xp") or 0) + gained
+    old_level = int((row or {}).get("level") or 1)
+    new_level = level_from_xp(new_xp)
+    new_messages = int((row or {}).get("messages_counted") or 0) + 1
+
+    TOKEN_DB.update_xp_progress(message.author, new_xp, new_level, new_messages, now_ts)
+
+    if new_level > old_level:
+        total_tokens = 0
+        bonus_notes = []
+        for reached_level in range(old_level + 1, new_level + 1):
+            token_reward, bonus_note = level_reward(reached_level)
+            if token_reward > 0:
+                total_tokens += token_reward
+                TOKEN_DB.add_tokens(message.author, token_reward, f"Level {reached_level} reward", "leveling")
+            if bonus_note:
+                bonus_notes.append(bonus_note)
+            await post_level_up_announcement(message.guild, message.author, reached_level, token_reward, bonus_note)
+
+        if total_tokens > 0 or bonus_notes:
+            summary = f"{message.author.mention} leveled up to **Level {new_level}**"
+            if total_tokens > 0:
+                summary += f" and earned **{fmt_tokens(total_tokens)}** token{'s' if total_tokens != 1 else ''}"
+            if bonus_notes:
+                summary += f" | Bonus: {', '.join(bonus_notes)}"
+            await send_log_message(f"📈 LEVEL UP: {summary}")
+
+    await bot.process_commands(message)
+
+
+@bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
     print(f"LOG_CHANNEL_ID: {LOG_CHANNEL_ID}")
@@ -1916,6 +2095,7 @@ async def on_ready():
     print(f"NEWS_CHANNEL_ID: {NEWS_CHANNEL_ID}")
     print(f"OPENAI_API_KEY set: {'yes' if OPENAI_API_KEY else 'no'}")
     print(f"DATABASE_URL set: {'yes' if DATABASE_URL else 'no'}")
+    print(f"LEVEL_UP_CHANNEL_ID: {LEVEL_UP_CHANNEL_ID}")
     bot.add_view(TradeReviewView())
     try:
         if GUILD_IDS:
@@ -2354,6 +2534,41 @@ async def leaderboard(interaction: discord.Interaction):
         await interaction.followup.send(
             embed=build_embed(f"🏆 Token Leaderboard (Page {page_num})", chunk, 0xFEE75C)
         )
+
+
+@bot.tree.command(name="xprank", description="Show your current XP rank and progress.")
+@app_commands.describe(user="Optional: check another user's rank")
+async def xprank(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    row = TOKEN_DB.get_xp_user(target)
+    xp = int((row or {}).get("xp") or 0)
+    level, progress, needed = xp_progress_text(xp)
+    desc = (
+        f"**Level:** {level}\n"
+        f"**XP:** {xp}\n"
+        f"**Progress to next level:** {progress}/{needed}\n"
+        f"**Messages Counted:** {(row or {}).get('messages_counted', 0)}"
+    )
+    await interaction.response.send_message(embed=build_embed(f"📈 {target.display_name}'s Rank", desc, 0x5865F2))
+
+
+@bot.tree.command(name="xpleaderboard", description="Show the server XP leaderboard.")
+async def xpleaderboard(interaction: discord.Interaction):
+    rows = TOKEN_DB.xp_leaderboard()
+    rows = [row for row in rows if int(row.get("xp") or 0) > 0][:25]
+    if not rows:
+        await interaction.response.send_message("No XP data found yet.")
+        return
+
+    lines = []
+    for idx, row in enumerate(rows, start=1):
+        lines.append(
+            f"**{idx}.** <@{row['user_id']}> — Level **{row['level']}** | XP **{row['xp']}** | Messages **{row['messages_counted']}**"
+        )
+
+    await interaction.response.send_message(
+        embed=build_embed("📚 XP Leaderboard", "\n".join(lines), 0xFEE75C)
+    )
 
 
 @bot.tree.command(name="history", description="Show your most recent token activity.")
@@ -5841,6 +6056,11 @@ def build_storyline_blurbs() -> list[str]:
     if second is not None:
         blurbs.insert(1, f"**Closest challenger:** {safe_text(second.get('team_name'))} is right there at {wins_losses_ties_text(second)} and keeping pressure on the top spot.")
     return blurbs[:6]
+
+
+@bot.tree.command(name="powerrankings", description="Show current league power rankings.")
+async def powerrankings_alias(interaction: discord.Interaction):
+    await powerrankings(interaction)
 
 
 @bot.tree.command(name="storylines", description="Show current league storylines.")
