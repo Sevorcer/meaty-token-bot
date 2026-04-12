@@ -38,27 +38,27 @@ TRADE_REQUIRED_DENIALS = int(os.getenv("TRADE_REQUIRED_DENIALS", "2"))
 ADMIN_ROLE_NAMES = {"Commissioner", "Admin", "COMMISH"}
 
 STAGE_LABELS = {
-    1: "Preseason",
-    2: "Regular Season",
-    3: "Wild Card",
-    4: "Divisional",
-    5: "Conference Championship",
-    6: "Super Bowl",
-    7: "Offseason",
+    0: "Preseason",
+    1: "Regular Season",
+    2: "Wild Card",
+    3: "Divisional",
+    4: "Conference Championship",
+    5: "Super Bowl",
+    6: "Offseason",
 }
 STAGE_PARSE_MAP = {
     "auto": None,
-    "preseason": 1,
-    "regular": 2,
-    "regular season": 2,
-    "wild card": 3,
-    "wildcard": 3,
-    "divisional": 4,
-    "conference": 5,
-    "conference championship": 5,
-    "super bowl": 6,
-    "superbowl": 6,
-    "offseason": 7,
+    "preseason": 0,
+    "regular": 1,
+    "regular season": 1,
+    "wild card": 2,
+    "wildcard": 2,
+    "divisional": 3,
+    "conference": 4,
+    "conference championship": 4,
+    "super bowl": 5,
+    "superbowl": 5,
+    "offseason": 6,
 }
 COMPLETE_GAME_STATUS_VALUES = {2, 4, 5, 6, 7, 8}
 
@@ -879,27 +879,27 @@ def stage_display_name(stage_index: int) -> str:
 
 def stage_channel_prefix(stage_index: int) -> str:
     return {
-        1: "pre-wk",
-        2: "wk",
-        3: "wc",
-        4: "div",
-        5: "conf",
-        6: "sb",
+        0: "pre-wk",
+        1: "wk",
+        2: "wc",
+        3: "div",
+        4: "conf",
+        5: "sb",
     }.get(stage_index, f"s{stage_index}-w")
 
 
 def stage_week_label(stage_index: int, display_week: int) -> str:
-    if stage_index == 2:
-        return f"Week {display_week}"
     if stage_index == 1:
+        return f"Week {display_week}"
+    if stage_index == 0:
         return f"Preseason Week {display_week}"
-    if stage_index == 3:
+    if stage_index == 2:
         return f"Wild Card Week {display_week}"
-    if stage_index == 4:
+    if stage_index == 3:
         return f"Divisional Week {display_week}"
-    if stage_index == 5:
+    if stage_index == 4:
         return f"Conference Championship Week {display_week}"
-    if stage_index == 6:
+    if stage_index == 5:
         return "Super Bowl"
     return f"{stage_display_name(stage_index)} Week {display_week}"
 
@@ -1968,7 +1968,7 @@ def compute_profile_gotw_count(team_id: int) -> int:
                     """
                     SELECT DISTINCT week
                     FROM games
-                    WHERE season_index = %s AND stage_index = 2
+                    WHERE season_index = %s AND stage_index = 1
                     ORDER BY week ASC
                     """,
                     (season_index,),
@@ -1976,7 +1976,7 @@ def compute_profile_gotw_count(team_id: int) -> int:
                 weeks = [int(r["week"]) for r in cur.fetchall()]
         count = 0
         for raw_week in weeks:
-            games = fetch_games_for_stage_week(2, raw_week + 1)
+            games = fetch_games_for_stage_week(1, raw_week + 1)
             if not games:
                 continue
             scored = sorted(games, key=compute_matchup_score, reverse=True)
@@ -2001,7 +2001,7 @@ def compute_profile_rivalry_count(team_id: int) -> int:
                     JOIN teams away ON away.team_id = g.away_team_id
                     JOIN teams home ON home.team_id = g.home_team_id
                     WHERE g.season_index = (SELECT MAX(season_index) FROM games)
-                      AND g.stage_index = 2
+                      AND g.stage_index = 1
                       AND (g.away_team_id = %s OR g.home_team_id = %s)
                       AND lower(COALESCE(away.conference_name, '')) = lower(COALESCE(home.conference_name, ''))
                       AND lower(COALESCE(away.division_name, '')) = lower(COALESCE(home.division_name, ''))
@@ -2023,7 +2023,7 @@ def compute_team_streak(team_id: int) -> tuple[str, int]:
                     SELECT away_team_id, home_team_id, away_score, home_score, status, week, game_id
                     FROM games
                     WHERE season_index = (SELECT MAX(season_index) FROM games)
-                      AND stage_index = 2
+                      AND stage_index = 1
                       AND (away_team_id = %s OR home_team_id = %s)
                     ORDER BY week DESC, game_id DESC
                     """,
@@ -4304,7 +4304,7 @@ async def create_week_channels(
         await channel.send("\n".join(message_lines))
 
         try:
-            weekly_rivalries = generate_weekly_rivalries(game_stage_index, game_week) if game_stage_index == 2 else []
+            weekly_rivalries = generate_weekly_rivalries(game_stage_index, game_week) if game_stage_index == 1 else []
             rivalry_game_ids = {int(r["game_id"]) for r in weekly_rivalries}
             if int(game_id) in rivalry_game_ids:
                 await channel.send("🔥 **This matchup has been tagged as a Rivalry Game.**")
@@ -5511,7 +5511,7 @@ def fetch_rivalry_count_map_for_season(season_index: int):
                 """
                 SELECT away_team_id, home_team_id
                 FROM bot_weekly_rivalries
-                WHERE season_index = %s AND stage_index = 2
+                WHERE season_index = %s AND stage_index = 1
                 """,
                 (int(season_index),),
             )
@@ -5535,7 +5535,7 @@ def is_divisional_matchup(game) -> bool:
 
 def generate_weekly_rivalries(stage_index: int, display_week: int):
     ensure_weekly_rivalries_table()
-    if int(stage_index) != 2:
+    if int(stage_index) != 1:
         return []
 
     existing = fetch_existing_weekly_rivalries(stage_index, display_week)
@@ -5606,7 +5606,7 @@ def generate_weekly_rivalries(stage_index: int, display_week: int):
 
 
 def fetch_weekly_rivalry_games_for_current_week():
-    stage_index = 2
+    stage_index = 1
     display_week = detect_display_week_for_stage(stage_index)
     if display_week is None:
         return []
@@ -5614,9 +5614,9 @@ def fetch_weekly_rivalry_games_for_current_week():
 
 
 def build_weekly_rivalries_embed(display_week: Optional[int] = None, phase: Optional[str] = None) -> discord.Embed:
-    stage_index = parse_phase_to_stage_index(phase) if phase else 2
+    stage_index = parse_phase_to_stage_index(phase) if phase else 1
     if stage_index is None:
-        stage_index = 2
+        stage_index = 1
     if display_week is None:
         display_week = detect_display_week_for_stage(stage_index)
     if display_week is None:
