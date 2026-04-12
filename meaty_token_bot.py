@@ -1579,7 +1579,7 @@ async def player(interaction: discord.Interaction, name: str):
         f"🔎 Player Search: {name}",
         "\n".join(
             f"**{idx}.** {safe_text(row.get('full_name'))} — {safe_text(row.get('team_name'), 'Free Agent')} | "
-            f"{safe_text(row.get('position'))} | {safe_int(row.get('overall_rating'))} OVR | "
+            f"{safe_text(row.get('position'))} | {resolve_display_overall(row)} OVR | "
             f"{dev_trait_to_label(row.get('dev_trait'), row.get('resolved_dev_trait_label') or row.get('dev_trait_label'))}"
             for idx, row in enumerate(results[:10], start=1)
         ),
@@ -2484,6 +2484,18 @@ def safe_text(value, default: str = "Unknown") -> str:
     return text or default
 
 
+def resolve_display_overall(row: dict) -> int:
+    overall = safe_int(row.get("overall_rating"))
+    if overall > 0:
+        return overall
+
+    best = safe_int(row.get("player_best_ovr"))
+    if best > 0:
+        return best
+
+    return 0
+
+
 def dev_trait_to_label(raw_value, existing_label: Optional[str] = None) -> str:
     if existing_label:
         return existing_label
@@ -2646,7 +2658,7 @@ def build_player_embed(row: dict) -> discord.Embed:
 
     embed = build_embed(
         title,
-        f"**{position}** • **{team_name}** • **{safe_int(row.get('overall_rating'))} OVR** • **{dev_label}**",
+        f"**{position}** • **{team_name}** • **{resolve_display_overall(row)} OVR** • **{dev_label}**",
         0x5865F2,
     )
     embed.add_field(
@@ -2702,7 +2714,7 @@ def build_roster_embed(team_row: dict, roster_rows: list[dict], page: int) -> di
             dev_label = dev_trait_to_label(row.get("dev_trait"), row.get("resolved_dev_trait_label") or row.get("dev_trait_label"))
             lines.append(
                 f"**{idx}.** {safe_text(row.get('full_name'))} — {safe_text(row.get('position'))} | "
-                f"{safe_int(row.get('overall_rating'))} OVR | {dev_label}"
+                f"{resolve_display_overall(row)} OVR | {dev_label}"
             )
         description = "\n".join(lines)
 
