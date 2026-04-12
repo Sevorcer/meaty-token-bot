@@ -5328,39 +5328,61 @@ def build_sportsbook_embed() -> discord.Embed:
 
 def settle_open_bets_for_current_week() -> tuple[int, int, list[dict], int, int]:
     season_index = get_current_season_index()
-    stage_index, display_week = detect_current_sportsbook_stage_and_week()
-    if stage_index is None or display_week is None:
-        return 0, 0, [], 0, 0
-    raw_week = max(display_week - 1, 0)
-    games = fetch_games_for_stage_week(stage_index, display_week)
-    all_game_map = {int(g["game_id"]): g for g in games}
-    game_map = {int(g["game_id"]): g for g in games if looks_like_completed_game(g)}
 
     settled = 0
     paid = 0
     skipped_unplayed = 0
     skipped_missing = 0
     details: list[dict] = []
+
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT * FROM bot_sportsbook_bets
-                WHERE season_index = %s AND stage_index = %s AND week = %s AND status = 'open'
-                ORDER BY id ASC
+                SELECT
+                    b.*,
+                    g.away_team_id,
+                    g.home_team_id,
+                    g.away_score,
+                    g.home_score,
+                    g.status AS game_status,
+                    g.stage_index AS game_stage_index,
+                    g.week AS game_week,
+                    away.team_name AS away_team_name,
+                    home.team_name AS home_team_name
+                FROM bot_sportsbook_bets b
+                LEFT JOIN games g
+                    ON g.game_id = b.game_id
+                   AND g.season_index = b.season_index
+                LEFT JOIN teams away ON away.team_id = g.away_team_id
+                LEFT JOIN teams home ON home.team_id = g.home_team_id
+                WHERE b.status = 'open'
+                  AND b.season_index = %s
+                ORDER BY b.id ASC
                 """,
-                (season_index, stage_index, raw_week),
+                (season_index,),
             )
             bets = cur.fetchall()
 
             for bet in bets:
-                game_id = int(bet["game_id"])
-                all_game = all_game_map.get(game_id)
-                game = game_map.get(game_id)
-                if all_game is None:
+                if bet.get("away_team_id") is None or bet.get("home_team_id") is None:
                     skipped_missing += 1
                     continue
-                if game is None:
+
+                game = {
+                    "game_id": bet.get("game_id"),
+                    "away_team_id": bet.get("away_team_id"),
+                    "home_team_id": bet.get("home_team_id"),
+                    "away_score": bet.get("away_score"),
+                    "home_score": bet.get("home_score"),
+                    "status": bet.get("game_status"),
+                    "stage_index": bet.get("game_stage_index"),
+                    "week": bet.get("game_week"),
+                    "away_team_name": bet.get("away_team_name") or "Unknown Away",
+                    "home_team_name": bet.get("home_team_name") or "Unknown Home",
+                }
+
+                if not looks_like_completed_game(game):
                     skipped_unplayed += 1
                     continue
 
@@ -5385,7 +5407,7 @@ def settle_open_bets_for_current_week() -> tuple[int, int, list[dict], int, int]
                         """
                         INSERT INTO bot_users (user_id, username)
                         VALUES (%s, %s)
-                        ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
+                        ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
                         """,
                         (int(bet["user_id"]), bet["username"]),
                     )
@@ -5393,8 +5415,7 @@ def settle_open_bets_for_current_week() -> tuple[int, int, list[dict], int, int]
                         """
                         UPDATE bot_users
                         SET balance = balance + %s,
-                            total_earned = total_earned + %s,
-                            updated_at = NOW()
+                            total_earned = total_earned + %s
                         WHERE user_id = %s
                         """,
                         (payout, payout, int(bet["user_id"])),
@@ -6070,7 +6091,7 @@ async def bet(interaction: discord.Interaction, team: str, amount: float):
     await interaction.response.send_message(f"✅ Bet placed: **{fmt_tokens(amount)}** on **{team_name}** at **{multiplier}x**.")
 
 
-@bot.tree.command(name="settlebets", description="Admin: settle sportsbook bets for the current completed slate.")
+@bot.tree.command(name="settlebets", description="Admin: settle all open sportsbook bets whose linked games are completed.")
 @admin_only()
 async def settlebets(interaction: discord.Interaction):
     await interaction.response.defer()
