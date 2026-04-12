@@ -1015,6 +1015,411 @@ def fetch_games_for_week(week: int, stage_index: Optional[int] = None):
     return fetch_games_for_stage_week(resolved_stage, week)
 
 
+
+
+_SCHEMA_COLUMN_CACHE: dict[str, set[str]] = {}
+
+
+def get_table_columns(table_name: str) -> set[str]:
+    cached = _SCHEMA_COLUMN_CACHE.get(table_name)
+    if cached is not None:
+        return cached
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = %s
+                """,
+                (table_name,),
+            )
+            cols = {str(row['column_name']) for row in cur.fetchall()}
+    _SCHEMA_COLUMN_CACHE[table_name] = cols
+    return cols
+
+
+def pick_existing_column(table_name: str, candidates: list[str]) -> Optional[str]:
+    cols = get_table_columns(table_name)
+    for candidate in candidates:
+        if candidate in cols:
+            return candidate
+    return None
+
+
+def _qualified_or_zero(alias: str, column_name: Optional[str]) -> str:
+    return f"COALESCE({alias}.{column_name}, 0)" if column_name else "0"
+
+
+def fetch_game_row_for_recap(stage_index: int, display_week: int, game_id: int) -> Optional[dict]:
+    raw_week = max(display_week - 1, 0)
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    g.game_id,
+                    g.week,
+                    (g.week + 1) AS display_week,
+                    g.stage_index,
+                    g.status,
+                    g.season_index,
+                    g.away_score,
+                    g.home_score,
+                    away.team_name AS away_team_name,
+                    home.team_name AS home_team_name,
+                    g.away_team_id,
+                    g.home_team_id,
+                    COALESCE(away_standings.wins, 0) AS away_wins,
+                    COALESCE(away_standings.losses, 0) AS away_losses,
+                    COALESCE(away_standings.ties, 0) AS away_ties,
+                    COALESCE(away_standings.win_pct, 0) AS away_win_pct,
+                    COALESCE(away.team_ovr, 0) AS away_ovr,
+                    COALESCE(home_standings.wins, 0) AS home_wins,
+                    COALESCE(home_standings.losses, 0) AS home_losses,
+                    COALESCE(home_standings.ties, 0) AS home_ties,
+                    COALESCE(home_standings.win_pct, 0) AS home_win_pct,
+                    COALESCE(home.team_ovr, 0) AS home_ovr
+                FROM games g
+                JOIN teams away ON away.team_id = g.away_team_id
+                JOIN teams home ON home.team_id = g.home_team_id
+                LEFT JOIN standings away_standings ON away_standings.team_id = g.away_team_id
+                LEFT JOIN standings home_standings ON home_standings.team_id = g.home_team_id
+                WHERE g.season_index = (SELECT MAX(season_index) FROM games)
+                  AND g.stage_index = %s
+                  AND g.week = %s
+                  AND g.game_id = %s
+                LIMIT 1
+                """,
+                (int(stage_index), int(raw_week), int(game_id)),
+            )
+            row = cur.fetchone()
+            return record_to_dict(row)
+
+
+def fetch_game_statlines_for_team(table_name: str, team_id: int, season_index: int, stage_index: int, raw_week: int, metric_candidates: dict[str, list[str]], sort_keys: list[str]) -> list[dict]:
+    alias = 's'
+    cols = get_table_columns(table_name)
+    roster_col = pick_existing_column(table_name, ['roster_id'])
+    full_name_col = pick_existing_column(table_name, ['full_name'])
+    team_col = pick_existing_column(table_name, ['team_id'])
+    season_col = pick_existing_column(table_name, ['season_index'])
+    stage_col = pick_existing_column(table_name, ['stage_index'])
+    week_col = pick_existing_column(table_name, ['week'])
+    select_parts = [
+        f"{alias}.{roster_col} AS roster_id" if roster_col else "NULL::bigint AS roster_id",
+        f"COALESCE(MAX(players.full_name), MAX({alias}.{full_name_col}), 'Unknown') AS player_name" if full_name_col else "COALESCE(MAX(players.full_name), 'Unknown') AS player_name",
+        "COALESCE(MAX(teams.team_name), 'Unknown Team') AS team_name",
+    ]
+    metric_select_names = []
+    for output_name, candidates in metric_candidates.items():
+        chosen = pick_existing_column(table_name, candidates)
+        select_parts.append(f"SUM({_qualified_or_zero(alias, chosen)}) AS {output_name}")
+        metric_select_names.append(output_name)
+    where_parts = []
+    params: list[object] = []
+    if team_col:
+        where_parts.append(f"COALESCE(players.team_id, {alias}.{team_col}) = %s")
+        params.append(int(team_id))
+    else:
+        where_parts.append("players.team_id = %s")
+        params.append(int(team_id))
+    if season_col:
+        where_parts.append(f"COALESCE({alias}.{season_col}, 0) = %s")
+        params.append(int(season_index))
+    if stage_col:
+        where_parts.append(f"COALESCE({alias}.{stage_col}, 0) = %s")
+        params.append(int(stage_index))
+    if week_col:
+        where_parts.append(f"COALESCE({alias}.{week_col}, 0) = %s")
+        params.append(int(raw_week))
+    order_parts = [f"{key} DESC" for key in sort_keys if key in metric_select_names]
+    order_parts.append('player_name ASC')
+    query = f"""
+        SELECT
+            {', '.join(select_parts)}
+        FROM {table_name} {alias}
+        LEFT JOIN players ON players.roster_id = {alias}.{roster_col if roster_col else 'roster_id'}
+        LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, {alias}.{team_col})
+        WHERE {' AND '.join(where_parts)}
+        GROUP BY {alias}.{roster_col if roster_col else 'roster_id'}
+        ORDER BY {', '.join(order_parts)}
+        LIMIT 5
+    """
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return [record_to_dict(row) for row in cur.fetchall()]
+
+
+def fetch_game_recap_stat_package(game_row: dict) -> dict:
+    season_index = safe_int(game_row.get('season_index'))
+    stage_index = safe_int(game_row.get('stage_index'))
+    raw_week = safe_int(game_row.get('week'))
+    away_team_id = safe_int(game_row.get('away_team_id'))
+    home_team_id = safe_int(game_row.get('home_team_id'))
+    package = {
+        'away_passing': fetch_game_statlines_for_team('player_passing_stats', away_team_id, season_index, stage_index, raw_week, {
+            'yards': ['pass_yds'], 'tds': ['pass_tds', 'pass_td'], 'ints': ['pass_ints', 'pass_int']
+        }, ['yards', 'tds']),
+        'home_passing': fetch_game_statlines_for_team('player_passing_stats', home_team_id, season_index, stage_index, raw_week, {
+            'yards': ['pass_yds'], 'tds': ['pass_tds', 'pass_td'], 'ints': ['pass_ints', 'pass_int']
+        }, ['yards', 'tds']),
+        'away_rushing': fetch_game_statlines_for_team('player_rushing_stats', away_team_id, season_index, stage_index, raw_week, {
+            'yards': ['rush_yds'], 'tds': ['rush_tds', 'rush_td'], 'attempts': ['rush_attempts', 'rush_att', 'carries']
+        }, ['yards', 'tds']),
+        'home_rushing': fetch_game_statlines_for_team('player_rushing_stats', home_team_id, season_index, stage_index, raw_week, {
+            'yards': ['rush_yds'], 'tds': ['rush_tds', 'rush_td'], 'attempts': ['rush_attempts', 'rush_att', 'carries']
+        }, ['yards', 'tds']),
+        'away_receiving': fetch_game_statlines_for_team('player_receiving_stats', away_team_id, season_index, stage_index, raw_week, {
+            'yards': ['rec_yds', 'recv_yds', 'receiving_yds'], 'tds': ['rec_tds', 'rec_td', 'recv_tds', 'receiving_tds'], 'catches': ['receptions', 'rec_catches', 'recv_catches']
+        }, ['yards', 'tds', 'catches']),
+        'home_receiving': fetch_game_statlines_for_team('player_receiving_stats', home_team_id, season_index, stage_index, raw_week, {
+            'yards': ['rec_yds', 'recv_yds', 'receiving_yds'], 'tds': ['rec_tds', 'rec_td', 'recv_tds', 'receiving_tds'], 'catches': ['receptions', 'rec_catches', 'recv_catches']
+        }, ['yards', 'tds', 'catches']),
+        'away_defense': fetch_game_statlines_for_team('player_defense_stats', away_team_id, season_index, stage_index, raw_week, {
+            'sacks': ['def_sacks'], 'ints': ['def_ints'], 'tackles': ['def_tackles', 'tackles', 'total_tackles']
+        }, ['ints', 'sacks', 'tackles']),
+        'home_defense': fetch_game_statlines_for_team('player_defense_stats', home_team_id, season_index, stage_index, raw_week, {
+            'sacks': ['def_sacks'], 'ints': ['def_ints'], 'tackles': ['def_tackles', 'tackles', 'total_tackles']
+        }, ['ints', 'sacks', 'tackles']),
+    }
+    return package
+
+
+def pick_statline_leader(rows: list[dict]) -> dict:
+    return rows[0] if rows else {}
+
+
+def build_gamerecap_facts(game_row: dict, stats: dict) -> dict:
+    away_score = safe_int(game_row.get('away_score'))
+    home_score = safe_int(game_row.get('home_score'))
+    away_team = safe_text(game_row.get('away_team_name'))
+    home_team = safe_text(game_row.get('home_team_name'))
+    away_record = f"{safe_int(game_row.get('away_wins'))}-{safe_int(game_row.get('away_losses'))}-{safe_int(game_row.get('away_ties'))}"
+    home_record = f"{safe_int(game_row.get('home_wins'))}-{safe_int(game_row.get('home_losses'))}-{safe_int(game_row.get('home_ties'))}"
+    home_won = home_score > away_score
+    winner = home_team if home_won else away_team
+    loser = away_team if home_won else home_team
+    winner_score = max(home_score, away_score)
+    loser_score = min(home_score, away_score)
+    winner_record = home_record if home_won else away_record
+    loser_record = away_record if home_won else home_record
+    margin = abs(home_score - away_score)
+    passing = pick_statline_leader(stats['home_passing'] if home_won else stats['away_passing'])
+    rushing = pick_statline_leader(stats['home_rushing'] if home_won else stats['away_rushing'])
+    receiving = pick_statline_leader(stats['home_receiving'] if home_won else stats['away_receiving'])
+    defense = pick_statline_leader(stats['home_defense'] if home_won else stats['away_defense'])
+    themes = []
+    if margin <= 8:
+        themes.append('one-score drama')
+    if margin >= 17:
+        themes.append('statement win')
+    if safe_text(game_row.get('away_team_name')).split()[-1] == safe_text(game_row.get('home_team_name')).split()[-1]:
+        themes.append('same-mascot weirdness')
+    if safe_int(game_row.get('away_wins')) == safe_int(game_row.get('home_wins')):
+        themes.append('evenly matched records')
+    if safe_int(defense.get('ints')) > 0:
+        themes.append('defensive takeaway swing')
+    if safe_int(passing.get('tds')) >= 3:
+        themes.append('quarterback-led offense')
+    if safe_int(rushing.get('yards')) >= 100:
+        themes.append('ground control')
+    if not themes:
+        themes.append('clean team result')
+    return {
+        'phase': stage_display_name(safe_int(game_row.get('stage_index'))),
+        'week': safe_int(game_row.get('display_week')),
+        'matchup': f"{away_team} @ {home_team}",
+        'away_team': away_team,
+        'home_team': home_team,
+        'winner': winner,
+        'loser': loser,
+        'winning_score': winner_score,
+        'losing_score': loser_score,
+        'winner_record': winner_record,
+        'loser_record': loser_record,
+        'margin': margin,
+        'is_one_score_game': margin <= 8,
+        'is_blowout': margin >= 17,
+        'turning_point': f"{winner} created separation in the second half and finished the job late.",
+        'top_passer': passing,
+        'top_rusher': rushing,
+        'top_receiver': receiving,
+        'top_defender': defense,
+        'themes': themes,
+        'game_row': game_row,
+    }
+
+
+def build_gamerecap_headline(facts: dict) -> str:
+    winner = facts['winner']
+    loser = facts['loser']
+    week = facts['week']
+    margin = facts['margin']
+    options = [
+        f"{winner} take Week {week} over {loser}",
+        f"{winner} beat {loser} in Week {week}",
+        f"{winner} outlast {loser} in Week {week}",
+        f"{winner} make a statement against {loser}",
+        f"{winner} defend home turf against {loser}" if facts['game_row'].get('home_team_name') == winner else f"{winner} win on the road at {loser}",
+    ]
+    if facts['is_one_score_game']:
+        options.append(f"{winner} hold off {loser} in a tight Week {week} finish")
+    if facts['is_blowout']:
+        options.append(f"{winner} overwhelm {loser} in Week {week}")
+    return deterministic_choice(options, f"gamerecap-headline-{winner}-{loser}-{week}-{margin}")
+
+
+def _format_player_snippet(row: dict, role: str) -> str:
+    if not row or not row.get('player_name'):
+        return ''
+    if role == 'passer':
+        return f"{row['player_name']} led the air attack with {safe_int(row.get('yards'))} passing yards and {safe_int(row.get('tds'))} touchdowns"
+    if role == 'rusher':
+        return f"{row['player_name']} added {safe_int(row.get('yards'))} rushing yards and {safe_int(row.get('tds'))} scores on the ground"
+    if role == 'receiver':
+        catches = safe_int(row.get('catches'))
+        catch_text = f" on {catches} catches" if catches else ''
+        return f"{row['player_name']} was the top target with {safe_int(row.get('yards'))} receiving yards{catch_text}"
+    if role == 'defender':
+        ints = safe_int(row.get('ints'))
+        sacks = safe_int(row.get('sacks'))
+        tackles = safe_int(row.get('tackles'))
+        bits = []
+        if ints:
+            bits.append(f"{ints} pick{'s' if ints != 1 else ''}")
+        if sacks:
+            bits.append(f"{sacks} sack{'s' if sacks != 1 else ''}")
+        if tackles:
+            bits.append(f"{tackles} tackles")
+        if bits:
+            return f"Defensively, {row['player_name']} showed up with " + ', '.join(bits)
+    return ''
+
+
+def template_gamerecap_text(facts: dict) -> str:
+    winner = facts['winner']
+    loser = facts['loser']
+    week = facts['week']
+    phase = facts['phase']
+    winner_score = facts['winning_score']
+    loser_score = facts['losing_score']
+    margin = facts['margin']
+    opener_options = [
+        f"{winner} came out of {phase} Week {week} with a {winner_score}-{loser_score} win over {loser}, turning a key matchup into another result that should matter in the room.",
+        f"In {phase} Week {week}, {winner} beat {loser} {winner_score}-{loser_score} and gave themselves another result with real momentum attached to it.",
+        f"{winner} handled business against {loser} in {phase} Week {week}, finishing with a {winner_score}-{loser_score} win that carried more than just box-score value.",
+    ]
+    if facts['is_one_score_game']:
+        opener_options.append(f"{winner} had to earn every bit of a {winner_score}-{loser_score} win over {loser} in {phase} Week {week}, surviving a game that stayed alive deep into the finish.")
+    if facts['is_blowout']:
+        opener_options.append(f"{winner} left little doubt in {phase} Week {week}, beating {loser} {winner_score}-{loser_score} in one of the more convincing results on the board.")
+    opener = deterministic_choice(opener_options, f"gamerecap-open-{winner}-{loser}-{week}-{margin}")
+    snippets = [
+        _format_player_snippet(facts['top_passer'], 'passer'),
+        _format_player_snippet(facts['top_rusher'], 'rusher'),
+        _format_player_snippet(facts['top_receiver'], 'receiver'),
+        _format_player_snippet(facts['top_defender'], 'defender'),
+    ]
+    snippets = [s for s in snippets if s]
+    middle = ' '.join(snippets[:3])
+    close_options = [
+        f"The win moves {winner} forward with a {facts['winner_record']} mark, while {loser} leave it at {facts['loser_record']} with more pressure heading into next week.",
+        f"For {winner}, it is another result that should strengthen league opinion; for {loser}, it is a loss that keeps the pressure on.",
+        f"That is the kind of scoreline that can boost {winner}'s confidence and leave {loser} needing a fast answer next time out.",
+    ]
+    if facts['is_one_score_game']:
+        close_options.append(f"In a game decided by {margin} points, {winner} were the side that handled the biggest moments cleaner when it counted.")
+    if facts['is_blowout']:
+        close_options.append(f"With a margin of {margin}, {winner} did more than win — they controlled the tone of the game from the bigger moments onward.")
+    close = deterministic_choice(close_options, f"gamerecap-close-{winner}-{loser}-{week}-{margin}")
+    parts = [opener]
+    if middle:
+        parts.append(middle + '.')
+    parts.append(close)
+    return ' '.join(parts)
+
+def build_gamerecap_prompt(facts: dict) -> str:
+    return (
+        "You are writing an original football game recap for a Madden franchise Discord.\n"
+        "Write one strong headline on the first line, then one recap paragraph of 130 to 220 words.\n"
+        "Keep it energetic, polished, and original. Do not imitate any specific outlet. Use only the facts provided.\n"
+        f"Facts JSON:\n{json.dumps({k: v for k, v in facts.items() if k != 'game_row'}, indent=2, default=str)}"
+    )
+
+
+
+async def generate_gamerecap_text(facts: dict) -> tuple[str, str, bool]:
+    fallback_headline = build_gamerecap_headline(facts)
+    fallback_body = template_gamerecap_text(facts)
+    if not OPENAI_API_KEY:
+        return fallback_headline, fallback_body, False
+    try:
+        ai_text = await asyncio.to_thread(call_openai_text, build_gamerecap_prompt(facts), 320)
+        cleaned = _clean_generated_text(ai_text)
+        if cleaned:
+            lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+            if len(lines) >= 2:
+                return lines[0], ' '.join(lines[1:]), True
+            if len(lines) == 1:
+                return fallback_headline, lines[0], True
+        return fallback_headline, fallback_body, False
+    except Exception as exc:
+        print(f"OpenAI gamerecap failed, using template fallback | game={facts['matchup']} error={exc}")
+        return fallback_headline, fallback_body, False
+
+
+def build_gamerecap_embed(facts: dict, headline: str, recap_text: str, used_ai: bool) -> discord.Embed:
+    game_row = facts['game_row']
+    embed = discord.Embed(
+        title=f"📝 {headline}",
+        description=recap_text,
+        color=0x3498DB,
+    )
+    embed.add_field(
+        name='Final Score',
+        value=f"{safe_text(game_row.get('away_team_name'))} {safe_int(game_row.get('away_score'))} — {safe_text(game_row.get('home_team_name'))} {safe_int(game_row.get('home_score'))}",
+        inline=False,
+    )
+    for label, row, role in [
+        ('Top Passer', facts['top_passer'], 'passer'),
+        ('Top Rusher', facts['top_rusher'], 'rusher'),
+        ('Top Receiver', facts['top_receiver'], 'receiver'),
+        ('Top Defender', facts['top_defender'], 'defender'),
+    ]:
+        snippet = _format_player_snippet(row, role)
+        if snippet:
+            embed.add_field(name=label, value=snippet, inline=False)
+    embed.set_footer(text=f"{facts['phase']} Week {facts['week']} • {'AI recap' if used_ai else 'Template recap'}")
+    return embed
+
+
+async def matchup_autocomplete_for_gamerecap(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    phase_value = getattr(interaction.namespace, 'phase', None)
+    week_value = getattr(interaction.namespace, 'week', None)
+    if week_value is None:
+        return []
+    try:
+        stage_index = resolve_command_stage(phase_value)
+        display_week = int(week_value)
+    except Exception:
+        return []
+    try:
+        games = fetch_games_for_stage_week(stage_index, display_week)
+    except Exception:
+        return []
+    current_norm = (current or '').lower().strip()
+    choices = []
+    for game in games:
+        label = f"{safe_text(game.get('away_team_name'))} @ {safe_text(game.get('home_team_name'))}"
+        if current_norm and current_norm not in label.lower():
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=str(safe_int(game.get('game_id')))))
+        if len(choices) >= 25:
+            break
+    return choices
+
 def compute_matchup_score(game_row) -> float:
     away_wins = game_row["away_wins"] or 0
     away_win_pct = float(game_row["away_win_pct"] or 0)
@@ -5417,6 +5822,56 @@ async def storylines(interaction: discord.Interaction):
 
 
 
+
+
+@bot.tree.command(name="gamerecap", description="Generate a recap for one completed game.")
+@app_commands.describe(
+    phase="Phase of the season",
+    week="Human week number",
+    matchup="Pick the matchup in Away @ Home format"
+)
+@app_commands.choices(phase=[
+    app_commands.Choice(name="Regular Season", value="regular"),
+    app_commands.Choice(name="Preseason", value="preseason"),
+    app_commands.Choice(name="Wild Card", value="wild card"),
+    app_commands.Choice(name="Divisional", value="divisional"),
+    app_commands.Choice(name="Conference Championship", value="conference championship"),
+    app_commands.Choice(name="Super Bowl", value="super bowl"),
+])
+@app_commands.autocomplete(matchup=matchup_autocomplete_for_gamerecap)
+async def gamerecap(
+    interaction: discord.Interaction,
+    phase: str,
+    week: int,
+    matchup: str,
+):
+    await interaction.response.defer()
+    try:
+        stage_index = resolve_command_stage(phase)
+    except Exception as exc:
+        await interaction.followup.send(f"Could not resolve phase: {exc}", ephemeral=True)
+        return
+
+    game_row = fetch_game_row_for_recap(stage_index, int(week), safe_int(matchup))
+    if not game_row:
+        await interaction.followup.send("Could not find that matchup for the selected phase and week.", ephemeral=True)
+        return
+    if not looks_like_completed_game(game_row):
+        await interaction.followup.send("That game does not look completed yet.", ephemeral=True)
+        return
+
+    try:
+        stat_package = fetch_game_recap_stat_package(game_row)
+        facts = build_gamerecap_facts(game_row, stat_package)
+        headline, recap_text, used_ai = await generate_gamerecap_text(facts)
+        embed = build_gamerecap_embed(facts, headline, recap_text, used_ai)
+    except Exception as exc:
+        await interaction.followup.send(f"Failed to build game recap: {exc}", ephemeral=True)
+        return
+
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="submittrade", description="Submit a trade for committee review.")
 @app_commands.describe(
     coach_one="First coach involved in the trade",
@@ -5624,6 +6079,509 @@ async def settlebets(interaction: discord.Interaction):
     embed = build_embed("✅ Sportsbook Bets Settled", "\n\n".join(lines), 0x57F287)
     embed.set_footer(text=f"Settled {settled} bets • Paid {paid} winning/push bets")
     await interaction.response.send_message(embed=embed)
+
+
+# -----------------------------
+# Game recap v2 engine
+# -----------------------------
+GAMERECAP_V2_STORYLINES = {
+    "statement_win": {"label": "statement win", "weight": 8},
+    "survive_and_advance": {"label": "survive and advance", "weight": 7},
+    "road_statement": {"label": "road statement", "weight": 9},
+    "home_field_held": {"label": "home field held", "weight": 6},
+    "one_score_drama": {"label": "one-score drama", "weight": 8},
+    "late_pullaway": {"label": "late pullaway", "weight": 7},
+    "blowout_control": {"label": "blowout control", "weight": 8},
+    "playoff_pressure": {"label": "playoff pressure", "weight": 6},
+    "division_race": {"label": "division race", "weight": 8},
+    "rivalry_heat": {"label": "rivalry heat", "weight": 7},
+    "quarterback_led": {"label": "quarterback-led offense", "weight": 7},
+    "ground_control": {"label": "ground control", "weight": 7},
+    "receiver_takeover": {"label": "receiver takeover", "weight": 6},
+    "defensive_swing": {"label": "defensive swing", "weight": 8},
+    "turnover_story": {"label": "turnover story", "weight": 7},
+    "balanced_attack": {"label": "balanced attack", "weight": 6},
+    "contender_behavior": {"label": "contender behavior", "weight": 7},
+    "loser_pressure": {"label": "loser pressure", "weight": 6},
+    "clean_finish": {"label": "clean finish", "weight": 5},
+    "explosive_offense": {"label": "explosive offense", "weight": 7},
+    "defense_traveled": {"label": "defense traveled", "weight": 6},
+    "season_saver": {"label": "season saver", "weight": 7},
+    "message_to_league": {"label": "message to the league", "weight": 7},
+    "winner_momentum": {"label": "winner momentum", "weight": 6},
+    "pressure_rising": {"label": "pressure rising", "weight": 6},
+}
+
+GAMERECAP_V2_ANGLES = {
+    "winner_focused": 10,
+    "turning_point_first": 8,
+    "broadcast_hype": 8,
+    "newspaper_clean": 7,
+    "rivalry_frame": 7,
+    "standings_frame": 7,
+    "star_spotlight": 8,
+    "defense_first": 6,
+    "offense_first": 6,
+    "survival_mode": 6,
+    "dominance_mode": 6,
+    "pressure_mode": 6,
+}
+
+GAMERECAP_V2_HEADLINE_PATTERNS = [
+    "{winner} send a message against {loser}",
+    "{winner} hold off {loser} in Week {week}",
+    "{winner} outlast {loser} in a key Week {week} clash",
+    "{winner} defend home turf against {loser}",
+    "{winner} leave no doubt against {loser}",
+    "{winner} survive late pressure to beat {loser}",
+    "{winner} seize momentum with a win over {loser}",
+    "{winner} take control late against {loser}",
+    "{winner} make a road statement at {loser}",
+    "{winner} answer the moment against {loser}",
+    "{winner} edge {loser} in a tense Week {week} battle",
+    "{winner} push past {loser} in a game that mattered",
+    "{winner} keep rolling with a win over {loser}",
+    "{winner} close strong to beat {loser}",
+    "{winner} rise above {loser} in Week {week}",
+    "{winner} put the league on notice against {loser}",
+    "{winner} stand tall against {loser}",
+    "{winner} outfinish {loser} in Week {week}",
+    "{winner} turn back {loser} in a tough test",
+    "{winner} take the latest chapter from {loser}",
+]
+
+GAMERECAP_V2_OPENERS = {
+    "statement_win": [
+        "{winner} delivered one of their clearest statements of the season in {phase} Week {week}.",
+        "Week {week} brought another reminder that {winner} can look dangerous when the game tightens up.",
+        "{winner} did more than win this one — they made the result feel like it meant something."
+    ],
+    "one_score_drama": [
+        "This one stayed alive deep into the finish before {winner} finally shut the door.",
+        "For most of the night, there was very little separating these teams on the scoreboard.",
+        "The margin stayed thin, and that made every late possession matter."
+    ],
+    "road_statement": [
+        "Walking into someone else’s building and leaving with control is never easy, but {winner} managed it.",
+        "Road wins have a way of carrying extra weight, and {winner} earned one here.",
+        "{winner} went on the road and handled the biggest moments better than {loser}."
+    ],
+    "blowout_control": [
+        "Once {winner} found control of this game, they never really gave it back.",
+        "From the more important moments onward, {winner} looked like the stronger side.",
+        "This turned into a long night for {loser} as {winner} kept stacking answers."
+    ],
+    "default": [
+        "{winner} came out of {phase} Week {week} with a result that should play well around the league.",
+        "In {phase} Week {week}, {winner} found a way to beat {loser} and keep their momentum moving.",
+        "{winner} took care of business in {phase} Week {week} against {loser}."
+    ],
+}
+
+GAMERECAP_V2_CLOSERS = {
+    "winner_momentum": [
+        "That kind of finish should only add to the belief building around {winner} right now.",
+        "For {winner}, it is another result that adds weight to their recent stretch.",
+        "The win keeps {winner} moving in the right direction heading toward next week."
+    ],
+    "pressure_rising": [
+        "For {loser}, the result leaves more questions than comfort heading into the next game.",
+        "That loss does not end anything for {loser}, but it does add pressure fast.",
+        "{loser} leave this one knowing the margin for error is not getting any wider."
+    ],
+    "division_race": [
+        "If the standings stay tight, this is the kind of result that can matter later.",
+        "Division races usually turn on games like this, and this one could carry weight for a while.",
+        "The standings impact may eventually feel as important as the final score itself."
+    ],
+    "default": [
+        "In a league that tends to remember the sharpest weekly results, this was one worth noticing.",
+        "The score goes in the books, but the tone of the result may matter just as much.",
+        "It was not just a win — it was the kind of game that tells you something about both sides."
+    ],
+}
+
+
+def ensure_gamerecap_memory_table():
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_gamerecap_memory (
+                    id BIGSERIAL PRIMARY KEY,
+                    game_id BIGINT,
+                    stage_index INTEGER,
+                    display_week INTEGER,
+                    matchup TEXT NOT NULL,
+                    winner_team TEXT,
+                    loser_team TEXT,
+                    headline TEXT,
+                    primary_storyline TEXT,
+                    secondary_storyline TEXT,
+                    angle_family TEXT,
+                    opener_family TEXT,
+                    closer_family TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+        conn.commit()
+
+
+def recent_gamerecap_memory(limit: int = 30) -> list[dict]:
+    ensure_gamerecap_memory_table()
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT matchup, winner_team, loser_team, headline, primary_storyline, secondary_storyline,
+                       angle_family, opener_family, closer_family, created_at
+                FROM bot_gamerecap_memory
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (int(limit),),
+            )
+            return [record_to_dict(r) for r in cur.fetchall()]
+
+
+def record_gamerecap_memory(facts: dict, plan: dict, headline: str):
+    ensure_gamerecap_memory_table()
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bot_gamerecap_memory (
+                    game_id, stage_index, display_week, matchup, winner_team, loser_team, headline,
+                    primary_storyline, secondary_storyline, angle_family, opener_family, closer_family
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    safe_int(facts['game_row'].get('game_id')),
+                    safe_int(facts['game_row'].get('stage_index')),
+                    safe_int(facts['week']),
+                    facts['matchup'],
+                    facts['winner'],
+                    facts['loser'],
+                    headline,
+                    plan.get('primary_storyline', ''),
+                    plan.get('secondary_storyline', ''),
+                    plan.get('angle', ''),
+                    plan.get('opener_family', ''),
+                    plan.get('closer_family', ''),
+                ),
+            )
+        conn.commit()
+
+
+def _recap_penalty(memory: list[dict], key: str, value: str) -> int:
+    penalty = 0
+    for idx, row in enumerate(memory):
+        if safe_text(row.get(key)) == value:
+            penalty += max(1, 8 - idx)
+    return penalty
+
+
+def build_gamerecap_facts(game_row: dict, stats: dict) -> dict:
+    away_score = safe_int(game_row.get('away_score'))
+    home_score = safe_int(game_row.get('home_score'))
+    away_team = safe_text(game_row.get('away_team_name'))
+    home_team = safe_text(game_row.get('home_team_name'))
+    away_record = f"{safe_int(game_row.get('away_wins'))}-{safe_int(game_row.get('away_losses'))}-{safe_int(game_row.get('away_ties'))}"
+    home_record = f"{safe_int(game_row.get('home_wins'))}-{safe_int(game_row.get('home_losses'))}-{safe_int(game_row.get('home_ties'))}"
+    home_won = home_score > away_score
+    winner = home_team if home_won else away_team
+    loser = away_team if home_won else home_team
+    winner_score = max(home_score, away_score)
+    loser_score = min(home_score, away_score)
+    winner_record = home_record if home_won else away_record
+    loser_record = away_record if home_won else home_record
+    margin = abs(home_score - away_score)
+    passing = pick_statline_leader(stats['home_passing'] if home_won else stats['away_passing'])
+    rushing = pick_statline_leader(stats['home_rushing'] if home_won else stats['away_rushing'])
+    receiving = pick_statline_leader(stats['home_receiving'] if home_won else stats['away_receiving'])
+    defense = pick_statline_leader(stats['home_defense'] if home_won else stats['away_defense'])
+    team_total_wins_gap = abs(safe_int(game_row.get('away_wins')) - safe_int(game_row.get('home_wins')))
+    is_divisional = False
+    away_name_bits = away_team.split()
+    home_name_bits = home_team.split()
+    if len(away_name_bits) > 1 and len(home_name_bits) > 1:
+        is_divisional = away_name_bits[-1] != home_name_bits[-1] and safe_int(game_row.get('away_wins')) >= 0 and safe_int(game_row.get('home_wins')) >= 0
+    themes = []
+    if margin <= 8:
+        themes.append('one-score drama')
+    if margin >= 17:
+        themes.append('statement win')
+    if not home_won:
+        themes.append('road statement')
+    if safe_int(defense.get('ints')) > 0 or safe_int(defense.get('sacks')) >= 2:
+        themes.append('defensive swing')
+    if safe_int(passing.get('tds')) >= 3 or safe_int(passing.get('yards')) >= 275:
+        themes.append('quarterback-led offense')
+    if safe_int(rushing.get('yards')) >= 100:
+        themes.append('ground control')
+    if safe_int(receiving.get('yards')) >= 100:
+        themes.append('receiver takeover')
+    if safe_int(passing.get('yards')) >= 220 and safe_int(rushing.get('yards')) >= 75:
+        themes.append('balanced attack')
+    if team_total_wins_gap <= 1:
+        themes.append('even records')
+    return {
+        'phase': stage_display_name(safe_int(game_row.get('stage_index'))),
+        'week': safe_int(game_row.get('display_week')),
+        'matchup': f"{away_team} @ {home_team}",
+        'away_team': away_team,
+        'home_team': home_team,
+        'winner': winner,
+        'loser': loser,
+        'winning_score': winner_score,
+        'losing_score': loser_score,
+        'winner_record': winner_record,
+        'loser_record': loser_record,
+        'margin': margin,
+        'is_one_score_game': margin <= 8,
+        'is_blowout': margin >= 17,
+        'home_team_won': home_won,
+        'road_team_won': not home_won,
+        'is_divisional': is_divisional,
+        'turning_point': f"{winner} created separation late and finished the game with cleaner execution in the biggest moments.",
+        'top_passer': passing,
+        'top_rusher': rushing,
+        'top_receiver': receiving,
+        'top_defender': defense,
+        'themes': themes,
+        'game_row': game_row,
+    }
+
+
+def select_gamerecap_plan(facts: dict) -> dict:
+    memory = recent_gamerecap_memory(25)
+    candidates = {}
+    def add(tag: str, points: int):
+        candidates[tag] = candidates.get(tag, 0) + points + GAMERECAP_V2_STORYLINES.get(tag, {}).get('weight', 0)
+
+    if facts['is_one_score_game']:
+        add('one_score_drama', 10)
+        add('survive_and_advance', 8)
+    else:
+        add('clean_finish', 4)
+    if facts['is_blowout']:
+        add('blowout_control', 12)
+        add('statement_win', 10)
+    else:
+        add('late_pullaway', 4)
+    if facts['road_team_won']:
+        add('road_statement', 10)
+    else:
+        add('home_field_held', 7)
+    if facts['is_divisional']:
+        add('division_race', 8)
+        add('rivalry_heat', 6)
+    if safe_int(facts['top_passer'].get('tds')) >= 3 or safe_int(facts['top_passer'].get('yards')) >= 275:
+        add('quarterback_led', 8)
+        add('explosive_offense', 5)
+    if safe_int(facts['top_rusher'].get('yards')) >= 100:
+        add('ground_control', 8)
+    if safe_int(facts['top_receiver'].get('yards')) >= 110:
+        add('receiver_takeover', 7)
+    if safe_int(facts['top_defender'].get('ints')) >= 1 or safe_int(facts['top_defender'].get('sacks')) >= 2:
+        add('defensive_swing', 8)
+        add('turnover_story', 4)
+    if safe_int(facts['top_passer'].get('yards')) >= 220 and safe_int(facts['top_rusher'].get('yards')) >= 75:
+        add('balanced_attack', 6)
+    if facts['margin'] >= 10:
+        add('message_to_league', 5)
+        add('contender_behavior', 5)
+    if safe_text(facts['winner_record']).startswith('0-'):
+        add('season_saver', 4)
+    add('winner_momentum', 6)
+    add('loser_pressure', 5)
+    add('pressure_rising', 4)
+
+    scored = []
+    for tag, score in candidates.items():
+        penalty = _recap_penalty(memory, 'primary_storyline', tag) + _recap_penalty(memory, 'secondary_storyline', tag)
+        scored.append((score - penalty, tag))
+    scored.sort(reverse=True)
+    primary = scored[0][1] if scored else 'winner_momentum'
+    secondary = next((tag for _, tag in scored if tag != primary), 'clean_finish')
+
+    angle_scores = {k: v for k, v in GAMERECAP_V2_ANGLES.items()}
+    if primary in {'statement_win', 'message_to_league', 'road_statement'}:
+        angle_scores['broadcast_hype'] += 4
+        angle_scores['winner_focused'] += 3
+    if primary in {'one_score_drama', 'survive_and_advance'}:
+        angle_scores['turning_point_first'] += 4
+        angle_scores['survival_mode'] += 3
+    if primary in {'defensive_swing', 'turnover_story'}:
+        angle_scores['defense_first'] += 4
+    if primary in {'quarterback_led', 'explosive_offense', 'receiver_takeover'}:
+        angle_scores['star_spotlight'] += 4
+        angle_scores['offense_first'] += 3
+    if facts['is_divisional']:
+        angle_scores['rivalry_frame'] += 3
+        angle_scores['standings_frame'] += 2
+
+    angle_ranked = sorted(
+        ((score - _recap_penalty(memory, 'angle_family', angle), angle) for angle, score in angle_scores.items()),
+        reverse=True,
+    )
+    angle = angle_ranked[0][1] if angle_ranked else 'winner_focused'
+
+    opener_family = primary if primary in GAMERECAP_V2_OPENERS else 'default'
+    if _recap_penalty(memory, 'opener_family', opener_family) > 10:
+        opener_family = 'default'
+    closer_family = 'division_race' if primary in {'division_race', 'rivalry_heat'} else ('pressure_rising' if secondary in {'loser_pressure', 'pressure_rising'} else 'winner_momentum')
+    if closer_family not in GAMERECAP_V2_CLOSERS:
+        closer_family = 'default'
+
+    return {
+        'primary_storyline': primary,
+        'secondary_storyline': secondary,
+        'angle': angle,
+        'opener_family': opener_family,
+        'closer_family': closer_family,
+        'recent_memory': memory,
+    }
+
+
+def build_gamerecap_headline(facts: dict, plan: Optional[dict] = None) -> str:
+    plan = plan or select_gamerecap_plan(facts)
+    memory = plan.get('recent_memory', [])
+    candidates = []
+    for pattern in GAMERECAP_V2_HEADLINE_PATTERNS:
+        if '{loser}' in pattern and facts['road_team_won'] and 'at {loser}' in pattern:
+            rendered = pattern.format(**facts)
+        else:
+            rendered = pattern.format(**facts)
+        penalty = sum(1 for row in memory[:8] if safe_text(row.get('headline')) == rendered)
+        candidates.append((10 - penalty, rendered))
+    if plan['primary_storyline'] == 'one_score_drama':
+        candidates.append((12, f"{facts['winner']} hold off {facts['loser']} in a tense Week {facts['week']} finish"))
+    if plan['primary_storyline'] == 'blowout_control':
+        candidates.append((12, f"{facts['winner']} overwhelm {facts['loser']} in Week {facts['week']}"))
+    if plan['primary_storyline'] == 'road_statement':
+        candidates.append((13, f"{facts['winner']} make a road statement at {facts['loser']}"))
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def template_gamerecap_text_v2(facts: dict, plan: dict) -> str:
+    opener_pool = GAMERECAP_V2_OPENERS.get(plan['opener_family'], GAMERECAP_V2_OPENERS['default'])
+    opener = deterministic_choice(opener_pool, f"{facts['matchup']}-{plan['opener_family']}-{facts['margin']}")
+    snippets = [
+        _format_player_snippet(facts['top_passer'], 'passer'),
+        _format_player_snippet(facts['top_rusher'], 'rusher'),
+        _format_player_snippet(facts['top_receiver'], 'receiver'),
+        _format_player_snippet(facts['top_defender'], 'defender'),
+    ]
+    snippets = [s for s in snippets if s]
+    if plan['angle'] == 'turning_point_first':
+        middle_start = facts['turning_point']
+    elif plan['angle'] in {'defense_first'} and snippets:
+        middle_start = snippets[-1]
+        snippets = snippets[:-1]
+    elif plan['angle'] in {'star_spotlight', 'offense_first'} and snippets:
+        middle_start = snippets[0]
+        snippets = snippets[1:]
+    else:
+        middle_start = f"The final margin was {facts['margin']}, but the game felt defined by how {facts['winner']} handled the key moments."
+    body_bits = [middle_start.rstrip('.') + '.']
+    if snippets:
+        body_bits.append(' '.join(s.rstrip('.') + '.' for s in snippets[:2]))
+    body_bits.append(f"The result leaves {facts['winner']} at {facts['winner_record']} while {facts['loser']} drop this one at {facts['loser_record']}.")
+    closer_pool = GAMERECAP_V2_CLOSERS.get(plan['closer_family'], GAMERECAP_V2_CLOSERS['default'])
+    closer = deterministic_choice(closer_pool, f"{facts['matchup']}-{plan['closer_family']}-{facts['week']}")
+    return ' '.join([opener] + body_bits + [closer])
+
+
+def build_gamerecap_prompt(facts: dict, plan: Optional[dict] = None) -> str:
+    plan = plan or select_gamerecap_plan(facts)
+    memory = [
+        {
+            'headline': row.get('headline'),
+            'primary_storyline': row.get('primary_storyline'),
+            'secondary_storyline': row.get('secondary_storyline'),
+            'angle_family': row.get('angle_family'),
+        }
+        for row in plan.get('recent_memory', [])[:8]
+    ]
+    payload = {k: v for k, v in facts.items() if k != 'game_row'}
+    payload['selected_plan'] = {
+        'primary_storyline': plan['primary_storyline'],
+        'secondary_storyline': plan['secondary_storyline'],
+        'angle': plan['angle'],
+        'opener_family': plan['opener_family'],
+        'closer_family': plan['closer_family'],
+    }
+    payload['recent_memory'] = memory
+    return (
+        "You are writing an original football recap for a Madden franchise Discord league.\n"
+        "Write one strong original headline on the first line, then one recap paragraph of 150 to 240 words.\n"
+        "Write with modern sports-media energy, but do not imitate any specific outlet.\n"
+        "Use the selected plan to choose the strongest narrative frame. Vary the writing and avoid repeating recent headline structures or storyline angles.\n"
+        f"Facts and recap plan JSON:\n{json.dumps(payload, indent=2, default=str)}"
+    )
+
+
+async def generate_gamerecap_text(facts: dict) -> tuple[str, str, bool]:
+    plan = select_gamerecap_plan(facts)
+    fallback_headline = build_gamerecap_headline(facts, plan)
+    fallback_body = template_gamerecap_text_v2(facts, plan)
+    used_ai = False
+    headline = fallback_headline
+    body = fallback_body
+    if OPENAI_API_KEY:
+        try:
+            ai_text = await asyncio.to_thread(call_openai_text, build_gamerecap_prompt(facts, plan), 420)
+            cleaned = _clean_generated_text(ai_text)
+            if cleaned:
+                lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+                if len(lines) >= 2:
+                    headline = lines[0]
+                    body = ' '.join(lines[1:])
+                    used_ai = True
+                elif len(lines) == 1:
+                    body = lines[0]
+                    used_ai = True
+        except Exception as exc:
+            print(f"OpenAI gamerecap v2 failed, using template fallback | game={facts['matchup']} error={exc}")
+    try:
+        record_gamerecap_memory(facts, plan, headline)
+    except Exception as exc:
+        print(f"Failed to record gamerecap memory | game={facts['matchup']} error={exc}")
+    return headline, body, used_ai
+
+
+def build_gamerecap_embed(facts: dict, headline: str, recap_text: str, used_ai: bool) -> discord.Embed:
+    game_row = facts['game_row']
+    embed = discord.Embed(
+        title=f"📝 {headline}",
+        description=recap_text,
+        color=0x3498DB,
+    )
+    embed.add_field(
+        name='Final Score',
+        value=f"{safe_text(game_row.get('away_team_name'))} {safe_int(game_row.get('away_score'))} — {safe_text(game_row.get('home_team_name'))} {safe_int(game_row.get('home_score'))}",
+        inline=False,
+    )
+    embed.add_field(
+        name='Game Notes',
+        value=f"Winner: **{facts['winner']}**\nMargin: **{facts['margin']}**\nTheme: **{GAMERECAP_V2_STORYLINES.get(select_gamerecap_plan(facts)['primary_storyline'], {}).get('label', 'game recap').title()}**",
+        inline=False,
+    )
+    for label, row, role in [
+        ('Top Passer', facts['top_passer'], 'passer'),
+        ('Top Rusher', facts['top_rusher'], 'rusher'),
+        ('Top Receiver', facts['top_receiver'], 'receiver'),
+        ('Top Defender', facts['top_defender'], 'defender'),
+    ]:
+        snippet = _format_player_snippet(row, role)
+        if snippet:
+            embed.add_field(name=label, value=snippet, inline=False)
+    embed.set_footer(text=f"{facts['phase']} Week {facts['week']} • {'AI recap v2' if used_ai else 'Template recap v2'}")
+    return embed
 
 
 if not BOT_TOKEN:
