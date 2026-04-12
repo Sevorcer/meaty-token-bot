@@ -2296,7 +2296,7 @@ async def team(interaction: discord.Interaction, team_name: str):
     standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
     merged_team = {**team_row, **standing_row}
     embed = build_roster_embed(merged_team, roster_rows, 1)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="balance", description="Check your token balance.")
@@ -5326,19 +5326,20 @@ def build_sportsbook_embed() -> discord.Embed:
     return embed
 
 
-def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
+def settle_open_bets_for_current_week() -> tuple[int, int, list[dict], int, int]:
     season_index = get_current_season_index()
     stage_index, display_week = detect_current_sportsbook_stage_and_week()
     if stage_index is None or display_week is None:
-        return 0, 0, []
+        return 0, 0, [], 0, 0
     raw_week = max(display_week - 1, 0)
     games = fetch_games_for_stage_week(stage_index, display_week)
+    all_game_map = {int(g["game_id"]): g for g in games}
     game_map = {int(g["game_id"]): g for g in games if looks_like_completed_game(g)}
-    if not game_map:
-        return 0, 0, []
 
     settled = 0
     paid = 0
+    skipped_unplayed = 0
+    skipped_missing = 0
     details: list[dict] = []
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
@@ -5353,9 +5354,16 @@ def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
             bets = cur.fetchall()
 
             for bet in bets:
-                game = game_map.get(int(bet["game_id"]))
-                if not game:
+                game_id = int(bet["game_id"])
+                all_game = all_game_map.get(game_id)
+                game = game_map.get(game_id)
+                if all_game is None:
+                    skipped_missing += 1
                     continue
+                if game is None:
+                    skipped_unplayed += 1
+                    continue
+
                 away_score = int(game.get("away_score") or 0)
                 home_score = int(game.get("home_score") or 0)
                 matchup = f"{game['away_team_name']} {away_score}-{home_score} {game['home_team_name']}"
@@ -5400,7 +5408,10 @@ def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
                     )
                     paid += 1
 
-                cur.execute("UPDATE bot_sportsbook_bets SET status = %s, settled_at = NOW() WHERE id = %s", (outcome, int(bet["id"])))
+                cur.execute(
+                    "UPDATE bot_sportsbook_bets SET status = %s, settled_at = NOW() WHERE id = %s",
+                    (outcome, int(bet["id"])),
+                )
                 details.append({
                     "username": bet["username"],
                     "team_name": bet["team_name"],
@@ -5412,7 +5423,7 @@ def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
                 })
                 settled += 1
         conn.commit()
-    return settled, paid, details
+    return settled, paid, details, skipped_unplayed, skipped_missing
 
 
 def detect_display_week_for_stage(stage_index: int) -> Optional[int]:
@@ -6064,9 +6075,17 @@ async def bet(interaction: discord.Interaction, team: str, amount: float):
 async def settlebets(interaction: discord.Interaction):
     await interaction.response.defer()
     init_extra_feature_tables()
-    settled, paid, details = settle_open_bets_for_current_week()
+    settled, paid, details, skipped_unplayed, skipped_missing = settle_open_bets_for_current_week()
     if not details:
-        await interaction.followup.send("No open completed bets were available to settle.", ephemeral=True)
+        extra = []
+        if skipped_unplayed:
+            extra.append(f"{skipped_unplayed} bet(s) were skipped because their games have not been completed yet")
+        if skipped_missing:
+            extra.append(f"{skipped_missing} bet(s) were skipped because no linked game row was found")
+        message = "No open completed bets were available to settle."
+        if extra:
+            message += "\n\n" + "\n".join(f"• {item}" for item in extra)
+        await interaction.followup.send(message, ephemeral=True)
         return
 
     lines = []
@@ -6082,8 +6101,13 @@ async def settlebets(interaction: discord.Interaction):
         lines.append(f"...and {len(details) - 20} more settled bets.")
 
     embed = build_embed("✅ Sportsbook Bets Settled", "\n\n".join(lines), 0x57F287)
-    embed.set_footer(text=f"Settled {settled} bets • Paid {paid} winning/push bets")
-    await interaction.response.send_message(embed=embed)
+    footer_parts = [f"Settled {settled} bets", f"Paid {paid} winning/push bets"]
+    if skipped_unplayed:
+        footer_parts.append(f"Skipped {skipped_unplayed} unfinished")
+    if skipped_missing:
+        footer_parts.append(f"Skipped {skipped_missing} missing game")
+    embed.set_footer(text=" • ".join(footer_parts))
+    await interaction.followup.send(embed=embed)
 
 
 # -----------------------------
