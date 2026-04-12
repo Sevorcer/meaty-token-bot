@@ -29,6 +29,10 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
 AUTO_POST_MATCHUP_PREVIEWS = os.getenv("AUTO_POST_MATCHUP_PREVIEWS", "true").lower() in {"1", "true", "yes", "on"}
 AUTO_POST_WEEKLY_NEWS = os.getenv("AUTO_POST_WEEKLY_NEWS", "true").lower() in {"1", "true", "yes", "on"}
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+TRADE_COMMITTEE_ROLE_ID = int(os.getenv("TRADE_COMMITTEE_ROLE_ID", "0"))
+TRADE_REVIEW_CHANNEL_ID = int(os.getenv("TRADE_REVIEW_CHANNEL_ID", "0"))
+TRADE_REQUIRED_APPROVALS = int(os.getenv("TRADE_REQUIRED_APPROVALS", "2"))
+TRADE_REQUIRED_DENIALS = int(os.getenv("TRADE_REQUIRED_DENIALS", "2"))
 
 ADMIN_ROLE_NAMES = {"Commissioner", "Admin", "COMMISH"}
 
@@ -204,6 +208,39 @@ class TokenDatabase:
                         quantity INTEGER NOT NULL DEFAULT 0,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         PRIMARY KEY (user_id, voucher_type)
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_trades (
+                        id BIGSERIAL PRIMARY KEY,
+                        submitted_by BIGINT NOT NULL,
+                        submitted_username TEXT NOT NULL,
+                        team_one_name TEXT NOT NULL,
+                        team_two_name TEXT NOT NULL,
+                        team_one_gets TEXT NOT NULL,
+                        team_two_gets TEXT NOT NULL,
+                        notes TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        approve_count INTEGER NOT NULL DEFAULT 0,
+                        deny_count INTEGER NOT NULL DEFAULT 0,
+                        review_channel_id BIGINT,
+                        review_message_id BIGINT,
+                        finalized_by BIGINT,
+                        finalized_reason TEXT,
+                        finalized_at TIMESTAMPTZ,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_trade_votes (
+                        id BIGSERIAL PRIMARY KEY,
+                        trade_id BIGINT NOT NULL REFERENCES bot_trades(id) ON DELETE CASCADE,
+                        voter_user_id BIGINT NOT NULL,
+                        voter_username TEXT NOT NULL,
+                        vote TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (trade_id, voter_user_id)
                     )
                 """)
             conn.commit()
@@ -486,6 +523,157 @@ class TokenDatabase:
                 )
             conn.commit()
             return True
+
+
+    def create_trade(self, submitted_by: discord.abc.User, team_one_name: str, team_two_name: str, team_one_gets: str, team_two_gets: str, notes: str = "") -> dict:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bot_trades (
+                        submitted_by,
+                        submitted_username,
+                        team_one_name,
+                        team_two_name,
+                        team_one_gets,
+                        team_two_gets,
+                        notes
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        int(submitted_by.id),
+                        str(submitted_by),
+                        team_one_name,
+                        team_two_name,
+                        team_one_gets,
+                        team_two_gets,
+                        notes or "",
+                    ),
+                )
+                row = cur.fetchone()
+            conn.commit()
+            return dict(row) if row else {}
+
+    def set_trade_review_message(self, trade_id: int, channel_id: int, message_id: int):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE bot_trades
+                    SET review_channel_id = %s,
+                        review_message_id = %s
+                    WHERE id = %s
+                    """,
+                    (int(channel_id), int(message_id), int(trade_id)),
+                )
+            conn.commit()
+
+    def get_trade(self, trade_id: int):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_trades WHERE id = %s", (int(trade_id),))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def get_trade_by_message(self, message_id: int):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_trades WHERE review_message_id = %s", (int(message_id),))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def upsert_trade_vote(self, trade_id: int, voter: discord.abc.User, vote: str) -> tuple[dict, bool]:
+        vote = (vote or "").strip().lower()
+        if vote not in {"approve", "deny"}:
+            raise ValueError("Vote must be approve or deny.")
+
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_trades WHERE id = %s FOR UPDATE", (int(trade_id),))
+                trade = cur.fetchone()
+                if trade is None:
+                    raise ValueError("Trade not found.")
+                if str(trade["status"]) != "pending":
+                    return dict(trade), False
+
+                cur.execute(
+                    """
+                    INSERT INTO bot_trade_votes (trade_id, voter_user_id, voter_username, vote)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (trade_id, voter_user_id) DO UPDATE
+                    SET voter_username = EXCLUDED.voter_username,
+                        vote = EXCLUDED.vote,
+                        updated_at = NOW()
+                    RETURNING vote
+                    """,
+                    (int(trade_id), int(voter.id), str(voter), vote),
+                )
+
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (WHERE vote = 'approve') AS approve_count,
+                        COUNT(*) FILTER (WHERE vote = 'deny') AS deny_count
+                    FROM bot_trade_votes
+                    WHERE trade_id = %s
+                    """,
+                    (int(trade_id),),
+                )
+                counts = cur.fetchone() or {}
+                approve_count = int(counts.get("approve_count") or 0)
+                deny_count = int(counts.get("deny_count") or 0)
+
+                cur.execute(
+                    """
+                    UPDATE bot_trades
+                    SET approve_count = %s,
+                        deny_count = %s
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (approve_count, deny_count, int(trade_id)),
+                )
+                updated = cur.fetchone()
+            conn.commit()
+            return dict(updated) if updated else {}, True
+
+    def finalize_trade(self, trade_id: int, decision: str, finalized_by: int | None = None, reason: str = ""):
+        decision = (decision or "").strip().lower()
+        if decision not in {"approved", "denied"}:
+            raise ValueError("Decision must be approved or denied.")
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE bot_trades
+                    SET status = %s,
+                        finalized_by = %s,
+                        finalized_reason = %s,
+                        finalized_at = NOW()
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (decision, int(finalized_by) if finalized_by else None, reason or "", int(trade_id)),
+                )
+                row = cur.fetchone()
+            conn.commit()
+            return dict(row) if row else None
+
+    def get_trade_votes(self, trade_id: int) -> list[dict]:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT voter_user_id, voter_username, vote, created_at, updated_at
+                    FROM bot_trade_votes
+                    WHERE trade_id = %s
+                    ORDER BY updated_at ASC, id ASC
+                    """,
+                    (int(trade_id),),
+                )
+                return [dict(row) for row in cur.fetchall()]
 
 
 TOKEN_DB = TokenDatabase(DATABASE_URL)
@@ -1278,6 +1466,7 @@ async def on_ready():
     print(f"NEWS_CHANNEL_ID: {NEWS_CHANNEL_ID}")
     print(f"OPENAI_API_KEY set: {'yes' if OPENAI_API_KEY else 'no'}")
     print(f"DATABASE_URL set: {'yes' if DATABASE_URL else 'no'}")
+    bot.add_view(TradeReviewView())
     try:
         if GUILD_IDS:
             for guild_id in GUILD_IDS:
@@ -1642,7 +1831,7 @@ async def roster(interaction: discord.Interaction, team_name: str, page: Optiona
     standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
     merged_team = {**team_row, **standing_row}
     embed = build_roster_embed(merged_team, roster_rows, page or 1)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="team", description="Show a team summary and its first roster page.")
@@ -2456,6 +2645,145 @@ async def postoverview(interaction: discord.Interaction):
 
 
 
+
+
+def member_has_role_id(member: discord.Member, role_id: int) -> bool:
+    if not role_id:
+        return False
+    return any(int(role.id) == int(role_id) for role in getattr(member, "roles", []))
+
+
+def is_trade_committee_member(member: discord.Member) -> bool:
+    return member_has_role_id(member, TRADE_COMMITTEE_ROLE_ID)
+
+
+def trade_status_title(status: str) -> str:
+    status = (status or "pending").lower()
+    if status == "approved":
+        return "✅ Trade Approved"
+    if status == "denied":
+        return "❌ Trade Denied"
+    return "📝 Trade Pending Review"
+
+
+def build_trade_embed(trade_row: dict) -> discord.Embed:
+    trade_id = safe_int(trade_row.get("id"))
+    status = safe_text(trade_row.get("status"), "pending").lower()
+    color = 0xFEE75C if status == "pending" else (0x57F287 if status == "approved" else 0xED4245)
+    embed = discord.Embed(
+        title=f"{trade_status_title(status)} — #{trade_id}",
+        color=color,
+        description=(
+            f"**{safe_text(trade_row.get('team_one_name'))} receive:** {safe_text(trade_row.get('team_one_gets'))}\n"
+            f"**{safe_text(trade_row.get('team_two_name'))} receive:** {safe_text(trade_row.get('team_two_gets'))}"
+        ),
+    )
+    embed.add_field(name="Submitted By", value=safe_text(trade_row.get("submitted_username")), inline=True)
+    embed.add_field(
+        name="Vote Tally",
+        value=(
+            f"✅ Approvals: **{safe_int(trade_row.get('approve_count'))} / {TRADE_REQUIRED_APPROVALS}**\n"
+            f"❌ Denials: **{safe_int(trade_row.get('deny_count'))} / {TRADE_REQUIRED_DENIALS}**"
+        ),
+        inline=True,
+    )
+    status_value = safe_text(trade_row.get("status"), "pending").title()
+    if trade_row.get("finalized_reason"):
+        status_value += f"\nReason: {safe_text(trade_row.get('finalized_reason'))}"
+    embed.add_field(name="Status", value=status_value, inline=False)
+    notes = safe_text(trade_row.get("notes"), "")
+    if notes and notes != "Unknown":
+        embed.add_field(name="Notes", value=notes, inline=False)
+    votes = TOKEN_DB.get_trade_votes(trade_id)
+    if votes:
+        approval_names = [safe_text(v.get("voter_username")) for v in votes if v.get("vote") == "approve"]
+        denial_names = [safe_text(v.get("voter_username")) for v in votes if v.get("vote") == "deny"]
+        embed.add_field(name="Approved By", value=", ".join(approval_names) if approval_names else "—", inline=True)
+        embed.add_field(name="Denied By", value=", ".join(denial_names) if denial_names else "—", inline=True)
+    embed.set_footer(text="Trade committee needs two approves to pass or two denies to fail.")
+    return embed
+
+
+async def fetch_channel_message(channel_id: int, message_id: int) -> discord.Message | None:
+    if not channel_id or not message_id:
+        return None
+    channel = bot.get_channel(int(channel_id))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(channel_id))
+        except Exception:
+            return None
+    try:
+        return await channel.fetch_message(int(message_id))
+    except Exception:
+        return None
+
+
+async def refresh_trade_message(trade_row: dict):
+    if not trade_row:
+        return
+    message = await fetch_channel_message(safe_int(trade_row.get("review_channel_id")), safe_int(trade_row.get("review_message_id")))
+    if message is None:
+        return
+    status = safe_text(trade_row.get("status"), "pending").lower()
+    view = TradeReviewView() if status == "pending" else None
+    await message.edit(embed=build_trade_embed(trade_row), view=view)
+
+
+async def finalize_trade_if_threshold_met(trade_row: dict, acting_user_id: int | None = None, reason: str = "") -> dict:
+    if not trade_row:
+        return trade_row
+    status = safe_text(trade_row.get("status"), "pending").lower()
+    if status != "pending":
+        return trade_row
+    approve_count = safe_int(trade_row.get("approve_count"))
+    deny_count = safe_int(trade_row.get("deny_count"))
+    if approve_count >= TRADE_REQUIRED_APPROVALS:
+        trade_row = TOKEN_DB.finalize_trade(safe_int(trade_row.get("id")), "approved", acting_user_id, reason or "Reached required approvals")
+    elif deny_count >= TRADE_REQUIRED_DENIALS:
+        trade_row = TOKEN_DB.finalize_trade(safe_int(trade_row.get("id")), "denied", acting_user_id, reason or "Reached required denials")
+    await refresh_trade_message(trade_row)
+    return trade_row
+
+
+class TradeReviewView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _handle_vote(self, interaction: discord.Interaction, vote: str):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command must be used inside a server.", ephemeral=True)
+            return
+        if not is_trade_committee_member(interaction.user):
+            await interaction.response.send_message("You are not on the trade committee.", ephemeral=True)
+            return
+        if interaction.message is None:
+            await interaction.response.send_message("Could not find the trade review message.", ephemeral=True)
+            return
+
+        trade_row = TOKEN_DB.get_trade_by_message(int(interaction.message.id))
+        if not trade_row:
+            await interaction.response.send_message("Could not find the trade linked to this review message.", ephemeral=True)
+            return
+        if safe_text(trade_row.get("status"), "pending").lower() != "pending":
+            await interaction.response.send_message("This trade has already been finalized.", ephemeral=True)
+            return
+
+        trade_row, _changed = TOKEN_DB.upsert_trade_vote(safe_int(trade_row.get("id")), interaction.user, vote)
+        trade_row = await finalize_trade_if_threshold_met(trade_row, int(interaction.user.id))
+        status = safe_text(trade_row.get("status"), "pending").lower()
+        content = None
+        if TRADE_COMMITTEE_ROLE_ID:
+            content = f"<@&{TRADE_COMMITTEE_ROLE_ID}>"
+        await interaction.response.edit_message(content=content, embed=build_trade_embed(trade_row), view=TradeReviewView() if status == "pending" else None)
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅", custom_id="trade_vote_approve")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_vote(interaction, "approve")
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌", custom_id="trade_vote_deny")
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_vote(interaction, "deny")
 
 def record_to_dict(row):
     if row is None:
@@ -5007,6 +5335,104 @@ async def storylines(interaction: discord.Interaction):
     )
 
 
+
+
+@bot.tree.command(name="submittrade", description="Submit a trade for committee review.")
+@app_commands.describe(
+    team_one="First team in the trade",
+    team_two="Second team in the trade",
+    team_one_gets="What the first team receives",
+    team_two_gets="What the second team receives",
+    notes="Optional notes for the committee"
+)
+async def submittrade(
+    interaction: discord.Interaction,
+    team_one: str,
+    team_two: str,
+    team_one_gets: str,
+    team_two_gets: str,
+    notes: Optional[str] = None,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not TRADE_REVIEW_CHANNEL_ID:
+        await interaction.followup.send("TRADE_REVIEW_CHANNEL_ID is not configured.", ephemeral=True)
+        return
+    if not TRADE_COMMITTEE_ROLE_ID:
+        await interaction.followup.send("TRADE_COMMITTEE_ROLE_ID is not configured.", ephemeral=True)
+        return
+    if team_one.strip().lower() == team_two.strip().lower():
+        await interaction.followup.send("Team one and team two must be different.", ephemeral=True)
+        return
+
+    trade_row = TOKEN_DB.create_trade(
+        interaction.user,
+        team_one.strip(),
+        team_two.strip(),
+        team_one_gets.strip(),
+        team_two_gets.strip(),
+        (notes or "").strip(),
+    )
+
+    review_channel = bot.get_channel(TRADE_REVIEW_CHANNEL_ID)
+    if review_channel is None:
+        try:
+            review_channel = await bot.fetch_channel(TRADE_REVIEW_CHANNEL_ID)
+        except Exception as exc:
+            await interaction.followup.send(f"Could not find the trade review channel: {exc}", ephemeral=True)
+            return
+
+    message = await review_channel.send(
+        content=f"<@&{TRADE_COMMITTEE_ROLE_ID}>",
+        embed=build_trade_embed(trade_row),
+        view=TradeReviewView(),
+    )
+    TOKEN_DB.set_trade_review_message(safe_int(trade_row.get("id")), int(review_channel.id), int(message.id))
+    trade_row = TOKEN_DB.get_trade(safe_int(trade_row.get("id"))) or trade_row
+
+    await interaction.followup.send(
+        f"Trade **#{safe_int(trade_row.get('id'))}** submitted to the trade committee in {review_channel.mention}.",
+        ephemeral=True,
+    )
+    await send_log_message(
+        f"📝 TRADE SUBMITTED: {interaction.user.mention} submitted trade #{safe_int(trade_row.get('id'))} — {safe_text(trade_row.get('team_one_name'))} / {safe_text(trade_row.get('team_two_name'))}."
+    )
+
+
+@bot.tree.command(name="forcetrade", description="Admin: force-approve or force-deny a trade.")
+@admin_only()
+@app_commands.describe(
+    trade_id="Trade ID number",
+    decision="approve or deny",
+    reason="Optional reason shown on the trade"
+)
+@app_commands.choices(decision=[
+    app_commands.Choice(name="approve", value="approve"),
+    app_commands.Choice(name="deny", value="deny"),
+])
+async def forcetrade(
+    interaction: discord.Interaction,
+    trade_id: int,
+    decision: app_commands.Choice[str],
+    reason: Optional[str] = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    trade_row = TOKEN_DB.get_trade(int(trade_id))
+    if not trade_row:
+        await interaction.followup.send(f"Trade #{trade_id} was not found.", ephemeral=True)
+        return
+
+    final_status = "approved" if decision.value == "approve" else "denied"
+    reason_text = (reason or f"Force {decision.value}d by admin").strip()
+    trade_row = TOKEN_DB.finalize_trade(int(trade_id), final_status, int(interaction.user.id), reason_text)
+    await refresh_trade_message(trade_row)
+    await interaction.followup.send(
+        f"Trade **#{trade_id}** was force-{decision.value}d.",
+        ephemeral=True,
+    )
+    await send_log_message(
+        f"⚖️ TRADE FORCED: {interaction.user.mention} force-{decision.value}d trade #{trade_id}. Reason: {reason_text}"
+    )
 
 @bot.tree.command(name="sportsbook", description="Show the current sportsbook lines.")
 async def sportsbook(interaction: discord.Interaction):
