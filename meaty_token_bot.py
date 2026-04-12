@@ -1097,7 +1097,7 @@ def fetch_game_row_for_recap(stage_index: int, display_week: int, game_id: int) 
             return record_to_dict(row)
 
 
-def fetch_game_statlines_for_team(table_name: str, team_id: int, season_index: int, stage_index: int, raw_week: int, metric_candidates: dict[str, list[str]], sort_keys: list[str]) -> list[dict]:
+def fetch_game_statlines_for_team(table_name: str, team_id: int, season_index: int, stage_index: int, raw_week: int, game_id: int, metric_candidates: dict[str, list[str]], sort_keys: list[str]) -> list[dict]:
     alias = 's'
     cols = get_table_columns(table_name)
     roster_col = pick_existing_column(table_name, ['roster_id'])
@@ -1105,7 +1105,8 @@ def fetch_game_statlines_for_team(table_name: str, team_id: int, season_index: i
     team_col = pick_existing_column(table_name, ['team_id'])
     season_col = pick_existing_column(table_name, ['season_index'])
     stage_col = pick_existing_column(table_name, ['stage_index'])
-    week_col = pick_existing_column(table_name, ['week'])
+    week_col = pick_existing_column(table_name, ['week', 'week_index'])
+    schedule_col = pick_existing_column(table_name, ['schedule_id', 'game_id'])
     select_parts = [
         f"{alias}.{roster_col} AS roster_id" if roster_col else "NULL::bigint AS roster_id",
         f"COALESCE(MAX(players.full_name), MAX({alias}.{full_name_col}), 'Unknown') AS player_name" if full_name_col else "COALESCE(MAX(players.full_name), 'Unknown') AS player_name",
@@ -1124,15 +1125,19 @@ def fetch_game_statlines_for_team(table_name: str, team_id: int, season_index: i
     else:
         where_parts.append("players.team_id = %s")
         params.append(int(team_id))
-    if season_col:
-        where_parts.append(f"COALESCE({alias}.{season_col}, 0) = %s")
-        params.append(int(season_index))
-    if stage_col:
-        where_parts.append(f"COALESCE({alias}.{stage_col}, 0) = %s")
-        params.append(int(stage_index))
-    if week_col:
-        where_parts.append(f"COALESCE({alias}.{week_col}, 0) = %s")
-        params.append(int(raw_week))
+    if schedule_col:
+        where_parts.append(f"COALESCE({alias}.{schedule_col}, 0) = %s")
+        params.append(int(game_id))
+    else:
+        if season_col:
+            where_parts.append(f"COALESCE({alias}.{season_col}, 0) = %s")
+            params.append(int(season_index))
+        if stage_col:
+            where_parts.append(f"COALESCE({alias}.{stage_col}, 0) = %s")
+            params.append(int(stage_index))
+        if week_col:
+            where_parts.append(f"COALESCE({alias}.{week_col}, 0) = %s")
+            params.append(int(raw_week))
     order_parts = [f"{key} DESC" for key in sort_keys if key in metric_select_names]
     order_parts.append('player_name ASC')
     query = f"""
@@ -1159,28 +1164,28 @@ def fetch_game_recap_stat_package(game_row: dict) -> dict:
     away_team_id = safe_int(game_row.get('away_team_id'))
     home_team_id = safe_int(game_row.get('home_team_id'))
     package = {
-        'away_passing': fetch_game_statlines_for_team('player_passing_stats', away_team_id, season_index, stage_index, raw_week, {
+        'away_passing': fetch_game_statlines_for_team('player_passing_stats', away_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
             'yards': ['pass_yds'], 'tds': ['pass_tds', 'pass_td'], 'ints': ['pass_ints', 'pass_int']
         }, ['yards', 'tds']),
-        'home_passing': fetch_game_statlines_for_team('player_passing_stats', home_team_id, season_index, stage_index, raw_week, {
+        'home_passing': fetch_game_statlines_for_team('player_passing_stats', home_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
             'yards': ['pass_yds'], 'tds': ['pass_tds', 'pass_td'], 'ints': ['pass_ints', 'pass_int']
         }, ['yards', 'tds']),
-        'away_rushing': fetch_game_statlines_for_team('player_rushing_stats', away_team_id, season_index, stage_index, raw_week, {
+        'away_rushing': fetch_game_statlines_for_team('player_rushing_stats', away_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
             'yards': ['rush_yds'], 'tds': ['rush_tds', 'rush_td'], 'attempts': ['rush_attempts', 'rush_att', 'carries']
         }, ['yards', 'tds']),
-        'home_rushing': fetch_game_statlines_for_team('player_rushing_stats', home_team_id, season_index, stage_index, raw_week, {
+        'home_rushing': fetch_game_statlines_for_team('player_rushing_stats', home_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
             'yards': ['rush_yds'], 'tds': ['rush_tds', 'rush_td'], 'attempts': ['rush_attempts', 'rush_att', 'carries']
         }, ['yards', 'tds']),
-        'away_receiving': fetch_game_statlines_for_team('player_receiving_stats', away_team_id, season_index, stage_index, raw_week, {
+        'away_receiving': fetch_game_statlines_for_team('player_receiving_stats', away_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
             'yards': ['rec_yds', 'recv_yds', 'receiving_yds'], 'tds': ['rec_tds', 'rec_td', 'recv_tds', 'receiving_tds'], 'catches': ['receptions', 'rec_catches', 'recv_catches']
         }, ['yards', 'tds', 'catches']),
-        'home_receiving': fetch_game_statlines_for_team('player_receiving_stats', home_team_id, season_index, stage_index, raw_week, {
+        'home_receiving': fetch_game_statlines_for_team('player_receiving_stats', home_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
             'yards': ['rec_yds', 'recv_yds', 'receiving_yds'], 'tds': ['rec_tds', 'rec_td', 'recv_tds', 'receiving_tds'], 'catches': ['receptions', 'rec_catches', 'recv_catches']
         }, ['yards', 'tds', 'catches']),
-        'away_defense': fetch_game_statlines_for_team('player_defense_stats', away_team_id, season_index, stage_index, raw_week, {
+        'away_defense': fetch_game_statlines_for_team('player_defense_stats', away_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
             'sacks': ['def_sacks'], 'ints': ['def_ints'], 'tackles': ['def_tackles', 'tackles', 'total_tackles']
         }, ['ints', 'sacks', 'tackles']),
-        'home_defense': fetch_game_statlines_for_team('player_defense_stats', home_team_id, season_index, stage_index, raw_week, {
+        'home_defense': fetch_game_statlines_for_team('player_defense_stats', home_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
             'sacks': ['def_sacks'], 'ints': ['def_ints'], 'tackles': ['def_tackles', 'tackles', 'total_tackles']
         }, ['ints', 'sacks', 'tackles']),
     }
