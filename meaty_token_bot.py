@@ -6288,13 +6288,98 @@ def _recap_penalty(memory: list[dict], key: str, value: str) -> int:
     return penalty
 
 
+def format_record_tuple(wins: int, losses: int, ties: int) -> str:
+    return f"{wins}-{losses}-{ties}" if ties else f"{wins}-{losses}"
+
+
+def expected_games_for_recap(stage_index: int, display_week: int) -> Optional[int]:
+    if stage_index in {0, 1}:
+        return max(0, safe_int(display_week))
+    return None
+
+
+def compute_team_record_through_game(team_id: int, season_index: int, stage_index: int, raw_week: int, game_id: int) -> dict:
+    wins = losses = ties = 0
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT game_id, week, away_team_id, home_team_id, away_score, home_score, status
+                FROM games
+                WHERE season_index = %s
+                  AND stage_index = %s
+                  AND (away_team_id = %s OR home_team_id = %s)
+                  AND (
+                        week < %s OR
+                        (week = %s AND game_id <= %s)
+                  )
+                ORDER BY week ASC, game_id ASC
+                """,
+                (int(season_index), int(stage_index), int(team_id), int(team_id), int(raw_week), int(raw_week), int(game_id)),
+            )
+            rows = [record_to_dict(r) for r in cur.fetchall()]
+    for row in rows:
+        if not looks_like_completed_game(row):
+            continue
+        away_id = safe_int(row.get('away_team_id'))
+        home_id = safe_int(row.get('home_team_id'))
+        away_score = safe_int(row.get('away_score'))
+        home_score = safe_int(row.get('home_score'))
+        if away_score == home_score:
+            ties += 1
+        else:
+            team_won = (away_id == team_id and away_score > home_score) or (home_id == team_id and home_score > away_score)
+            if team_won:
+                wins += 1
+            else:
+                losses += 1
+    return {
+        'wins': wins,
+        'losses': losses,
+        'ties': ties,
+        'games_played': wins + losses + ties,
+        'record': format_record_tuple(wins, losses, ties),
+    }
+
+
+def resolve_recap_record(game_row: dict, team_side: str) -> Optional[str]:
+    display_week = safe_int(game_row.get('display_week'))
+    stage_index = safe_int(game_row.get('stage_index'))
+    expected_games = expected_games_for_recap(stage_index, display_week)
+    fallback_record = format_record_tuple(
+        safe_int(game_row.get(f'{team_side}_wins')),
+        safe_int(game_row.get(f'{team_side}_losses')),
+        safe_int(game_row.get(f'{team_side}_ties')),
+    )
+    team_id = safe_int(game_row.get('away_team_id' if team_side == 'away' else 'home_team_id'))
+    computed = compute_team_record_through_game(
+        team_id,
+        safe_int(game_row.get('season_index')),
+        stage_index,
+        safe_int(game_row.get('week')),
+        safe_int(game_row.get('game_id')),
+    )
+    if expected_games is None:
+        return computed['record']
+    if safe_int(computed.get('games_played')) == expected_games:
+        return computed['record']
+    fallback_total = (
+        safe_int(game_row.get(f'{team_side}_wins'))
+        + safe_int(game_row.get(f'{team_side}_losses'))
+        + safe_int(game_row.get(f'{team_side}_ties'))
+    )
+    if fallback_total == expected_games:
+        return fallback_record
+    return None
+
+
 def build_gamerecap_facts(game_row: dict, stats: dict) -> dict:
     away_score = safe_int(game_row.get('away_score'))
     home_score = safe_int(game_row.get('home_score'))
     away_team = safe_text(game_row.get('away_team_name'))
     home_team = safe_text(game_row.get('home_team_name'))
-    away_record = f"{safe_int(game_row.get('away_wins'))}-{safe_int(game_row.get('away_losses'))}-{safe_int(game_row.get('away_ties'))}"
-    home_record = f"{safe_int(game_row.get('home_wins'))}-{safe_int(game_row.get('home_losses'))}-{safe_int(game_row.get('home_ties'))}"
+    away_record = resolve_recap_record(game_row, 'away')
+    home_record = resolve_recap_record(game_row, 'home')
     home_won = home_score > away_score
     winner = home_team if home_won else away_team
     loser = away_team if home_won else home_team
@@ -6307,12 +6392,14 @@ def build_gamerecap_facts(game_row: dict, stats: dict) -> dict:
     rushing = pick_statline_leader(stats['home_rushing'] if home_won else stats['away_rushing'])
     receiving = pick_statline_leader(stats['home_receiving'] if home_won else stats['away_receiving'])
     defense = pick_statline_leader(stats['home_defense'] if home_won else stats['away_defense'])
-    team_total_wins_gap = abs(safe_int(game_row.get('away_wins')) - safe_int(game_row.get('home_wins')))
+    away_wins_now = safe_int(game_row.get('away_wins'))
+    home_wins_now = safe_int(game_row.get('home_wins'))
+    team_total_wins_gap = abs(away_wins_now - home_wins_now)
     is_divisional = False
     away_name_bits = away_team.split()
     home_name_bits = home_team.split()
     if len(away_name_bits) > 1 and len(home_name_bits) > 1:
-        is_divisional = away_name_bits[-1] != home_name_bits[-1] and safe_int(game_row.get('away_wins')) >= 0 and safe_int(game_row.get('home_wins')) >= 0
+        is_divisional = away_name_bits[-1] != home_name_bits[-1] and away_wins_now >= 0 and home_wins_now >= 0
     themes = []
     if margin <= 8:
         themes.append('one-score drama')
@@ -6344,6 +6431,7 @@ def build_gamerecap_facts(game_row: dict, stats: dict) -> dict:
         'losing_score': loser_score,
         'winner_record': winner_record,
         'loser_record': loser_record,
+        'has_valid_records': bool(winner_record and loser_record),
         'margin': margin,
         'is_one_score_game': margin <= 8,
         'is_blowout': margin >= 17,
@@ -6495,7 +6583,8 @@ def template_gamerecap_text_v2(facts: dict, plan: dict) -> str:
     body_bits = [middle_start.rstrip('.') + '.']
     if snippets:
         body_bits.append(' '.join(s.rstrip('.') + '.' for s in snippets[:2]))
-    body_bits.append(f"The result leaves {facts['winner']} at {facts['winner_record']} while {facts['loser']} drop this one at {facts['loser_record']}.")
+    if facts.get('has_valid_records') and facts.get('winner_record') and facts.get('loser_record'):
+        body_bits.append(f"The result leaves {facts['winner']} at {facts['winner_record']} while {facts['loser']} drop this one at {facts['loser_record']}.")
     closer_pool = GAMERECAP_V2_CLOSERS.get(plan['closer_family'], GAMERECAP_V2_CLOSERS['default'])
     closer = deterministic_choice(closer_pool, f"{facts['matchup']}-{plan['closer_family']}-{facts['week']}")
     return ' '.join([opener] + body_bits + [closer])
