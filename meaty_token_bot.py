@@ -3679,19 +3679,258 @@ def fetch_team_roster_rows(team_id: int) -> list[dict]:
             return [record_to_dict(row) for row in cur.fetchall()]
 
 
+def rating_value(row: dict, *field_names: str) -> Optional[int]:
+    for field_name in field_names:
+        if field_name not in row:
+            continue
+        value = row.get(field_name)
+        try:
+            if value is None or value == "":
+                continue
+            numeric = int(float(value))
+        except Exception:
+            continue
+        if numeric > 0:
+            return numeric
+    return None
+
+
+RATING_LABEL_CANDIDATES = {
+    "Speed": ("speed_rating",),
+    "Acceleration": ("acceleration_rating",),
+    "Agility": ("agility_rating",),
+    "Awareness": ("awareness_rating", "awareness"),
+    "Throw Power": ("throw_power_rating",),
+    "Short Accuracy": ("short_accuracy_rating", "throw_accuracy_short_rating", "throw_short_rating"),
+    "Mid Accuracy": ("mid_accuracy_rating", "medium_accuracy_rating", "throw_accuracy_mid_rating", "throw_medium_rating"),
+    "Deep Accuracy": ("deep_accuracy_rating", "throw_accuracy_deep_rating", "throw_deep_rating"),
+    "Throw on Run": ("throw_on_run_rating",),
+    "Play Action": ("play_action_rating",),
+    "Break Sack": ("break_sack_rating",),
+    "Carrying": ("carrying_rating",),
+    "Break Tackle": ("break_tackle_rating",),
+    "Trucking": ("trucking_rating",),
+    "Change of Direction": ("change_of_direction_rating",),
+    "Juke": ("juke_move_rating", "juke_rating"),
+    "Spin": ("spin_move_rating", "spin_rating"),
+    "Catch": ("catch_rating",),
+    "Catch in Traffic": ("catch_in_traffic_rating",),
+    "Spec Catch": ("spectacular_catch_rating",),
+    "Release": ("release_rating",),
+    "Short Route": ("short_route_running_rating",),
+    "Mid Route": ("medium_route_running_rating", "mid_route_running_rating"),
+    "Deep Route": ("deep_route_running_rating",),
+    "Strength": ("strength_rating",),
+    "Pass Block": ("pass_block_rating",),
+    "Run Block": ("run_block_rating",),
+    "Impact Block": ("impact_block_rating",),
+    "Lead Block": ("lead_block_rating",),
+    "Finesse Moves": ("finesse_moves_rating", "finesse_move_rating"),
+    "Power Moves": ("power_moves_rating", "power_move_rating"),
+    "Block Shed": ("block_shedding_rating", "block_shed_rating"),
+    "Tackle": ("tackle_rating",),
+    "Pursuit": ("pursuit_rating",),
+    "Hit Power": ("hit_power_rating",),
+    "Play Recognition": ("play_recognition_rating",),
+    "Man Coverage": ("man_coverage_rating",),
+    "Zone Coverage": ("zone_coverage_rating",),
+    "Press": ("press_rating",),
+    "Jump": ("jump_rating",),
+    "Kick Power": ("kick_power_rating",),
+    "Kick Accuracy": ("kick_accuracy_rating",),
+    "Punt Power": ("punt_power_rating",),
+    "Punt Accuracy": ("punt_accuracy_rating",),
+}
+
+
+POSITION_RATING_PLANS = {
+    "QB": ["Throw Power", "Short Accuracy", "Mid Accuracy", "Deep Accuracy", "Throw on Run", "Play Action", "Break Sack", "Speed", "Awareness"],
+    "HB": ["Speed", "Acceleration", "Agility", "Carrying", "Break Tackle", "Trucking", "Change of Direction", "Juke", "Spin"],
+    "FB": ["Speed", "Strength", "Carrying", "Lead Block", "Run Block", "Impact Block", "Break Tackle", "Trucking"],
+    "WR": ["Speed", "Acceleration", "Catch", "Catch in Traffic", "Spec Catch", "Release", "Short Route", "Mid Route", "Deep Route", "Jump"],
+    "TE": ["Speed", "Catch", "Catch in Traffic", "Spec Catch", "Short Route", "Mid Route", "Run Block", "Impact Block"],
+    "LT": ["Strength", "Awareness", "Pass Block", "Run Block", "Impact Block"],
+    "LG": ["Strength", "Awareness", "Pass Block", "Run Block", "Impact Block"],
+    "C": ["Strength", "Awareness", "Pass Block", "Run Block", "Impact Block"],
+    "RG": ["Strength", "Awareness", "Pass Block", "Run Block", "Impact Block"],
+    "RT": ["Strength", "Awareness", "Pass Block", "Run Block", "Impact Block"],
+    "LE": ["Strength", "Finesse Moves", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
+    "RE": ["Strength", "Finesse Moves", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
+    "LEDGE": ["Speed", "Finesse Moves", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
+    "REDGE": ["Speed", "Finesse Moves", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
+    "DT": ["Strength", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
+    "LOLB": ["Speed", "Tackle", "Block Shed", "Hit Power", "Zone Coverage", "Pursuit"],
+    "MLB": ["Speed", "Awareness", "Tackle", "Block Shed", "Hit Power", "Zone Coverage", "Pursuit"],
+    "ROLB": ["Speed", "Tackle", "Block Shed", "Hit Power", "Zone Coverage", "Pursuit"],
+    "SAM": ["Speed", "Tackle", "Block Shed", "Hit Power", "Zone Coverage", "Pursuit"],
+    "MIKE": ["Speed", "Awareness", "Tackle", "Block Shed", "Hit Power", "Zone Coverage", "Pursuit"],
+    "WILL": ["Speed", "Tackle", "Block Shed", "Hit Power", "Man Coverage", "Zone Coverage", "Pursuit"],
+    "CB": ["Speed", "Acceleration", "Man Coverage", "Zone Coverage", "Press", "Play Recognition", "Jump", "Catch"],
+    "FS": ["Speed", "Acceleration", "Zone Coverage", "Man Coverage", "Play Recognition", "Tackle", "Pursuit", "Catch"],
+    "SS": ["Speed", "Acceleration", "Zone Coverage", "Hit Power", "Play Recognition", "Tackle", "Pursuit", "Catch"],
+    "K": ["Kick Power", "Kick Accuracy", "Awareness"],
+    "P": ["Punt Power", "Punt Accuracy", "Awareness"],
+}
+
+
+POSITION_VALUE_WEIGHTS = {
+    "QB": 18,
+    "WR": 11,
+    "LT": 11,
+    "RT": 10,
+    "LE": 10,
+    "RE": 10,
+    "LEDGE": 12,
+    "REDGE": 12,
+    "DT": 9,
+    "CB": 11,
+    "FS": 8,
+    "SS": 8,
+    "MLB": 8,
+    "MIKE": 8,
+    "WILL": 8,
+    "LOLB": 8,
+    "ROLB": 8,
+    "HB": 8,
+    "FB": 4,
+    "TE": 7,
+    "LG": 8,
+    "C": 8,
+    "RG": 8,
+    "K": -2,
+    "P": -4,
+}
+
+
+def select_key_ratings(row: dict, position: str, max_items: int = 6) -> list[tuple[str, int]]:
+    position = (position or "").upper()
+    labels = POSITION_RATING_PLANS.get(position, ["Speed", "Awareness", "Catch", "Break Tackle", "Throw Power"])
+    selected: list[tuple[str, int]] = []
+    used_labels: set[str] = set()
+
+    for label in labels:
+        candidates = RATING_LABEL_CANDIDATES.get(label, ())
+        value = rating_value(row, *candidates)
+        if value is None:
+            continue
+        selected.append((label, value))
+        used_labels.add(label)
+        if len(selected) >= max_items:
+            return selected
+
+    fallback_labels = [
+        "Speed", "Acceleration", "Agility", "Strength", "Awareness", "Catch", "Throw Power",
+        "Carrying", "Break Tackle", "Tackle", "Zone Coverage", "Man Coverage", "Finesse Moves", "Power Moves"
+    ]
+    for label in fallback_labels:
+        if label in used_labels:
+            continue
+        candidates = RATING_LABEL_CANDIDATES.get(label, ())
+        value = rating_value(row, *candidates)
+        if value is None:
+            continue
+        selected.append((label, value))
+        if len(selected) >= max_items:
+            break
+    return selected
+
+
+def format_key_ratings(row: dict, position: str, max_items: int = 6) -> str:
+    items = select_key_ratings(row, position, max_items=max_items)
+    if not items:
+        return "No rating data found."
+    return "\n".join(f"{label}: {value}" for label, value in items)
+
+
+def player_value_score(row: dict) -> tuple[int, str]:
+    position = safe_text(row.get("position"), "").upper()
+    overall = resolve_display_overall(row)
+    age = safe_int(row.get("age"), 25)
+    years_pro = safe_int(row.get("years_pro"), 0)
+    dev_raw = safe_int(row.get("dev_trait"), 0)
+    years_left = safe_int(row.get("contract_years_left"), 0)
+    salary = safe_int(row.get("contract_salary"), 0)
+
+    score = overall
+    score += POSITION_VALUE_WEIGHTS.get(position, 0)
+    score += {0: 0, 1: 8, 2: 16, 3: 24}.get(dev_raw, 0)
+    score += min(years_left, 5) * 2
+
+    if position == "QB":
+        if age <= 24:
+            score += 14
+        elif age <= 27:
+            score += 8
+        elif age <= 31:
+            score += 2
+        elif age >= 36:
+            score -= 10
+    elif position in {"HB", "FB"}:
+        if age <= 23:
+            score += 8
+        elif age <= 26:
+            score += 3
+        elif age >= 29:
+            score -= 10
+        if years_pro >= 6:
+            score -= 4
+    else:
+        if age <= 23:
+            score += 10
+        elif age <= 26:
+            score += 6
+        elif age <= 29:
+            score += 2
+        elif age >= 32:
+            score -= 8
+
+    if salary >= 25_000_000:
+        score -= 6
+    elif salary >= 15_000_000:
+        score -= 3
+    elif salary > 0 and salary <= 3_000_000:
+        score += 3
+
+    if overall >= 90:
+        score += 12
+    elif overall >= 85:
+        score += 8
+    elif overall >= 80:
+        score += 4
+
+    score = max(1, min(99, int(round(score))))
+
+    if score >= 92:
+        tier = "Untouchable"
+    elif score >= 84:
+        tier = "Elite"
+    elif score >= 72:
+        tier = "High Value"
+    elif score >= 58:
+        tier = "Starter Value"
+    elif score >= 42:
+        tier = "Depth Plus"
+    else:
+        tier = "Depth / Dev"
+
+    return score, tier
+
+
 def build_player_embed(row: dict) -> discord.Embed:
     team_name = safe_text(row.get("team_name"), "Free Agent")
     dev_label = dev_trait_to_label(row.get("dev_trait"), row.get("resolved_dev_trait_label") or row.get("dev_trait_label"))
     position = safe_text(row.get("position"))
     jersey = safe_int(row.get("jersey_num"))
     title_name = safe_text(row.get("full_name"))
+    display_ovr = resolve_display_overall(row)
+    value_score, value_tier = player_value_score(row)
     title = f"🏈 {title_name}"
     if jersey:
         title += f" #{jersey}"
 
     embed = build_embed(
         title,
-        f"**{position}** • **{team_name}** • **{resolve_display_overall(row)} OVR** • **{dev_label}**",
+        f"**{position}** • **{team_name}** • **{display_ovr} OVR** • **{dev_label}**",
         0x5865F2,
     )
     embed.add_field(
@@ -3706,12 +3945,15 @@ def build_player_embed(row: dict) -> discord.Embed:
     )
     embed.add_field(
         name="Key Ratings",
+        value=format_key_ratings(row, position, max_items=6),
+        inline=True,
+    )
+    embed.add_field(
+        name="Value",
         value=(
-            f"Speed: {safe_int(row.get('speed_rating'))}\n"
-            f"Awareness: {safe_int(row.get('awareness_rating'))}\n"
-            f"Catch: {safe_int(row.get('catch_rating'))}\n"
-            f"Break Tackle: {safe_int(row.get('break_tackle_rating'))}\n"
-            f"Throw Power: {safe_int(row.get('throw_power_rating'))}"
+            f"Score: {value_score}\n"
+            f"Tier: {value_tier}\n"
+            f"Best OVR: {safe_int(row.get('player_best_ovr'))}"
         ),
         inline=True,
     )
@@ -3720,7 +3962,6 @@ def build_player_embed(row: dict) -> discord.Embed:
         value=(
             f"Years Left: {safe_int(row.get('contract_years_left'))}\n"
             f"Salary: {format_currency_compact(row.get('contract_salary'))}\n"
-            f"Best OVR: {safe_int(row.get('player_best_ovr'))}\n"
             f"Rookie Year: {safe_int(row.get('rookie_year'))}"
         ),
         inline=False,
