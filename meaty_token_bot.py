@@ -3699,18 +3699,18 @@ RATING_LABEL_CANDIDATES = {
     "Speed": ("speed_rating",),
     "Acceleration": ("acceleration_rating",),
     "Agility": ("agility_rating",),
-    "Awareness": ("awareness_rating", "awareness"),
-    "Throw Power": ("throw_power_rating",),
-    "Short Accuracy": ("short_accuracy_rating", "throw_accuracy_short_rating", "throw_short_rating"),
-    "Mid Accuracy": ("mid_accuracy_rating", "medium_accuracy_rating", "throw_accuracy_mid_rating", "throw_medium_rating"),
-    "Deep Accuracy": ("deep_accuracy_rating", "throw_accuracy_deep_rating", "throw_deep_rating"),
-    "Throw on Run": ("throw_on_run_rating",),
-    "Play Action": ("play_action_rating",),
-    "Break Sack": ("break_sack_rating",),
+    "Awareness": ("awareness_rating", "awareness", "awareness_grade"),
+    "Throw Power": ("throw_power_rating", "throwpower_rating"),
+    "Short Accuracy": ("short_accuracy_rating", "short_accuracy", "throw_accuracy_short_rating", "throw_accuracy_short", "throw_short_rating"),
+    "Mid Accuracy": ("mid_accuracy_rating", "mid_accuracy", "medium_accuracy_rating", "medium_accuracy", "throw_accuracy_mid_rating", "throw_accuracy_mid", "throw_medium_rating"),
+    "Deep Accuracy": ("deep_accuracy_rating", "deep_accuracy", "throw_accuracy_deep_rating", "throw_accuracy_deep", "throw_deep_rating"),
+    "Throw on Run": ("throw_on_run_rating", "throw_on_run", "throwonrun_rating"),
+    "Play Action": ("play_action_rating", "play_action", "playaction_rating"),
+    "Break Sack": ("break_sack_rating", "break_sack", "breaksack_rating"),
     "Carrying": ("carrying_rating",),
     "Break Tackle": ("break_tackle_rating",),
     "Trucking": ("trucking_rating",),
-    "Change of Direction": ("change_of_direction_rating",),
+    "Change of Direction": ("change_of_direction_rating", "cod_rating"),
     "Juke": ("juke_move_rating", "juke_rating"),
     "Spin": ("spin_move_rating", "spin_rating"),
     "Catch": ("catch_rating",),
@@ -3744,9 +3744,9 @@ RATING_LABEL_CANDIDATES = {
 
 
 POSITION_RATING_PLANS = {
-    "QB": ["Throw Power", "Short Accuracy", "Mid Accuracy", "Deep Accuracy", "Throw on Run", "Play Action", "Break Sack", "Speed", "Awareness"],
+    "QB": ["Throw Power", "Short Accuracy", "Mid Accuracy", "Deep Accuracy", "Throw on Run", "Play Action", "Break Sack", "Speed", "Acceleration", "Agility"],
     "HB": ["Speed", "Acceleration", "Agility", "Carrying", "Break Tackle", "Trucking", "Change of Direction", "Juke", "Spin"],
-    "FB": ["Speed", "Strength", "Carrying", "Lead Block", "Run Block", "Impact Block", "Break Tackle", "Trucking"],
+    "FB": ["Strength", "Carrying", "Lead Block", "Run Block", "Impact Block", "Break Tackle", "Trucking", "Speed"],
     "WR": ["Speed", "Acceleration", "Catch", "Catch in Traffic", "Spec Catch", "Release", "Short Route", "Mid Route", "Deep Route", "Jump"],
     "TE": ["Speed", "Catch", "Catch in Traffic", "Spec Catch", "Short Route", "Mid Route", "Run Block", "Impact Block"],
     "LT": ["Strength", "Awareness", "Pass Block", "Run Block", "Impact Block"],
@@ -3770,6 +3770,36 @@ POSITION_RATING_PLANS = {
     "SS": ["Speed", "Acceleration", "Zone Coverage", "Hit Power", "Play Recognition", "Tackle", "Pursuit", "Catch"],
     "K": ["Kick Power", "Kick Accuracy", "Awareness"],
     "P": ["Punt Power", "Punt Accuracy", "Awareness"],
+}
+
+
+POSITION_FALLBACK_LABELS = {
+    "QB": ["Speed", "Acceleration", "Agility", "Break Sack", "Awareness"],
+    "HB": ["Speed", "Acceleration", "Agility", "Carrying", "Break Tackle", "Juke"],
+    "FB": ["Strength", "Carrying", "Lead Block", "Impact Block", "Break Tackle"],
+    "WR": ["Speed", "Acceleration", "Catch", "Release", "Jump"],
+    "TE": ["Catch", "Spec Catch", "Run Block", "Impact Block", "Strength"],
+    "LT": ["Strength", "Pass Block", "Run Block", "Impact Block", "Awareness"],
+    "LG": ["Strength", "Pass Block", "Run Block", "Impact Block", "Awareness"],
+    "C": ["Strength", "Pass Block", "Run Block", "Impact Block", "Awareness"],
+    "RG": ["Strength", "Pass Block", "Run Block", "Impact Block", "Awareness"],
+    "RT": ["Strength", "Pass Block", "Run Block", "Impact Block", "Awareness"],
+    "LE": ["Strength", "Power Moves", "Finesse Moves", "Block Shed", "Tackle"],
+    "RE": ["Strength", "Power Moves", "Finesse Moves", "Block Shed", "Tackle"],
+    "LEDGE": ["Speed", "Power Moves", "Finesse Moves", "Block Shed", "Tackle"],
+    "REDGE": ["Speed", "Power Moves", "Finesse Moves", "Block Shed", "Tackle"],
+    "DT": ["Strength", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
+    "LOLB": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
+    "MLB": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
+    "ROLB": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
+    "SAM": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
+    "MIKE": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
+    "WILL": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
+    "CB": ["Speed", "Acceleration", "Man Coverage", "Zone Coverage", "Press"],
+    "FS": ["Speed", "Acceleration", "Zone Coverage", "Play Recognition", "Tackle"],
+    "SS": ["Speed", "Acceleration", "Hit Power", "Zone Coverage", "Tackle"],
+    "K": ["Kick Power", "Kick Accuracy"],
+    "P": ["Punt Power", "Punt Accuracy"],
 }
 
 
@@ -3818,10 +3848,10 @@ def select_key_ratings(row: dict, position: str, max_items: int = 6) -> list[tup
         if len(selected) >= max_items:
             return selected
 
-    fallback_labels = [
-        "Speed", "Acceleration", "Agility", "Strength", "Awareness", "Catch", "Throw Power",
-        "Carrying", "Break Tackle", "Tackle", "Zone Coverage", "Man Coverage", "Finesse Moves", "Power Moves"
-    ]
+    fallback_labels = POSITION_FALLBACK_LABELS.get(
+        position,
+        ["Speed", "Acceleration", "Agility", "Strength", "Awareness", "Catch", "Throw Power", "Carrying", "Break Tackle", "Tackle"],
+    )
     for label in fallback_labels:
         if label in used_labels:
             continue
@@ -3851,64 +3881,66 @@ def player_value_score(row: dict) -> tuple[int, str]:
     years_left = safe_int(row.get("contract_years_left"), 0)
     salary = safe_int(row.get("contract_salary"), 0)
 
-    score = overall
-    score += POSITION_VALUE_WEIGHTS.get(position, 0)
-    score += {0: 0, 1: 8, 2: 16, 3: 24}.get(dev_raw, 0)
-    score += min(years_left, 5) * 2
+    base_score = overall * 0.65
+    base_score += POSITION_VALUE_WEIGHTS.get(position, 0) * 0.35
+    base_score += {0: 0, 1: 4, 2: 8, 3: 12}.get(dev_raw, 0)
+    base_score += min(years_left, 5) * 0.8
 
     if position == "QB":
         if age <= 24:
-            score += 14
+            base_score += 5
         elif age <= 27:
-            score += 8
+            base_score += 3
         elif age <= 31:
-            score += 2
+            base_score += 1
         elif age >= 36:
-            score -= 10
+            base_score -= 5
     elif position in {"HB", "FB"}:
         if age <= 23:
-            score += 8
+            base_score += 3
         elif age <= 26:
-            score += 3
+            base_score += 1
         elif age >= 29:
-            score -= 10
+            base_score -= 6
         if years_pro >= 6:
-            score -= 4
+            base_score -= 2
     else:
         if age <= 23:
-            score += 10
+            base_score += 4
         elif age <= 26:
-            score += 6
+            base_score += 2
         elif age <= 29:
-            score += 2
+            base_score += 1
         elif age >= 32:
-            score -= 8
+            base_score -= 4
 
     if salary >= 25_000_000:
-        score -= 6
+        base_score -= 5
     elif salary >= 15_000_000:
-        score -= 3
-    elif salary > 0 and salary <= 3_000_000:
-        score += 3
+        base_score -= 3
+    elif 0 < salary <= 3_000_000:
+        base_score += 2
 
-    if overall >= 90:
-        score += 12
+    if overall >= 95:
+        base_score += 12
+    elif overall >= 90:
+        base_score += 8
     elif overall >= 85:
-        score += 8
+        base_score += 5
     elif overall >= 80:
-        score += 4
+        base_score += 2
 
-    score = max(1, min(99, int(round(score))))
+    score = max(1, min(99, int(round(base_score))))
 
-    if score >= 92:
+    if score >= 90:
         tier = "Untouchable"
-    elif score >= 84:
+    elif score >= 80:
         tier = "Elite"
-    elif score >= 72:
+    elif score >= 68:
         tier = "High Value"
-    elif score >= 58:
+    elif score >= 54:
         tier = "Starter Value"
-    elif score >= 42:
+    elif score >= 40:
         tier = "Depth Plus"
     else:
         tier = "Depth / Dev"
