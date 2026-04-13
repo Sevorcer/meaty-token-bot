@@ -3719,39 +3719,70 @@ def prettify_rating_field_name(field_name: str) -> str:
 def extract_additional_rating_candidates(row: dict, position: str, used_labels: set[str], limit: int) -> list[tuple[str, int]]:
     position = (position or "").upper()
     keyword_priorities = {
-        "QB": ["throw", "accuracy", "play", "sack", "speed", "acceleration", "agility", "awareness"],
+        "QB": ["throw", "accuracy", "play action", "break sack", "speed", "acceleration", "agility", "awareness"],
         "HB": ["speed", "acceleration", "agility", "carry", "break", "truck", "juke", "spin", "change"],
         "FB": ["strength", "carry", "lead", "impact", "break", "truck", "run block"],
-        "WR": ["speed", "acceleration", "catch", "route", "release", "jump", "agility"],
-        "TE": ["catch", "route", "spec", "run block", "impact", "strength", "speed"],
+        "WR": ["speed", "acceleration", "agility", "catch", "spectacular", "traffic", "release", "route", "jump"],
+        "TE": ["speed", "catch", "spectacular", "traffic", "route", "run block", "impact", "strength"],
         "LT": ["pass block", "run block", "impact", "strength", "awareness"],
         "LG": ["pass block", "run block", "impact", "strength", "awareness"],
         "C": ["pass block", "run block", "impact", "strength", "awareness"],
         "RG": ["pass block", "run block", "impact", "strength", "awareness"],
         "RT": ["pass block", "run block", "impact", "strength", "awareness"],
-        "LE": ["power", "finesse", "shed", "tackle", "pursuit", "strength"],
-        "RE": ["power", "finesse", "shed", "tackle", "pursuit", "strength"],
-        "LEDGE": ["power", "finesse", "shed", "tackle", "pursuit", "speed"],
-        "REDGE": ["power", "finesse", "shed", "tackle", "pursuit", "speed"],
-        "DT": ["strength", "power", "finesse", "shed", "tackle", "pursuit", "play rec"],
-        "LOLB": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit"],
-        "MLB": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit"],
-        "ROLB": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit"],
-        "SAM": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit"],
-        "MIKE": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit"],
-        "WILL": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit"],
-        "CB": ["speed", "acceleration", "man", "zone", "press", "play", "jump", "catch"],
-        "FS": ["speed", "acceleration", "zone", "man", "play", "tackle", "pursuit", "catch"],
-        "SS": ["speed", "acceleration", "zone", "man", "play", "hit", "tackle", "pursuit", "catch"],
+        "LE": ["power", "finesse", "shed", "tackle", "pursuit", "strength", "play recognition"],
+        "RE": ["power", "finesse", "shed", "tackle", "pursuit", "strength", "play recognition"],
+        "LEDGE": ["speed", "power", "finesse", "shed", "tackle", "pursuit", "play recognition"],
+        "REDGE": ["speed", "power", "finesse", "shed", "tackle", "pursuit", "play recognition"],
+        "DT": ["strength", "power", "finesse", "shed", "tackle", "pursuit", "play recognition"],
+        "LOLB": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit", "play recognition"],
+        "MLB": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit", "play recognition"],
+        "ROLB": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit", "play recognition"],
+        "SAM": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit", "play recognition"],
+        "MIKE": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit", "play recognition"],
+        "WILL": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit", "play recognition"],
+        "CB": ["speed", "acceleration", "man", "zone", "press", "play recognition", "jump", "catch"],
+        "FS": ["speed", "acceleration", "zone", "man", "play recognition", "tackle", "pursuit", "catch"],
+        "SS": ["speed", "acceleration", "zone", "man", "play recognition", "hit", "tackle", "pursuit", "catch"],
         "K": ["kick"],
         "P": ["punt"],
     }
+    forbidden_keywords = {
+        "QB": ["cover", "press", "injury", "kick", "punt", "catch", "route", "block", "tackle", "hit power"],
+        "HB": ["cover", "press", "injury", "kick", "punt", "throw power", "accuracy"],
+        "FB": ["cover", "press", "injury", "kick", "punt", "throw power", "accuracy"],
+        "WR": ["cover", "press", "injury", "kick", "punt", "throw power", "accuracy", "tackle", "block shed"],
+        "TE": ["cover", "press", "injury", "kick", "punt", "throw power", "accuracy", "tackle", "block shed"],
+        "LT": ["cover", "press", "injury", "kick", "punt", "throw", "catch"],
+        "LG": ["cover", "press", "injury", "kick", "punt", "throw", "catch"],
+        "C": ["cover", "press", "injury", "kick", "punt", "throw", "catch"],
+        "RG": ["cover", "press", "injury", "kick", "punt", "throw", "catch"],
+        "RT": ["cover", "press", "injury", "kick", "punt", "throw", "catch"],
+        "LE": ["accuracy", "route", "catch", "injury", "kick", "punt"],
+        "RE": ["accuracy", "route", "catch", "injury", "kick", "punt"],
+        "LEDGE": ["accuracy", "route", "catch", "injury", "kick", "punt"],
+        "REDGE": ["accuracy", "route", "catch", "injury", "kick", "punt"],
+        "DT": ["accuracy", "route", "catch", "injury", "kick", "punt", "cover"],
+        "LOLB": ["accuracy", "route", "release", "injury", "kick", "punt"],
+        "MLB": ["accuracy", "route", "release", "injury", "kick", "punt"],
+        "ROLB": ["accuracy", "route", "release", "injury", "kick", "punt"],
+        "SAM": ["accuracy", "route", "release", "injury", "kick", "punt"],
+        "MIKE": ["accuracy", "route", "release", "injury", "kick", "punt"],
+        "WILL": ["accuracy", "route", "release", "injury", "kick", "punt"],
+        "CB": ["accuracy", "route", "release", "injury", "kick", "punt", "throw power"],
+        "FS": ["accuracy", "route", "release", "injury", "kick", "punt", "throw power"],
+        "SS": ["accuracy", "route", "release", "injury", "kick", "punt", "throw power"],
+        "K": ["injury", "cover", "route", "throw", "catch"],
+        "P": ["injury", "cover", "route", "throw", "catch"],
+    }
     priorities = keyword_priorities.get(position, ["speed", "acceleration", "agility", "strength", "awareness", "catch", "throw", "tackle"])
+    banned = forbidden_keywords.get(position, ["injury"])
     candidates: list[tuple[int, str, int]] = []
     for key, raw_value in row.items():
         key_str = str(key)
         normalized = key_str.lower().replace("_", " ")
         if not (key_str.endswith("_rating") or "rating" in key_str.lower()):
+            continue
+        if any(bad in normalized for bad in banned):
             continue
         try:
             if raw_value is None or raw_value == "":
@@ -3769,7 +3800,7 @@ def extract_additional_rating_candidates(row: dict, position: str, used_labels: 
             if keyword in normalized:
                 score += max(1, 20 - idx)
         if score <= 0:
-            score = 1
+            continue
         candidates.append((score, label, numeric))
     candidates.sort(key=lambda item: (-item[0], -item[2], item[1]))
     out: list[tuple[str, int]] = []
@@ -3833,10 +3864,10 @@ RATING_LABEL_CANDIDATES = {
 
 
 POSITION_RATING_PLANS = {
-    "QB": ["Throw Power", "Short Accuracy", "Mid Accuracy", "Deep Accuracy", "Throw on Run", "Play Action", "Break Sack", "Speed", "Acceleration", "Agility"],
+    "QB": ["Throw Power", "Short Accuracy", "Mid Accuracy", "Deep Accuracy", "Throw on Run", "Play Action", "Break Sack", "Awareness", "Speed", "Acceleration", "Agility"],
     "HB": ["Speed", "Acceleration", "Agility", "Carrying", "Break Tackle", "Trucking", "Change of Direction", "Juke", "Spin"],
     "FB": ["Strength", "Carrying", "Lead Block", "Run Block", "Impact Block", "Break Tackle", "Trucking", "Speed"],
-    "WR": ["Speed", "Acceleration", "Catch", "Catch in Traffic", "Spec Catch", "Release", "Short Route", "Mid Route", "Deep Route", "Jump"],
+    "WR": ["Speed", "Acceleration", "Agility", "Catch", "Catch in Traffic", "Spec Catch", "Release", "Short Route", "Mid Route", "Deep Route", "Jump"],
     "TE": ["Speed", "Catch", "Catch in Traffic", "Spec Catch", "Short Route", "Mid Route", "Run Block", "Impact Block"],
     "LT": ["Strength", "Awareness", "Pass Block", "Run Block", "Impact Block"],
     "LG": ["Strength", "Awareness", "Pass Block", "Run Block", "Impact Block"],
@@ -3847,7 +3878,7 @@ POSITION_RATING_PLANS = {
     "RE": ["Strength", "Finesse Moves", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
     "LEDGE": ["Speed", "Finesse Moves", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
     "REDGE": ["Speed", "Finesse Moves", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
-    "DT": ["Strength", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
+    "DT": ["Power Moves", "Finesse Moves", "Block Shed", "Play Recognition", "Tackle", "Pursuit", "Hit Power"],
     "LOLB": ["Speed", "Tackle", "Block Shed", "Hit Power", "Zone Coverage", "Pursuit"],
     "MLB": ["Speed", "Awareness", "Tackle", "Block Shed", "Hit Power", "Zone Coverage", "Pursuit"],
     "ROLB": ["Speed", "Tackle", "Block Shed", "Hit Power", "Zone Coverage", "Pursuit"],
@@ -3863,10 +3894,10 @@ POSITION_RATING_PLANS = {
 
 
 POSITION_FALLBACK_LABELS = {
-    "QB": ["Speed", "Acceleration", "Agility", "Break Sack", "Awareness"],
+    "QB": ["Awareness", "Break Sack", "Speed", "Acceleration", "Agility"],
     "HB": ["Speed", "Acceleration", "Agility", "Carrying", "Break Tackle", "Juke"],
     "FB": ["Strength", "Carrying", "Lead Block", "Impact Block", "Break Tackle"],
-    "WR": ["Speed", "Acceleration", "Catch", "Release", "Jump"],
+    "WR": ["Acceleration", "Agility", "Catch", "Catch in Traffic", "Spec Catch", "Release", "Jump"],
     "TE": ["Catch", "Spec Catch", "Run Block", "Impact Block", "Strength"],
     "LT": ["Strength", "Pass Block", "Run Block", "Impact Block", "Awareness"],
     "LG": ["Strength", "Pass Block", "Run Block", "Impact Block", "Awareness"],
@@ -3877,7 +3908,7 @@ POSITION_FALLBACK_LABELS = {
     "RE": ["Strength", "Power Moves", "Finesse Moves", "Block Shed", "Tackle"],
     "LEDGE": ["Speed", "Power Moves", "Finesse Moves", "Block Shed", "Tackle"],
     "REDGE": ["Speed", "Power Moves", "Finesse Moves", "Block Shed", "Tackle"],
-    "DT": ["Strength", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
+    "DT": ["Power Moves", "Finesse Moves", "Block Shed", "Play Recognition", "Tackle", "Pursuit", "Hit Power"],
     "LOLB": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
     "MLB": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
     "ROLB": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
@@ -3921,7 +3952,7 @@ POSITION_VALUE_WEIGHTS = {
 }
 
 
-def select_key_ratings(row: dict, position: str, max_items: int = 8, min_items: int = 5) -> list[tuple[str, int]]:
+def select_key_ratings(row: dict, position: str, max_items: int = 8, min_items: int = 4) -> list[tuple[str, int]]:
     position = (position or "").upper()
     labels = POSITION_RATING_PLANS.get(position, ["Speed", "Awareness", "Catch", "Break Tackle", "Throw Power"])
     selected: list[tuple[str, int]] = []
@@ -3954,7 +3985,7 @@ def select_key_ratings(row: dict, position: str, max_items: int = 8, min_items: 
             return selected
 
     if len(selected) < min_items:
-        needed = max_items - len(selected)
+        needed = min(max_items - len(selected), max(0, min_items - len(selected)))
         for label, value in extract_additional_rating_candidates(row, position, used_labels, needed):
             selected.append((label, value))
             used_labels.add(label)
