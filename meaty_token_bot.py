@@ -2460,8 +2460,10 @@ async def roster(interaction: discord.Interaction, team_name: str, page: Optiona
 
     standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
     merged_team = {**team_row, **standing_row}
-    embed = build_roster_embed(merged_team, roster_rows, page or 1)
-    await interaction.followup.send(embed=embed)
+    current_page = max(1, page or 1)
+    embed = build_roster_embed(merged_team, roster_rows, current_page)
+    view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, page=current_page)
+    await interaction.response.send_message(embed=embed, view=view)
 
 
 @bot.tree.command(name="team", description="Show a team summary and its first roster page.")
@@ -2476,7 +2478,8 @@ async def team(interaction: discord.Interaction, team_name: str):
     standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
     merged_team = {**team_row, **standing_row}
     embed = build_roster_embed(merged_team, roster_rows, 1)
-    await interaction.followup.send(embed=embed)
+    view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, page=1)
+    await interaction.response.send_message(embed=embed, view=view)
 
 
 @bot.tree.command(name="balance", description="Check your token balance.")
