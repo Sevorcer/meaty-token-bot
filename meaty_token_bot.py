@@ -3679,11 +3679,24 @@ def fetch_team_roster_rows(team_id: int) -> list[dict]:
             return [record_to_dict(row) for row in cur.fetchall()]
 
 
+def normalize_rating_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def _normalized_row_lookup(row: dict) -> dict[str, tuple[str, object]]:
+    lookup: dict[str, tuple[str, object]] = {}
+    for key, value in row.items():
+        lookup[normalize_rating_key(str(key))] = (str(key), value)
+    return lookup
+
+
 def rating_value(row: dict, *field_names: str) -> Optional[int]:
+    normalized_lookup = _normalized_row_lookup(row)
     for field_name in field_names:
-        if field_name not in row:
+        normalized_name = normalize_rating_key(field_name)
+        if normalized_name not in normalized_lookup:
             continue
-        value = row.get(field_name)
+        _original_key, value = normalized_lookup[normalized_name]
         try:
             if value is None or value == "":
                 continue
@@ -3695,10 +3708,86 @@ def rating_value(row: dict, *field_names: str) -> Optional[int]:
     return None
 
 
+def prettify_rating_field_name(field_name: str) -> str:
+    name = re.sub(r"_rating$", "", field_name)
+    name = name.replace("_", " ").strip()
+    name = re.sub(r"\s+", " ", name)
+    words = [w.upper() if w.lower() in {"qb", "rb", "wr", "te", "lt", "lg", "rg", "rt", "dt", "de", "lb", "cb", "fs", "ss"} else w.title() for w in name.split()]
+    return " ".join(words)
+
+
+def extract_additional_rating_candidates(row: dict, position: str, used_labels: set[str], limit: int) -> list[tuple[str, int]]:
+    position = (position or "").upper()
+    keyword_priorities = {
+        "QB": ["throw", "accuracy", "play", "sack", "speed", "acceleration", "agility", "awareness"],
+        "HB": ["speed", "acceleration", "agility", "carry", "break", "truck", "juke", "spin", "change"],
+        "FB": ["strength", "carry", "lead", "impact", "break", "truck", "run block"],
+        "WR": ["speed", "acceleration", "catch", "route", "release", "jump", "agility"],
+        "TE": ["catch", "route", "spec", "run block", "impact", "strength", "speed"],
+        "LT": ["pass block", "run block", "impact", "strength", "awareness"],
+        "LG": ["pass block", "run block", "impact", "strength", "awareness"],
+        "C": ["pass block", "run block", "impact", "strength", "awareness"],
+        "RG": ["pass block", "run block", "impact", "strength", "awareness"],
+        "RT": ["pass block", "run block", "impact", "strength", "awareness"],
+        "LE": ["power", "finesse", "shed", "tackle", "pursuit", "strength"],
+        "RE": ["power", "finesse", "shed", "tackle", "pursuit", "strength"],
+        "LEDGE": ["power", "finesse", "shed", "tackle", "pursuit", "speed"],
+        "REDGE": ["power", "finesse", "shed", "tackle", "pursuit", "speed"],
+        "DT": ["strength", "power", "finesse", "shed", "tackle", "pursuit", "play rec"],
+        "LOLB": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit"],
+        "MLB": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit"],
+        "ROLB": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit"],
+        "SAM": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit"],
+        "MIKE": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit"],
+        "WILL": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit"],
+        "CB": ["speed", "acceleration", "man", "zone", "press", "play", "jump", "catch"],
+        "FS": ["speed", "acceleration", "zone", "man", "play", "tackle", "pursuit", "catch"],
+        "SS": ["speed", "acceleration", "zone", "man", "play", "hit", "tackle", "pursuit", "catch"],
+        "K": ["kick"],
+        "P": ["punt"],
+    }
+    priorities = keyword_priorities.get(position, ["speed", "acceleration", "agility", "strength", "awareness", "catch", "throw", "tackle"])
+    candidates: list[tuple[int, str, int]] = []
+    for key, raw_value in row.items():
+        key_str = str(key)
+        normalized = key_str.lower().replace("_", " ")
+        if not (key_str.endswith("_rating") or "rating" in key_str.lower()):
+            continue
+        try:
+            if raw_value is None or raw_value == "":
+                continue
+            numeric = int(float(raw_value))
+        except Exception:
+            continue
+        if numeric <= 0:
+            continue
+        label = prettify_rating_field_name(key_str)
+        if label in used_labels:
+            continue
+        score = 0
+        for idx, keyword in enumerate(priorities):
+            if keyword in normalized:
+                score += max(1, 20 - idx)
+        if score <= 0:
+            score = 1
+        candidates.append((score, label, numeric))
+    candidates.sort(key=lambda item: (-item[0], -item[2], item[1]))
+    out: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for _score, label, numeric in candidates:
+        if label in seen or label in used_labels:
+            continue
+        seen.add(label)
+        out.append((label, numeric))
+        if len(out) >= limit:
+            break
+    return out
+
+
 RATING_LABEL_CANDIDATES = {
-    "Speed": ("speed_rating",),
-    "Acceleration": ("acceleration_rating",),
-    "Agility": ("agility_rating",),
+    "Speed": ("speed_rating", "speed", "player_speed_rating"),
+    "Acceleration": ("acceleration_rating", "acceleration", "accel_rating"),
+    "Agility": ("agility_rating", "agility"),
     "Awareness": ("awareness_rating", "awareness", "awareness_grade"),
     "Throw Power": ("throw_power_rating", "throwpower_rating"),
     "Short Accuracy": ("short_accuracy_rating", "short_accuracy", "throw_accuracy_short_rating", "throw_accuracy_short", "throw_short_rating"),
@@ -3707,35 +3796,35 @@ RATING_LABEL_CANDIDATES = {
     "Throw on Run": ("throw_on_run_rating", "throw_on_run", "throwonrun_rating"),
     "Play Action": ("play_action_rating", "play_action", "playaction_rating"),
     "Break Sack": ("break_sack_rating", "break_sack", "breaksack_rating"),
-    "Carrying": ("carrying_rating",),
-    "Break Tackle": ("break_tackle_rating",),
-    "Trucking": ("trucking_rating",),
+    "Carrying": ("carrying_rating", "carry_rating", "carry"),
+    "Break Tackle": ("break_tackle_rating", "breaktackle_rating", "break_tackle"),
+    "Trucking": ("trucking_rating", "truck_rating", "trucking"),
     "Change of Direction": ("change_of_direction_rating", "cod_rating"),
     "Juke": ("juke_move_rating", "juke_rating"),
     "Spin": ("spin_move_rating", "spin_rating"),
-    "Catch": ("catch_rating",),
-    "Catch in Traffic": ("catch_in_traffic_rating",),
-    "Spec Catch": ("spectacular_catch_rating",),
-    "Release": ("release_rating",),
-    "Short Route": ("short_route_running_rating",),
-    "Mid Route": ("medium_route_running_rating", "mid_route_running_rating"),
-    "Deep Route": ("deep_route_running_rating",),
-    "Strength": ("strength_rating",),
-    "Pass Block": ("pass_block_rating",),
-    "Run Block": ("run_block_rating",),
-    "Impact Block": ("impact_block_rating",),
-    "Lead Block": ("lead_block_rating",),
-    "Finesse Moves": ("finesse_moves_rating", "finesse_move_rating"),
-    "Power Moves": ("power_moves_rating", "power_move_rating"),
-    "Block Shed": ("block_shedding_rating", "block_shed_rating"),
-    "Tackle": ("tackle_rating",),
-    "Pursuit": ("pursuit_rating",),
-    "Hit Power": ("hit_power_rating",),
-    "Play Recognition": ("play_recognition_rating",),
-    "Man Coverage": ("man_coverage_rating",),
-    "Zone Coverage": ("zone_coverage_rating",),
-    "Press": ("press_rating",),
-    "Jump": ("jump_rating",),
+    "Catch": ("catch_rating", "catching_rating", "catch"),
+    "Catch in Traffic": ("catch_in_traffic_rating", "catch_in_traffic", "cit_rating", "catchintraffic_rating"),
+    "Spec Catch": ("spectacular_catch_rating", "spec_catch_rating", "spectacularcatch_rating"),
+    "Release": ("release_rating", "release"),
+    "Short Route": ("short_route_running_rating", "short_route_rating", "route_running_short_rating", "shortroute_running_rating"),
+    "Mid Route": ("medium_route_running_rating", "mid_route_running_rating", "medium_route_rating", "route_running_medium_rating", "route_running_mid_rating"),
+    "Deep Route": ("deep_route_running_rating", "deep_route_rating", "route_running_deep_rating"),
+    "Strength": ("strength_rating", "strength"),
+    "Pass Block": ("pass_block_rating", "passblock_rating", "pass_block"),
+    "Run Block": ("run_block_rating", "runblock_rating", "run_block"),
+    "Impact Block": ("impact_block_rating", "impactblock_rating", "impact_block"),
+    "Lead Block": ("lead_block_rating", "leadblock_rating", "lead_block"),
+    "Finesse Moves": ("finesse_moves_rating", "finesse_move_rating", "finessemoves_rating", "finesse_moves"),
+    "Power Moves": ("power_moves_rating", "power_move_rating", "powermoves_rating", "power_moves"),
+    "Block Shed": ("block_shedding_rating", "block_shed_rating", "blockshedding_rating", "block_shedding"),
+    "Tackle": ("tackle_rating", "tackle"),
+    "Pursuit": ("pursuit_rating", "pursuit"),
+    "Hit Power": ("hit_power_rating", "hitpower_rating", "hit_power"),
+    "Play Recognition": ("play_recognition_rating", "playrecognition_rating", "play_recognition"),
+    "Man Coverage": ("man_coverage_rating", "mancoverage_rating", "man_coverage"),
+    "Zone Coverage": ("zone_coverage_rating", "zonecoverage_rating", "zone_coverage"),
+    "Press": ("press_rating", "press"),
+    "Jump": ("jump_rating", "jumping_rating", "jump"),
     "Kick Power": ("kick_power_rating",),
     "Kick Accuracy": ("kick_accuracy_rating",),
     "Punt Power": ("punt_power_rating",),
@@ -3832,7 +3921,7 @@ POSITION_VALUE_WEIGHTS = {
 }
 
 
-def select_key_ratings(row: dict, position: str, max_items: int = 6) -> list[tuple[str, int]]:
+def select_key_ratings(row: dict, position: str, max_items: int = 8, min_items: int = 5) -> list[tuple[str, int]]:
     position = (position or "").upper()
     labels = POSITION_RATING_PLANS.get(position, ["Speed", "Awareness", "Catch", "Break Tackle", "Throw Power"])
     selected: list[tuple[str, int]] = []
@@ -3860,12 +3949,22 @@ def select_key_ratings(row: dict, position: str, max_items: int = 6) -> list[tup
         if value is None:
             continue
         selected.append((label, value))
+        used_labels.add(label)
         if len(selected) >= max_items:
-            break
+            return selected
+
+    if len(selected) < min_items:
+        needed = max_items - len(selected)
+        for label, value in extract_additional_rating_candidates(row, position, used_labels, needed):
+            selected.append((label, value))
+            used_labels.add(label)
+            if len(selected) >= max_items:
+                break
+
     return selected
 
 
-def format_key_ratings(row: dict, position: str, max_items: int = 6) -> str:
+def format_key_ratings(row: dict, position: str, max_items: int = 8) -> str:
     items = select_key_ratings(row, position, max_items=max_items)
     if not items:
         return "No rating data found."
@@ -3977,7 +4076,7 @@ def build_player_embed(row: dict) -> discord.Embed:
     )
     embed.add_field(
         name="Key Ratings",
-        value=format_key_ratings(row, position, max_items=6),
+        value=format_key_ratings(row, position, max_items=8),
         inline=True,
     )
     embed.add_field(
