@@ -5866,6 +5866,13 @@ def detect_current_sportsbook_stage_and_week() -> tuple[Optional[int], Optional[
     return phases[0]
 
 
+def fetch_upcoming_games_for_current_week():
+    stage_index, display_week = detect_current_sportsbook_stage_and_week()
+    if stage_index is None or display_week is None:
+        return []
+    return fetch_games_for_stage_week(stage_index, display_week)
+
+
 def _team_strength_for_odds(team_row: dict, is_home: bool) -> float:
     wins = float(team_row.get("wins") or 0)
     losses = float(team_row.get("losses") or 0)
