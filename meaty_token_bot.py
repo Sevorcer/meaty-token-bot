@@ -1560,19 +1560,26 @@ def fetch_top_rushing_leaders(limit: int = 5):
 
 
 def fetch_top_receiving_leaders(limit: int = 5):
+    rec_yds_col = pick_existing_column("player_receiving_stats", ["rec_yds", "recv_yds", "receiving_yds"])
+    full_name_col = pick_existing_column("player_receiving_stats", ["full_name"])
+    roster_col = pick_existing_column("player_receiving_stats", ["roster_id"])
+    team_col = pick_existing_column("player_receiving_stats", ["team_id"])
+    if not roster_col or not rec_yds_col:
+        return []
+
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT
-                    prs.roster_id,
-                    COALESCE(MAX(players.full_name), MAX(prs.full_name)) AS player_name,
+                    prs.{roster_col} AS roster_id,
+                    COALESCE(MAX(players.full_name), MAX(prs.{full_name_col}){'' if full_name_col else ''}, 'Unknown') AS player_name,
                     COALESCE(MAX(teams.team_name), 'Unknown Team') AS team_name,
-                    SUM(COALESCE(prs.rec_yds, prs.recv_yds, prs.receiving_yds, 0)) AS total_rec_yds
+                    SUM(COALESCE(prs.{rec_yds_col}, 0)) AS total_rec_yds
                 FROM player_receiving_stats prs
-                LEFT JOIN players ON players.roster_id = prs.roster_id
-                LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, prs.team_id)
-                GROUP BY prs.roster_id
+                LEFT JOIN players ON players.roster_id = prs.{roster_col}
+                LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, prs.{team_col if team_col else 'team_id'})
+                GROUP BY prs.{roster_col}
                 ORDER BY total_rec_yds DESC, player_name ASC
                 LIMIT %s
                 """,
