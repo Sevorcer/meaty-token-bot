@@ -29,31 +29,40 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
 AUTO_POST_MATCHUP_PREVIEWS = os.getenv("AUTO_POST_MATCHUP_PREVIEWS", "true").lower() in {"1", "true", "yes", "on"}
 AUTO_POST_WEEKLY_NEWS = os.getenv("AUTO_POST_WEEKLY_NEWS", "true").lower() in {"1", "true", "yes", "on"}
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+TRADE_COMMITTEE_ROLE_ID = int(os.getenv("TRADE_COMMITTEE_ROLE_ID", "0"))
+TRADE_REVIEW_CHANNEL_ID = int(os.getenv("TRADE_REVIEW_CHANNEL_ID", "0"))
+TRADE_ANNOUNCEMENTS_CHANNEL_ID = int(os.getenv("TRADE_ANNOUNCEMENTS_CHANNEL_ID", "0"))
+TRADE_REQUIRED_APPROVALS = int(os.getenv("TRADE_REQUIRED_APPROVALS", "2"))
+TRADE_REQUIRED_DENIALS = int(os.getenv("TRADE_REQUIRED_DENIALS", "2"))
+LEVEL_UP_CHANNEL_ID = int(os.getenv("LEVEL_UP_CHANNEL_ID", "0"))
+XP_COOLDOWN_SECONDS = int(os.getenv("XP_COOLDOWN_SECONDS", "45"))
+XP_MIN_MESSAGE_LEN = int(os.getenv("XP_MIN_MESSAGE_LEN", "8"))
+XP_BLACKLIST_CHANNEL_IDS = {int(x.strip()) for x in os.getenv("XP_BLACKLIST_CHANNEL_IDS", "").split(",") if x.strip()}
 
 ADMIN_ROLE_NAMES = {"Commissioner", "Admin", "COMMISH"}
 
 STAGE_LABELS = {
-    1: "Preseason",
-    2: "Regular Season",
-    3: "Wild Card",
-    4: "Divisional",
-    5: "Conference Championship",
-    6: "Super Bowl",
-    7: "Offseason",
+    0: "Preseason",
+    1: "Regular Season",
+    2: "Wild Card",
+    3: "Divisional",
+    4: "Conference Championship",
+    5: "Super Bowl",
+    6: "Offseason",
 }
 STAGE_PARSE_MAP = {
     "auto": None,
-    "preseason": 1,
-    "regular": 2,
-    "regular season": 2,
-    "wild card": 3,
-    "wildcard": 3,
-    "divisional": 4,
-    "conference": 5,
-    "conference championship": 5,
-    "super bowl": 6,
-    "superbowl": 6,
-    "offseason": 7,
+    "preseason": 0,
+    "regular": 1,
+    "regular season": 1,
+    "wild card": 2,
+    "wildcard": 2,
+    "divisional": 3,
+    "conference": 4,
+    "conference championship": 4,
+    "super bowl": 5,
+    "superbowl": 5,
+    "offseason": 6,
 }
 COMPLETE_GAME_STATUS_VALUES = {2, 4, 5, 6, 7, 8}
 
@@ -111,7 +120,7 @@ POSITION_SORT_ORDER = {
 
 PRIZE_WHEEL_COST = 2
 BOOM_OR_BUST_COST = 5
-MYSTERY_CRATE_COST = 8
+MYSTERY_CRATE_COST = 4
 ATTRIBUTE_COST = 3
 NAME_CHANGE_COST = 5
 ROOKIE_REVEAL_COST = 10
@@ -131,6 +140,7 @@ BLACKJACK_FINISHED_DELETE_DELAY = 180
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -204,6 +214,58 @@ class TokenDatabase:
                         quantity INTEGER NOT NULL DEFAULT 0,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         PRIMARY KEY (user_id, voucher_type)
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_trades (
+                        id BIGSERIAL PRIMARY KEY,
+                        submitted_by BIGINT NOT NULL,
+                        submitted_username TEXT NOT NULL,
+                        coach_one_user_id BIGINT,
+                        coach_two_user_id BIGINT,
+                        team_one_name TEXT NOT NULL,
+                        team_two_name TEXT NOT NULL,
+                        team_one_gets TEXT NOT NULL,
+                        team_two_gets TEXT NOT NULL,
+                        notes TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        approve_count INTEGER NOT NULL DEFAULT 0,
+                        deny_count INTEGER NOT NULL DEFAULT 0,
+                        review_channel_id BIGINT,
+                        review_message_id BIGINT,
+                        announcement_channel_id BIGINT,
+                        announcement_message_id BIGINT,
+                        finalized_by BIGINT,
+                        finalized_reason TEXT,
+                        finalized_at TIMESTAMPTZ,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cur.execute("ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS coach_one_user_id BIGINT")
+                cur.execute("ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS coach_two_user_id BIGINT")
+                cur.execute("ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS announcement_channel_id BIGINT")
+                cur.execute("ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS announcement_message_id BIGINT")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_trade_votes (
+                        id BIGSERIAL PRIMARY KEY,
+                        trade_id BIGINT NOT NULL REFERENCES bot_trades(id) ON DELETE CASCADE,
+                        voter_user_id BIGINT NOT NULL,
+                        voter_username TEXT NOT NULL,
+                        vote TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (trade_id, voter_user_id)
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_xp_users (
+                        user_id BIGINT PRIMARY KEY,
+                        username TEXT NOT NULL,
+                        xp INTEGER NOT NULL DEFAULT 0,
+                        level INTEGER NOT NULL DEFAULT 1,
+                        messages_counted INTEGER NOT NULL DEFAULT 0,
+                        last_xp_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
                 """)
             conn.commit()
@@ -312,31 +374,6 @@ class TokenDatabase:
                     WHERE balance > 0
                     ORDER BY balance DESC, total_earned DESC, username ASC
                     """
-                )
-                return cur.fetchall()
-
-
-    def casino_leaderboard(self, minimum_games: int = 10):
-        with self.connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT
-                        user_id,
-                        username,
-                        casino_wins,
-                        casino_losses,
-                        (casino_wins + casino_losses) AS total_games,
-                        CASE
-                            WHEN (casino_wins + casino_losses) > 0
-                                THEN (casino_wins::double precision / (casino_wins + casino_losses)) * 100.0
-                            ELSE 0.0
-                        END AS win_pct
-                    FROM bot_users
-                    WHERE (casino_wins + casino_losses) >= %s
-                    ORDER BY win_pct DESC, casino_wins DESC, total_games DESC, username ASC
-                    """,
-                    (int(minimum_games),),
                 )
                 return cur.fetchall()
 
@@ -513,6 +550,235 @@ class TokenDatabase:
             return True
 
 
+    def ensure_xp_user(self, user: discord.abc.User):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bot_xp_users (user_id, username, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (user_id) DO UPDATE
+                    SET username = EXCLUDED.username, updated_at = NOW()
+                    """,
+                    (int(user.id), str(user)),
+                )
+            conn.commit()
+
+    def get_xp_user(self, user: discord.abc.User):
+        self.ensure_xp_user(user)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_xp_users WHERE user_id = %s", (int(user.id),))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def update_xp_progress(self, user: discord.abc.User, xp: int, level: int, messages_counted: int, last_xp_at: float):
+        self.ensure_xp_user(user)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE bot_xp_users
+                    SET xp = %s,
+                        level = %s,
+                        messages_counted = %s,
+                        last_xp_at = %s,
+                        username = %s,
+                        updated_at = NOW()
+                    WHERE user_id = %s
+                    """,
+                    (int(xp), int(level), int(messages_counted), float(last_xp_at), str(user), int(user.id)),
+                )
+            conn.commit()
+
+    def xp_leaderboard(self):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_xp_users ORDER BY level DESC, xp DESC, messages_counted DESC, username ASC")
+                return [dict(row) for row in cur.fetchall()]
+
+    def create_trade(
+        self,
+        submitted_by: discord.abc.User,
+        coach_one: discord.abc.User,
+        coach_two: discord.abc.User,
+        team_one_name: str,
+        team_two_name: str,
+        team_one_gets: str,
+        team_two_gets: str,
+        notes: str = "",
+    ) -> dict:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bot_trades (
+                        submitted_by,
+                        submitted_username,
+                        coach_one_user_id,
+                        coach_two_user_id,
+                        team_one_name,
+                        team_two_name,
+                        team_one_gets,
+                        team_two_gets,
+                        notes,
+                        announcement_channel_id
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        int(submitted_by.id),
+                        str(submitted_by),
+                        int(coach_one.id),
+                        int(coach_two.id),
+                        team_one_name,
+                        team_two_name,
+                        team_one_gets,
+                        team_two_gets,
+                        notes or "",
+                        int(TRADE_ANNOUNCEMENTS_CHANNEL_ID) if TRADE_ANNOUNCEMENTS_CHANNEL_ID else None,
+                    ),
+                )
+                row = cur.fetchone()
+            conn.commit()
+            return dict(row) if row else {}
+
+    def set_trade_review_message(self, trade_id: int, channel_id: int, message_id: int):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE bot_trades
+                    SET review_channel_id = %s,
+                        review_message_id = %s
+                    WHERE id = %s
+                    """,
+                    (int(channel_id), int(message_id), int(trade_id)),
+                )
+            conn.commit()
+
+
+    def set_trade_announcement_message(self, trade_id: int, channel_id: int, message_id: int):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE bot_trades
+                    SET announcement_channel_id = %s,
+                        announcement_message_id = %s
+                    WHERE id = %s
+                    """,
+                    (int(channel_id), int(message_id), int(trade_id)),
+                )
+            conn.commit()
+
+    def get_trade(self, trade_id: int):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_trades WHERE id = %s", (int(trade_id),))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def get_trade_by_message(self, message_id: int):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_trades WHERE review_message_id = %s", (int(message_id),))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def upsert_trade_vote(self, trade_id: int, voter: discord.abc.User, vote: str) -> tuple[dict, bool]:
+        vote = (vote or "").strip().lower()
+        if vote not in {"approve", "deny"}:
+            raise ValueError("Vote must be approve or deny.")
+
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM bot_trades WHERE id = %s FOR UPDATE", (int(trade_id),))
+                trade = cur.fetchone()
+                if trade is None:
+                    raise ValueError("Trade not found.")
+                if str(trade["status"]) != "pending":
+                    return dict(trade), False
+
+                cur.execute(
+                    """
+                    INSERT INTO bot_trade_votes (trade_id, voter_user_id, voter_username, vote)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (trade_id, voter_user_id) DO UPDATE
+                    SET voter_username = EXCLUDED.voter_username,
+                        vote = EXCLUDED.vote,
+                        updated_at = NOW()
+                    RETURNING vote
+                    """,
+                    (int(trade_id), int(voter.id), str(voter), vote),
+                )
+
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (WHERE vote = 'approve') AS approve_count,
+                        COUNT(*) FILTER (WHERE vote = 'deny') AS deny_count
+                    FROM bot_trade_votes
+                    WHERE trade_id = %s
+                    """,
+                    (int(trade_id),),
+                )
+                counts = cur.fetchone() or {}
+                approve_count = int(counts.get("approve_count") or 0)
+                deny_count = int(counts.get("deny_count") or 0)
+
+                cur.execute(
+                    """
+                    UPDATE bot_trades
+                    SET approve_count = %s,
+                        deny_count = %s
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (approve_count, deny_count, int(trade_id)),
+                )
+                updated = cur.fetchone()
+            conn.commit()
+            return dict(updated) if updated else {}, True
+
+    def finalize_trade(self, trade_id: int, decision: str, finalized_by: int | None = None, reason: str = ""):
+        decision = (decision or "").strip().lower()
+        if decision not in {"approved", "denied"}:
+            raise ValueError("Decision must be approved or denied.")
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE bot_trades
+                    SET status = %s,
+                        finalized_by = %s,
+                        finalized_reason = %s,
+                        finalized_at = NOW()
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (decision, int(finalized_by) if finalized_by else None, reason or "", int(trade_id)),
+                )
+                row = cur.fetchone()
+            conn.commit()
+            return dict(row) if row else None
+
+    def get_trade_votes(self, trade_id: int) -> list[dict]:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT voter_user_id, voter_username, vote, created_at, updated_at
+                    FROM bot_trade_votes
+                    WHERE trade_id = %s
+                    ORDER BY updated_at ASC, id ASC
+                    """,
+                    (int(trade_id),),
+                )
+                return [dict(row) for row in cur.fetchall()]
+
+
 TOKEN_DB = TokenDatabase(DATABASE_URL)
 
 
@@ -676,27 +942,27 @@ def stage_display_name(stage_index: int) -> str:
 
 def stage_channel_prefix(stage_index: int) -> str:
     return {
-        1: "pre-wk",
-        2: "wk",
-        3: "wc",
-        4: "div",
-        5: "conf",
-        6: "sb",
+        0: "pre-wk",
+        1: "wk",
+        2: "wc",
+        3: "div",
+        4: "conf",
+        5: "sb",
     }.get(stage_index, f"s{stage_index}-w")
 
 
 def stage_week_label(stage_index: int, display_week: int) -> str:
-    if stage_index == 2:
-        return f"Week {display_week}"
     if stage_index == 1:
+        return f"Week {display_week}"
+    if stage_index == 0:
         return f"Preseason Week {display_week}"
-    if stage_index == 3:
+    if stage_index == 2:
         return f"Wild Card Week {display_week}"
-    if stage_index == 4:
+    if stage_index == 3:
         return f"Divisional Week {display_week}"
-    if stage_index == 5:
+    if stage_index == 4:
         return f"Conference Championship Week {display_week}"
-    if stage_index == 6:
+    if stage_index == 5:
         return "Super Bowl"
     return f"{stage_display_name(stage_index)} Week {display_week}"
 
@@ -812,6 +1078,416 @@ def fetch_games_for_week(week: int, stage_index: Optional[int] = None):
     return fetch_games_for_stage_week(resolved_stage, week)
 
 
+
+
+_SCHEMA_COLUMN_CACHE: dict[str, set[str]] = {}
+
+
+def get_table_columns(table_name: str) -> set[str]:
+    cached = _SCHEMA_COLUMN_CACHE.get(table_name)
+    if cached is not None:
+        return cached
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = %s
+                """,
+                (table_name,),
+            )
+            cols = {str(row['column_name']) for row in cur.fetchall()}
+    _SCHEMA_COLUMN_CACHE[table_name] = cols
+    return cols
+
+
+def pick_existing_column(table_name: str, candidates: list[str]) -> Optional[str]:
+    cols = get_table_columns(table_name)
+    for candidate in candidates:
+        if candidate in cols:
+            return candidate
+    return None
+
+
+def _qualified_or_zero(alias: str, column_name: Optional[str]) -> str:
+    return f"COALESCE({alias}.{column_name}, 0)" if column_name else "0"
+
+
+def fetch_game_row_for_recap(stage_index: int, display_week: int, game_id: int) -> Optional[dict]:
+    raw_week = max(display_week - 1, 0)
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    g.game_id,
+                    g.week,
+                    (g.week + 1) AS display_week,
+                    g.stage_index,
+                    g.status,
+                    g.season_index,
+                    g.away_score,
+                    g.home_score,
+                    away.team_name AS away_team_name,
+                    home.team_name AS home_team_name,
+                    g.away_team_id,
+                    g.home_team_id,
+                    COALESCE(away_standings.wins, 0) AS away_wins,
+                    COALESCE(away_standings.losses, 0) AS away_losses,
+                    COALESCE(away_standings.ties, 0) AS away_ties,
+                    COALESCE(away_standings.win_pct, 0) AS away_win_pct,
+                    COALESCE(away.team_ovr, 0) AS away_ovr,
+                    COALESCE(home_standings.wins, 0) AS home_wins,
+                    COALESCE(home_standings.losses, 0) AS home_losses,
+                    COALESCE(home_standings.ties, 0) AS home_ties,
+                    COALESCE(home_standings.win_pct, 0) AS home_win_pct,
+                    COALESCE(home.team_ovr, 0) AS home_ovr
+                FROM games g
+                JOIN teams away ON away.team_id = g.away_team_id
+                JOIN teams home ON home.team_id = g.home_team_id
+                LEFT JOIN standings away_standings ON away_standings.team_id = g.away_team_id
+                LEFT JOIN standings home_standings ON home_standings.team_id = g.home_team_id
+                WHERE g.season_index = (SELECT MAX(season_index) FROM games)
+                  AND g.stage_index = %s
+                  AND g.week = %s
+                  AND g.game_id = %s
+                LIMIT 1
+                """,
+                (int(stage_index), int(raw_week), int(game_id)),
+            )
+            row = cur.fetchone()
+            return record_to_dict(row)
+
+
+def fetch_game_statlines_for_team(table_name: str, team_id: int, season_index: int, stage_index: int, raw_week: int, game_id: int, metric_candidates: dict[str, list[str]], sort_keys: list[str]) -> list[dict]:
+    alias = 's'
+    cols = get_table_columns(table_name)
+    roster_col = pick_existing_column(table_name, ['roster_id'])
+    full_name_col = pick_existing_column(table_name, ['full_name'])
+    team_col = pick_existing_column(table_name, ['team_id'])
+    season_col = pick_existing_column(table_name, ['season_index'])
+    stage_col = pick_existing_column(table_name, ['stage_index'])
+    week_col = pick_existing_column(table_name, ['week', 'week_index'])
+    schedule_col = pick_existing_column(table_name, ['schedule_id', 'game_id'])
+    select_parts = [
+        f"{alias}.{roster_col} AS roster_id" if roster_col else "NULL::bigint AS roster_id",
+        f"COALESCE(MAX(players.full_name), MAX({alias}.{full_name_col}), 'Unknown') AS player_name" if full_name_col else "COALESCE(MAX(players.full_name), 'Unknown') AS player_name",
+        "COALESCE(MAX(teams.team_name), 'Unknown Team') AS team_name",
+    ]
+    metric_select_names = []
+    for output_name, candidates in metric_candidates.items():
+        chosen = pick_existing_column(table_name, candidates)
+        select_parts.append(f"SUM({_qualified_or_zero(alias, chosen)}) AS {output_name}")
+        metric_select_names.append(output_name)
+    where_parts = []
+    params: list[object] = []
+    if team_col:
+        where_parts.append(f"COALESCE(players.team_id, {alias}.{team_col}) = %s")
+        params.append(int(team_id))
+    else:
+        where_parts.append("players.team_id = %s")
+        params.append(int(team_id))
+    if schedule_col:
+        where_parts.append(f"COALESCE({alias}.{schedule_col}, 0) = %s")
+        params.append(int(game_id))
+    else:
+        if season_col:
+            where_parts.append(f"COALESCE({alias}.{season_col}, 0) = %s")
+            params.append(int(season_index))
+        if stage_col:
+            where_parts.append(f"COALESCE({alias}.{stage_col}, 0) = %s")
+            params.append(int(stage_index))
+        if week_col:
+            where_parts.append(f"COALESCE({alias}.{week_col}, 0) = %s")
+            params.append(int(raw_week))
+    order_parts = [f"{key} DESC" for key in sort_keys if key in metric_select_names]
+    order_parts.append('player_name ASC')
+    query = f"""
+        SELECT
+            {', '.join(select_parts)}
+        FROM {table_name} {alias}
+        LEFT JOIN players ON players.roster_id = {alias}.{roster_col if roster_col else 'roster_id'}
+        LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, {alias}.{team_col})
+        WHERE {' AND '.join(where_parts)}
+        GROUP BY {alias}.{roster_col if roster_col else 'roster_id'}
+        ORDER BY {', '.join(order_parts)}
+        LIMIT 5
+    """
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return [record_to_dict(row) for row in cur.fetchall()]
+
+
+def fetch_game_recap_stat_package(game_row: dict) -> dict:
+    season_index = safe_int(game_row.get('season_index'))
+    stage_index = safe_int(game_row.get('stage_index'))
+    raw_week = safe_int(game_row.get('week'))
+    away_team_id = safe_int(game_row.get('away_team_id'))
+    home_team_id = safe_int(game_row.get('home_team_id'))
+    package = {
+        'away_passing': fetch_game_statlines_for_team('player_passing_stats', away_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
+            'yards': ['pass_yds'], 'tds': ['pass_tds', 'pass_td'], 'ints': ['pass_ints', 'pass_int']
+        }, ['yards', 'tds']),
+        'home_passing': fetch_game_statlines_for_team('player_passing_stats', home_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
+            'yards': ['pass_yds'], 'tds': ['pass_tds', 'pass_td'], 'ints': ['pass_ints', 'pass_int']
+        }, ['yards', 'tds']),
+        'away_rushing': fetch_game_statlines_for_team('player_rushing_stats', away_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
+            'yards': ['rush_yds'], 'tds': ['rush_tds', 'rush_td'], 'attempts': ['rush_attempts', 'rush_att', 'carries']
+        }, ['yards', 'tds']),
+        'home_rushing': fetch_game_statlines_for_team('player_rushing_stats', home_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
+            'yards': ['rush_yds'], 'tds': ['rush_tds', 'rush_td'], 'attempts': ['rush_attempts', 'rush_att', 'carries']
+        }, ['yards', 'tds']),
+        'away_receiving': fetch_game_statlines_for_team('player_receiving_stats', away_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
+            'yards': ['rec_yds', 'recv_yds', 'receiving_yds'], 'tds': ['rec_tds', 'rec_td', 'recv_tds', 'receiving_tds'], 'catches': ['receptions', 'rec_catches', 'recv_catches']
+        }, ['yards', 'tds', 'catches']),
+        'home_receiving': fetch_game_statlines_for_team('player_receiving_stats', home_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
+            'yards': ['rec_yds', 'recv_yds', 'receiving_yds'], 'tds': ['rec_tds', 'rec_td', 'recv_tds', 'receiving_tds'], 'catches': ['receptions', 'rec_catches', 'recv_catches']
+        }, ['yards', 'tds', 'catches']),
+        'away_defense': fetch_game_statlines_for_team('player_defense_stats', away_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
+            'sacks': ['def_sacks'], 'ints': ['def_ints'], 'tackles': ['def_tackles', 'tackles', 'total_tackles']
+        }, ['ints', 'sacks', 'tackles']),
+        'home_defense': fetch_game_statlines_for_team('player_defense_stats', home_team_id, season_index, stage_index, raw_week, safe_int(game_row.get('game_id')), {
+            'sacks': ['def_sacks'], 'ints': ['def_ints'], 'tackles': ['def_tackles', 'tackles', 'total_tackles']
+        }, ['ints', 'sacks', 'tackles']),
+    }
+    return package
+
+
+def pick_statline_leader(rows: list[dict]) -> dict:
+    return rows[0] if rows else {}
+
+
+def build_gamerecap_facts(game_row: dict, stats: dict) -> dict:
+    away_score = safe_int(game_row.get('away_score'))
+    home_score = safe_int(game_row.get('home_score'))
+    away_team = safe_text(game_row.get('away_team_name'))
+    home_team = safe_text(game_row.get('home_team_name'))
+    away_record = f"{safe_int(game_row.get('away_wins'))}-{safe_int(game_row.get('away_losses'))}-{safe_int(game_row.get('away_ties'))}"
+    home_record = f"{safe_int(game_row.get('home_wins'))}-{safe_int(game_row.get('home_losses'))}-{safe_int(game_row.get('home_ties'))}"
+    home_won = home_score > away_score
+    winner = home_team if home_won else away_team
+    loser = away_team if home_won else home_team
+    winner_score = max(home_score, away_score)
+    loser_score = min(home_score, away_score)
+    winner_record = home_record if home_won else away_record
+    loser_record = away_record if home_won else home_record
+    margin = abs(home_score - away_score)
+    passing = pick_statline_leader(stats['home_passing'] if home_won else stats['away_passing'])
+    rushing = pick_statline_leader(stats['home_rushing'] if home_won else stats['away_rushing'])
+    receiving = pick_statline_leader(stats['home_receiving'] if home_won else stats['away_receiving'])
+    defense = pick_statline_leader(stats['home_defense'] if home_won else stats['away_defense'])
+    themes = []
+    if margin <= 8:
+        themes.append('one-score drama')
+    if margin >= 17:
+        themes.append('statement win')
+    if safe_text(game_row.get('away_team_name')).split()[-1] == safe_text(game_row.get('home_team_name')).split()[-1]:
+        themes.append('same-mascot weirdness')
+    if safe_int(game_row.get('away_wins')) == safe_int(game_row.get('home_wins')):
+        themes.append('evenly matched records')
+    if safe_int(defense.get('ints')) > 0:
+        themes.append('defensive takeaway swing')
+    if safe_int(passing.get('tds')) >= 3:
+        themes.append('quarterback-led offense')
+    if safe_int(rushing.get('yards')) >= 100:
+        themes.append('ground control')
+    if not themes:
+        themes.append('clean team result')
+    return {
+        'phase': stage_display_name(safe_int(game_row.get('stage_index'))),
+        'week': safe_int(game_row.get('display_week')),
+        'matchup': f"{away_team} @ {home_team}",
+        'away_team': away_team,
+        'home_team': home_team,
+        'winner': winner,
+        'loser': loser,
+        'winning_score': winner_score,
+        'losing_score': loser_score,
+        'winner_record': winner_record,
+        'loser_record': loser_record,
+        'margin': margin,
+        'is_one_score_game': margin <= 8,
+        'is_blowout': margin >= 17,
+        'turning_point': f"{winner} created separation in the second half and finished the job late.",
+        'top_passer': passing,
+        'top_rusher': rushing,
+        'top_receiver': receiving,
+        'top_defender': defense,
+        'themes': themes,
+        'game_row': game_row,
+    }
+
+
+def build_gamerecap_headline(facts: dict) -> str:
+    winner = facts['winner']
+    loser = facts['loser']
+    week = facts['week']
+    margin = facts['margin']
+    options = [
+        f"{winner} take Week {week} over {loser}",
+        f"{winner} beat {loser} in Week {week}",
+        f"{winner} outlast {loser} in Week {week}",
+        f"{winner} make a statement against {loser}",
+        f"{winner} defend home turf against {loser}" if facts['game_row'].get('home_team_name') == winner else f"{winner} win on the road at {loser}",
+    ]
+    if facts['is_one_score_game']:
+        options.append(f"{winner} hold off {loser} in a tight Week {week} finish")
+    if facts['is_blowout']:
+        options.append(f"{winner} overwhelm {loser} in Week {week}")
+    return deterministic_choice(options, f"gamerecap-headline-{winner}-{loser}-{week}-{margin}")
+
+
+def _format_player_snippet(row: dict, role: str) -> str:
+    if not row or not row.get('player_name'):
+        return ''
+    if role == 'passer':
+        return f"{row['player_name']} led the air attack with {safe_int(row.get('yards'))} passing yards and {safe_int(row.get('tds'))} touchdowns"
+    if role == 'rusher':
+        return f"{row['player_name']} added {safe_int(row.get('yards'))} rushing yards and {safe_int(row.get('tds'))} scores on the ground"
+    if role == 'receiver':
+        catches = safe_int(row.get('catches'))
+        catch_text = f" on {catches} catches" if catches else ''
+        return f"{row['player_name']} was the top target with {safe_int(row.get('yards'))} receiving yards{catch_text}"
+    if role == 'defender':
+        ints = safe_int(row.get('ints'))
+        sacks = safe_int(row.get('sacks'))
+        tackles = safe_int(row.get('tackles'))
+        bits = []
+        if ints:
+            bits.append(f"{ints} pick{'s' if ints != 1 else ''}")
+        if sacks:
+            bits.append(f"{sacks} sack{'s' if sacks != 1 else ''}")
+        if tackles:
+            bits.append(f"{tackles} tackles")
+        if bits:
+            return f"Defensively, {row['player_name']} showed up with " + ', '.join(bits)
+    return ''
+
+
+def template_gamerecap_text(facts: dict) -> str:
+    winner = facts['winner']
+    loser = facts['loser']
+    week = facts['week']
+    phase = facts['phase']
+    winner_score = facts['winning_score']
+    loser_score = facts['losing_score']
+    margin = facts['margin']
+    opener_options = [
+        f"{winner} came out of {phase} Week {week} with a {winner_score}-{loser_score} win over {loser}, turning a key matchup into another result that should matter in the room.",
+        f"In {phase} Week {week}, {winner} beat {loser} {winner_score}-{loser_score} and gave themselves another result with real momentum attached to it.",
+        f"{winner} handled business against {loser} in {phase} Week {week}, finishing with a {winner_score}-{loser_score} win that carried more than just box-score value.",
+    ]
+    if facts['is_one_score_game']:
+        opener_options.append(f"{winner} had to earn every bit of a {winner_score}-{loser_score} win over {loser} in {phase} Week {week}, surviving a game that stayed alive deep into the finish.")
+    if facts['is_blowout']:
+        opener_options.append(f"{winner} left little doubt in {phase} Week {week}, beating {loser} {winner_score}-{loser_score} in one of the more convincing results on the board.")
+    opener = deterministic_choice(opener_options, f"gamerecap-open-{winner}-{loser}-{week}-{margin}")
+    snippets = [
+        _format_player_snippet(facts['top_passer'], 'passer'),
+        _format_player_snippet(facts['top_rusher'], 'rusher'),
+        _format_player_snippet(facts['top_receiver'], 'receiver'),
+        _format_player_snippet(facts['top_defender'], 'defender'),
+    ]
+    snippets = [s for s in snippets if s]
+    middle = ' '.join(snippets[:3])
+    close_options = [
+        f"The win moves {winner} forward with a {facts['winner_record']} mark, while {loser} leave it at {facts['loser_record']} with more pressure heading into next week.",
+        f"For {winner}, it is another result that should strengthen league opinion; for {loser}, it is a loss that keeps the pressure on.",
+        f"That is the kind of scoreline that can boost {winner}'s confidence and leave {loser} needing a fast answer next time out.",
+    ]
+    if facts['is_one_score_game']:
+        close_options.append(f"In a game decided by {margin} points, {winner} were the side that handled the biggest moments cleaner when it counted.")
+    if facts['is_blowout']:
+        close_options.append(f"With a margin of {margin}, {winner} did more than win — they controlled the tone of the game from the bigger moments onward.")
+    close = deterministic_choice(close_options, f"gamerecap-close-{winner}-{loser}-{week}-{margin}")
+    parts = [opener]
+    if middle:
+        parts.append(middle + '.')
+    parts.append(close)
+    return ' '.join(parts)
+
+def build_gamerecap_prompt(facts: dict) -> str:
+    return (
+        "You are writing an original football game recap for a Madden franchise Discord.\n"
+        "Write one strong headline on the first line, then one recap paragraph of 130 to 220 words.\n"
+        "Keep it energetic, polished, and original. Do not imitate any specific outlet. Use only the facts provided.\n"
+        f"Facts JSON:\n{json.dumps({k: v for k, v in facts.items() if k != 'game_row'}, indent=2, default=str)}"
+    )
+
+
+
+async def generate_gamerecap_text(facts: dict) -> tuple[str, str, bool]:
+    fallback_headline = build_gamerecap_headline(facts)
+    fallback_body = template_gamerecap_text(facts)
+    if not OPENAI_API_KEY:
+        return fallback_headline, fallback_body, False
+    try:
+        ai_text = await asyncio.to_thread(call_openai_text, build_gamerecap_prompt(facts), 320)
+        cleaned = _clean_generated_text(ai_text)
+        if cleaned:
+            lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+            if len(lines) >= 2:
+                return lines[0], ' '.join(lines[1:]), True
+            if len(lines) == 1:
+                return fallback_headline, lines[0], True
+        return fallback_headline, fallback_body, False
+    except Exception as exc:
+        print(f"OpenAI gamerecap failed, using template fallback | game={facts['matchup']} error={exc}")
+        return fallback_headline, fallback_body, False
+
+
+def build_gamerecap_embed(facts: dict, headline: str, recap_text: str, used_ai: bool) -> discord.Embed:
+    game_row = facts['game_row']
+    embed = discord.Embed(
+        title=f"📝 {headline}",
+        description=recap_text,
+        color=0x3498DB,
+    )
+    embed.add_field(
+        name='Final Score',
+        value=f"{safe_text(game_row.get('away_team_name'))} {safe_int(game_row.get('away_score'))} — {safe_text(game_row.get('home_team_name'))} {safe_int(game_row.get('home_score'))}",
+        inline=False,
+    )
+    for label, row, role in [
+        ('Top Passer', facts['top_passer'], 'passer'),
+        ('Top Rusher', facts['top_rusher'], 'rusher'),
+        ('Top Receiver', facts['top_receiver'], 'receiver'),
+        ('Top Defender', facts['top_defender'], 'defender'),
+    ]:
+        snippet = _format_player_snippet(row, role)
+        if snippet:
+            embed.add_field(name=label, value=snippet, inline=False)
+    embed.set_footer(text=f"{facts['phase']} Week {facts['week']} • {'AI recap' if used_ai else 'Template recap'}")
+    return embed
+
+
+async def matchup_autocomplete_for_gamerecap(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    phase_value = getattr(interaction.namespace, 'phase', None)
+    week_value = getattr(interaction.namespace, 'week', None)
+    if week_value is None:
+        return []
+    try:
+        stage_index = resolve_command_stage(phase_value)
+        display_week = int(week_value)
+    except Exception:
+        return []
+    try:
+        games = fetch_games_for_stage_week(stage_index, display_week)
+    except Exception:
+        return []
+    current_norm = (current or '').lower().strip()
+    choices = []
+    for game in games:
+        label = f"{safe_text(game.get('away_team_name'))} @ {safe_text(game.get('home_team_name'))}"
+        if current_norm and current_norm not in label.lower():
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=str(safe_int(game.get('game_id')))))
+        if len(choices) >= 25:
+            break
+    return choices
+
 def compute_matchup_score(game_row) -> float:
     away_wins = game_row["away_wins"] or 0
     away_win_pct = float(game_row["away_win_pct"] or 0)
@@ -882,6 +1558,29 @@ def fetch_top_rushing_leaders(limit: int = 5):
             return cur.fetchall()
 
 
+
+def fetch_top_receiving_leaders(limit: int = 5):
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    prs.roster_id,
+                    COALESCE(MAX(players.full_name), MAX(prs.full_name)) AS player_name,
+                    COALESCE(MAX(teams.team_name), 'Unknown Team') AS team_name,
+                    SUM(COALESCE(prs.rec_yds, prs.recv_yds, prs.receiving_yds, 0)) AS total_rec_yds
+                FROM player_receiving_stats prs
+                LEFT JOIN players ON players.roster_id = prs.roster_id
+                LEFT JOIN teams ON teams.team_id = COALESCE(players.team_id, prs.team_id)
+                GROUP BY prs.roster_id
+                ORDER BY total_rec_yds DESC, player_name ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+
+
 def fetch_top_sack_leaders(limit: int = 5):
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
@@ -936,6 +1635,73 @@ def format_leader_lines(rows, stat_key: str, stat_label: str):
         stat_value = row.get(stat_key, 0)
         lines.append(f"{idx}. {player_name} ({team_name}) — {stat_value}")
     return lines
+
+
+def xp_required_for_level(level: int) -> int:
+    if level <= 1:
+        return 0
+    return int(round(100 * ((level - 1) ** 1.5)))
+
+
+def level_from_xp(xp: int) -> int:
+    level = 1
+    while xp >= xp_required_for_level(level + 1):
+        level += 1
+    return level
+
+
+def xp_progress_text(xp: int) -> tuple[int, int, int]:
+    level = level_from_xp(xp)
+    current_floor = xp_required_for_level(level)
+    next_floor = xp_required_for_level(level + 1)
+    needed = max(next_floor - current_floor, 1)
+    progress = xp - current_floor
+    return level, progress, needed
+
+
+def level_reward(level: int) -> tuple[int, str]:
+    token_rewards = {
+        2: 1, 4: 1, 6: 2, 8: 2, 10: 3,
+        12: 2, 14: 2, 16: 3, 18: 3, 20: 4,
+        22: 3, 24: 3, 26: 4, 28: 4, 30: 5,
+        32: 4, 34: 4, 36: 5, 38: 5, 40: 6,
+        42: 5, 44: 5, 46: 6, 48: 6, 50: 10,
+    }
+    bonus_notes = {
+        10: "Prize Wheel spin voucher",
+        20: "Mystery Crate voucher",
+        30: "Boom or Bust voucher",
+        40: "Prize Wheel spin voucher",
+        50: "Premium reward voucher",
+    }
+    return token_rewards.get(level, 0), bonus_notes.get(level, "")
+
+
+async def post_level_up_announcement(guild: Optional[discord.Guild], user: discord.abc.User, level: int, token_reward: int, bonus_note: str):
+    if not guild or not LEVEL_UP_CHANNEL_ID:
+        return
+    channel = guild.get_channel(LEVEL_UP_CHANNEL_ID)
+    if channel is None:
+        try:
+            fetched = await bot.fetch_channel(LEVEL_UP_CHANNEL_ID)
+            if isinstance(fetched, discord.abc.Messageable):
+                channel = fetched
+        except Exception:
+            return
+    if channel is None:
+        return
+
+    desc = f"🎉 {user.mention} leveled up to **Level {level}**"
+    if token_reward > 0:
+        desc += f" and earned **{token_reward}** token{'s' if token_reward != 1 else ''}"
+    desc += "!"
+    if bonus_note:
+        desc += f"\n**Bonus to honor:** {bonus_note}"
+
+    try:
+        await channel.send(embed=build_embed("⬆️ Level Up!", desc, 0x57F287))
+    except Exception:
+        pass
 
 
 # -----------------------------
@@ -1296,6 +2062,55 @@ class PrizeResult:
 # Bot events
 # -----------------------------
 @bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+
+    if message.channel.id in XP_BLACKLIST_CHANNEL_IDS:
+        return
+
+    content = (message.content or "").strip()
+    if len(content) < XP_MIN_MESSAGE_LEN:
+        return
+
+    row = TOKEN_DB.get_xp_user(message.author)
+    now_ts = message.created_at.timestamp()
+    last_xp_at = float((row or {}).get("last_xp_at") or 0)
+    if now_ts - last_xp_at < XP_COOLDOWN_SECONDS:
+        return
+
+    gained = random.randint(15, 25)
+    new_xp = int((row or {}).get("xp") or 0) + gained
+    old_level = int((row or {}).get("level") or 1)
+    new_level = level_from_xp(new_xp)
+    new_messages = int((row or {}).get("messages_counted") or 0) + 1
+
+    TOKEN_DB.update_xp_progress(message.author, new_xp, new_level, new_messages, now_ts)
+
+    if new_level > old_level:
+        total_tokens = 0
+        bonus_notes = []
+        for reached_level in range(old_level + 1, new_level + 1):
+            token_reward, bonus_note = level_reward(reached_level)
+            if token_reward > 0:
+                total_tokens += token_reward
+                TOKEN_DB.add_tokens(message.author, token_reward, f"Level {reached_level} reward", "leveling")
+            if bonus_note:
+                bonus_notes.append(bonus_note)
+            await post_level_up_announcement(message.guild, message.author, reached_level, token_reward, bonus_note)
+
+        if total_tokens > 0 or bonus_notes:
+            summary = f"{message.author.mention} leveled up to **Level {new_level}**"
+            if total_tokens > 0:
+                summary += f" and earned **{fmt_tokens(total_tokens)}** token{'s' if total_tokens != 1 else ''}"
+            if bonus_notes:
+                summary += f" | Bonus: {', '.join(bonus_notes)}"
+            await send_log_message(f"📈 LEVEL UP: {summary}")
+
+    await bot.process_commands(message)
+
+
+@bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
     print(f"LOG_CHANNEL_ID: {LOG_CHANNEL_ID}")
@@ -1303,6 +2118,8 @@ async def on_ready():
     print(f"NEWS_CHANNEL_ID: {NEWS_CHANNEL_ID}")
     print(f"OPENAI_API_KEY set: {'yes' if OPENAI_API_KEY else 'no'}")
     print(f"DATABASE_URL set: {'yes' if DATABASE_URL else 'no'}")
+    print(f"LEVEL_UP_CHANNEL_ID: {LEVEL_UP_CHANNEL_ID}")
+    bot.add_view(TradeReviewView())
     try:
         if GUILD_IDS:
             for guild_id in GUILD_IDS:
@@ -1359,7 +2176,7 @@ def compute_profile_gotw_count(team_id: int) -> int:
                     """
                     SELECT DISTINCT week
                     FROM games
-                    WHERE season_index = %s AND stage_index = 2
+                    WHERE season_index = %s AND stage_index = 1
                     ORDER BY week ASC
                     """,
                     (season_index,),
@@ -1367,7 +2184,7 @@ def compute_profile_gotw_count(team_id: int) -> int:
                 weeks = [int(r["week"]) for r in cur.fetchall()]
         count = 0
         for raw_week in weeks:
-            games = fetch_games_for_stage_week(2, raw_week + 1)
+            games = fetch_games_for_stage_week(1, raw_week + 1)
             if not games:
                 continue
             scored = sorted(games, key=compute_matchup_score, reverse=True)
@@ -1392,7 +2209,7 @@ def compute_profile_rivalry_count(team_id: int) -> int:
                     JOIN teams away ON away.team_id = g.away_team_id
                     JOIN teams home ON home.team_id = g.home_team_id
                     WHERE g.season_index = (SELECT MAX(season_index) FROM games)
-                      AND g.stage_index = 2
+                      AND g.stage_index = 1
                       AND (g.away_team_id = %s OR g.home_team_id = %s)
                       AND lower(COALESCE(away.conference_name, '')) = lower(COALESCE(home.conference_name, ''))
                       AND lower(COALESCE(away.division_name, '')) = lower(COALESCE(home.division_name, ''))
@@ -1414,7 +2231,7 @@ def compute_team_streak(team_id: int) -> tuple[str, int]:
                     SELECT away_team_id, home_team_id, away_score, home_score, status, week, game_id
                     FROM games
                     WHERE season_index = (SELECT MAX(season_index) FROM games)
-                      AND stage_index = 2
+                      AND stage_index = 1
                       AND (away_team_id = %s OR home_team_id = %s)
                     ORDER BY week DESC, game_id DESC
                     """,
@@ -1666,8 +2483,10 @@ async def roster(interaction: discord.Interaction, team_name: str, page: Optiona
 
     standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
     merged_team = {**team_row, **standing_row}
-    embed = build_roster_embed(merged_team, roster_rows, page or 1)
-    await interaction.response.send_message(embed=embed)
+    current_page = max(1, page or 1)
+    embed = build_roster_embed(merged_team, roster_rows, current_page)
+    view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, page=current_page)
+    await interaction.response.send_message(embed=embed, view=view)
 
 
 @bot.tree.command(name="team", description="Show a team summary and its first roster page.")
@@ -1682,7 +2501,8 @@ async def team(interaction: discord.Interaction, team_name: str):
     standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
     merged_team = {**team_row, **standing_row}
     embed = build_roster_embed(merged_team, roster_rows, 1)
-    await interaction.response.send_message(embed=embed)
+    view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, page=1)
+    await interaction.response.send_message(embed=embed, view=view)
 
 
 @bot.tree.command(name="balance", description="Check your token balance.")
@@ -1740,6 +2560,92 @@ async def leaderboard(interaction: discord.Interaction):
         await interaction.followup.send(
             embed=build_embed(f"🏆 Token Leaderboard (Page {page_num})", chunk, 0xFEE75C)
         )
+
+
+@bot.tree.command(name="xprank", description="Show your current XP rank and progress.")
+@app_commands.describe(user="Optional: check another user's rank")
+async def xprank(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    row = TOKEN_DB.get_xp_user(target)
+    xp = int((row or {}).get("xp") or 0)
+    level, progress, needed = xp_progress_text(xp)
+    desc = (
+        f"**Level:** {level}\n"
+        f"**XP:** {xp}\n"
+        f"**Progress to next level:** {progress}/{needed}\n"
+        f"**Messages Counted:** {(row or {}).get('messages_counted', 0)}"
+    )
+    await interaction.response.send_message(embed=build_embed(f"📈 {target.display_name}'s Rank", desc, 0x5865F2))
+
+
+
+
+@bot.tree.command(name="xplevel", description="Show your current XP level and progress.")
+@app_commands.describe(user="Optional: check another user's XP level")
+async def xplevel(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    return await xprank(interaction, user)
+
+
+@bot.tree.command(name="xpleaderboard", description="Show the server XP leaderboard.")
+async def xpleaderboard(interaction: discord.Interaction):
+    rows = TOKEN_DB.xp_leaderboard()
+    rows = [row for row in rows if int(row.get("xp") or 0) > 0][:25]
+    if not rows:
+        await interaction.response.send_message("No XP data found yet.")
+        return
+
+    lines = []
+    for idx, row in enumerate(rows, start=1):
+        lines.append(
+            f"**{idx}.** <@{row['user_id']}> — Level **{row['level']}** | XP **{row['xp']}** | Messages **{row['messages_counted']}**"
+        )
+
+    await interaction.response.send_message(
+        embed=build_embed("📚 XP Leaderboard", "\n".join(lines), 0xFEE75C)
+    )
+
+
+
+
+@bot.tree.command(name="casinoleaderboard", description="Show the top casino win percentages (minimum 10 games).")
+async def casinoleaderboard(interaction: discord.Interaction):
+    await interaction.response.defer()
+    with TOKEN_DB.connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    user_id,
+                    username,
+                    casino_wins,
+                    casino_losses,
+                    (casino_wins + casino_losses) AS total_games,
+                    CASE
+                        WHEN (casino_wins + casino_losses) > 0
+                        THEN ROUND((casino_wins::numeric / (casino_wins + casino_losses)) * 100, 1)
+                        ELSE 0
+                    END AS win_pct
+                FROM bot_users
+                WHERE (casino_wins + casino_losses) >= 10
+                ORDER BY win_pct DESC, casino_wins DESC, total_games DESC, username ASC
+                LIMIT 25
+                """
+            )
+            rows = cur.fetchall()
+
+    if not rows:
+        await interaction.followup.send("No casino leaderboard data yet. Minimum 10 casino games required.")
+        return
+
+    lines = []
+    for idx, row in enumerate(rows, start=1):
+        lines.append(
+            f"**{idx}.** <@{row['user_id']}> — **{row['win_pct']}%** | Record **{row['casino_wins']}-{row['casino_losses']}** | Games **{row['total_games']}**"
+        )
+
+    embed = build_embed("🎰 Casino Leaderboard", "\n".join(lines), 0xF1C40F)
+    embed.set_footer(text="Minimum 10 total casino games required.")
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="history", description="Show your most recent token activity.")
@@ -2296,39 +3202,6 @@ async def vouchers(interaction: discord.Interaction, user: Optional[discord.Memb
     )
 
 
-
-@bot.tree.command(name="casinoleaderboard", description="Show top casino win percentages with a minimum of 10 games.")
-async def casinoleaderboard(interaction: discord.Interaction):
-    await interaction.response.defer()
-    try:
-        rows = TOKEN_DB.casino_leaderboard(minimum_games=10)
-    except Exception as exc:
-        await interaction.followup.send(f"Failed to load casino leaderboard: {exc}", ephemeral=True)
-        return
-
-    if not rows:
-        await interaction.followup.send("No users qualify yet. Minimum **10** total casino games required.")
-        return
-
-    lines = []
-    for idx, row in enumerate(rows[:15], start=1):
-        wins = int(row["casino_wins"] or 0)
-        losses = int(row["casino_losses"] or 0)
-        total_games = int(row["total_games"] or 0)
-        win_pct = float(row["win_pct"] or 0.0)
-        lines.append(
-            f"**{idx}.** <@{row['user_id']}> — **{win_pct:.1f}%** ({wins}-{losses}, {total_games} games)"
-        )
-
-    embed = build_embed(
-        "🎰 Casino Leaderboard",
-        "\n".join(lines),
-        0xFEE75C,
-    )
-    embed.set_footer(text="Minimum 10 total casino games required.")
-    await interaction.followup.send(embed=embed)
-
-
 # -----------------------------
 # Admin commands
 # -----------------------------
@@ -2514,6 +3387,185 @@ async def postoverview(interaction: discord.Interaction):
 
 
 
+
+
+def member_has_role_id(member: discord.Member, role_id: int) -> bool:
+    if not role_id:
+        return False
+    return any(int(role.id) == int(role_id) for role in getattr(member, "roles", []))
+
+
+def is_trade_committee_member(member: discord.Member) -> bool:
+    return member_has_role_id(member, TRADE_COMMITTEE_ROLE_ID)
+
+
+def trade_status_title(status: str) -> str:
+    status = (status or "pending").lower()
+    if status == "approved":
+        return "✅ Trade Approved"
+    if status == "denied":
+        return "❌ Trade Denied"
+    return "📝 Trade Pending Review"
+
+
+def build_trade_embed(trade_row: dict) -> discord.Embed:
+    trade_id = safe_int(trade_row.get("id"))
+    status = safe_text(trade_row.get("status"), "pending").lower()
+    color = 0xFEE75C if status == "pending" else (0x57F287 if status == "approved" else 0xED4245)
+    embed = discord.Embed(
+        title=f"{trade_status_title(status)} — #{trade_id}",
+        color=color,
+        description=(
+            f"**{safe_text(trade_row.get('team_one_name'))} receive:** {safe_text(trade_row.get('team_one_gets'))}\n"
+            f"**{safe_text(trade_row.get('team_two_name'))} receive:** {safe_text(trade_row.get('team_two_gets'))}"
+        ),
+    )
+    embed.add_field(name="Submitted By", value=safe_text(trade_row.get("submitted_username")), inline=True)
+    embed.add_field(
+        name="Vote Tally",
+        value=(
+            f"✅ Approvals: **{safe_int(trade_row.get('approve_count'))} / {TRADE_REQUIRED_APPROVALS}**\n"
+            f"❌ Denials: **{safe_int(trade_row.get('deny_count'))} / {TRADE_REQUIRED_DENIALS}**"
+        ),
+        inline=True,
+    )
+    status_value = safe_text(trade_row.get("status"), "pending").title()
+    if trade_row.get("finalized_reason"):
+        status_value += f"\nReason: {safe_text(trade_row.get('finalized_reason'))}"
+    embed.add_field(name="Status", value=status_value, inline=False)
+    notes = safe_text(trade_row.get("notes"), "")
+    if notes and notes != "Unknown":
+        embed.add_field(name="Notes", value=notes, inline=False)
+    votes = TOKEN_DB.get_trade_votes(trade_id)
+    if votes:
+        approval_names = [safe_text(v.get("voter_username")) for v in votes if v.get("vote") == "approve"]
+        denial_names = [safe_text(v.get("voter_username")) for v in votes if v.get("vote") == "deny"]
+        embed.add_field(name="Approved By", value=", ".join(approval_names) if approval_names else "—", inline=True)
+        embed.add_field(name="Denied By", value=", ".join(denial_names) if denial_names else "—", inline=True)
+    embed.set_footer(text="Trade committee needs two approves to pass or two denies to fail.")
+    return embed
+
+
+async def fetch_channel_message(channel_id: int, message_id: int) -> discord.Message | None:
+    if not channel_id or not message_id:
+        return None
+    channel = bot.get_channel(int(channel_id))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(channel_id))
+        except Exception:
+            return None
+    try:
+        return await channel.fetch_message(int(message_id))
+    except Exception:
+        return None
+
+
+async def refresh_trade_message(trade_row: dict):
+    if not trade_row:
+        return
+    message = await fetch_channel_message(safe_int(trade_row.get("review_channel_id")), safe_int(trade_row.get("review_message_id")))
+    if message is None:
+        return
+    status = safe_text(trade_row.get("status"), "pending").lower()
+    view = TradeReviewView() if status == "pending" else None
+    await message.edit(embed=build_trade_embed(trade_row), view=view)
+
+
+async def post_trade_announcement(trade_row: dict):
+    if not trade_row:
+        return
+    announcement_channel_id = safe_int(trade_row.get("announcement_channel_id")) or TRADE_ANNOUNCEMENTS_CHANNEL_ID
+    if not announcement_channel_id:
+        return
+    channel = bot.get_channel(int(announcement_channel_id))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(announcement_channel_id))
+        except Exception:
+            return
+    coach_mentions = []
+    for coach_id in [safe_int(trade_row.get("coach_one_user_id")), safe_int(trade_row.get("coach_two_user_id"))]:
+        if coach_id:
+            coach_mentions.append(f"<@{coach_id}>")
+    mention_text = " and ".join(coach_mentions) if coach_mentions else "Coaches"
+    status = safe_text(trade_row.get("status"), "pending").lower()
+    if status not in {"approved", "denied"}:
+        return
+    emoji = "✅" if status == "approved" else "❌"
+    status_word = "approved" if status == "approved" else "denied"
+    content = (
+        f"{emoji} {mention_text} — Trade **#{safe_int(trade_row.get('id'))}** between "
+        f"**{safe_text(trade_row.get('team_one_name'))}** and **{safe_text(trade_row.get('team_two_name'))}** was **{status_word}**."
+    )
+    existing_message_id = safe_int(trade_row.get("announcement_message_id"))
+    existing = await fetch_channel_message(int(announcement_channel_id), existing_message_id) if existing_message_id else None
+    if existing is not None:
+        await existing.edit(content=content, embed=build_trade_embed(trade_row))
+        return
+    try:
+        message = await channel.send(content=content, embed=build_trade_embed(trade_row))
+        TOKEN_DB.set_trade_announcement_message(safe_int(trade_row.get("id")), int(channel.id), int(message.id))
+    except Exception:
+        return
+
+
+async def finalize_trade_if_threshold_met(trade_row: dict, acting_user_id: int | None = None, reason: str = "") -> dict:
+    if not trade_row:
+        return trade_row
+    status = safe_text(trade_row.get("status"), "pending").lower()
+    if status != "pending":
+        return trade_row
+    approve_count = safe_int(trade_row.get("approve_count"))
+    deny_count = safe_int(trade_row.get("deny_count"))
+    if approve_count >= TRADE_REQUIRED_APPROVALS:
+        trade_row = TOKEN_DB.finalize_trade(safe_int(trade_row.get("id")), "approved", acting_user_id, reason or "Reached required approvals")
+    elif deny_count >= TRADE_REQUIRED_DENIALS:
+        trade_row = TOKEN_DB.finalize_trade(safe_int(trade_row.get("id")), "denied", acting_user_id, reason or "Reached required denials")
+    await refresh_trade_message(trade_row)
+    if safe_text(trade_row.get("status"), "pending").lower() in {"approved", "denied"}:
+        await post_trade_announcement(trade_row)
+    return trade_row
+
+
+class TradeReviewView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _handle_vote(self, interaction: discord.Interaction, vote: str):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command must be used inside a server.", ephemeral=True)
+            return
+        if not is_trade_committee_member(interaction.user):
+            await interaction.response.send_message("You are not on the trade committee.", ephemeral=True)
+            return
+        if interaction.message is None:
+            await interaction.response.send_message("Could not find the trade review message.", ephemeral=True)
+            return
+
+        trade_row = TOKEN_DB.get_trade_by_message(int(interaction.message.id))
+        if not trade_row:
+            await interaction.response.send_message("Could not find the trade linked to this review message.", ephemeral=True)
+            return
+        if safe_text(trade_row.get("status"), "pending").lower() != "pending":
+            await interaction.response.send_message("This trade has already been finalized.", ephemeral=True)
+            return
+
+        trade_row, _changed = TOKEN_DB.upsert_trade_vote(safe_int(trade_row.get("id")), interaction.user, vote)
+        trade_row = await finalize_trade_if_threshold_met(trade_row, int(interaction.user.id))
+        status = safe_text(trade_row.get("status"), "pending").lower()
+        content = None
+        if TRADE_COMMITTEE_ROLE_ID:
+            content = f"<@&{TRADE_COMMITTEE_ROLE_ID}>"
+        await interaction.response.edit_message(content=content, embed=build_trade_embed(trade_row), view=TradeReviewView() if status == "pending" else None)
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅", custom_id="trade_vote_approve")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_vote(interaction, "approve")
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌", custom_id="trade_vote_deny")
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_vote(interaction, "deny")
 
 def record_to_dict(row):
     if row is None:
@@ -2704,19 +3756,420 @@ def fetch_team_roster_rows(team_id: int) -> list[dict]:
             return [record_to_dict(row) for row in cur.fetchall()]
 
 
+def normalize_rating_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def _normalized_row_lookup(row: dict) -> dict[str, tuple[str, object]]:
+    lookup: dict[str, tuple[str, object]] = {}
+    for key, value in row.items():
+        lookup[normalize_rating_key(str(key))] = (str(key), value)
+    return lookup
+
+
+def rating_value(row: dict, *field_names: str) -> Optional[int]:
+    normalized_lookup = _normalized_row_lookup(row)
+    for field_name in field_names:
+        normalized_name = normalize_rating_key(field_name)
+        if normalized_name not in normalized_lookup:
+            continue
+        _original_key, value = normalized_lookup[normalized_name]
+        try:
+            if value is None or value == "":
+                continue
+            numeric = int(float(value))
+        except Exception:
+            continue
+        if numeric > 0:
+            return numeric
+    return None
+
+
+def prettify_rating_field_name(field_name: str) -> str:
+    name = re.sub(r"_rating$", "", field_name)
+    name = name.replace("_", " ").strip()
+    name = re.sub(r"\s+", " ", name)
+    words = [w.upper() if w.lower() in {"qb", "rb", "wr", "te", "lt", "lg", "rg", "rt", "dt", "de", "lb", "cb", "fs", "ss"} else w.title() for w in name.split()]
+    return " ".join(words)
+
+
+def extract_additional_rating_candidates(row: dict, position: str, used_labels: set[str], limit: int) -> list[tuple[str, int]]:
+    position = (position or "").upper()
+    keyword_priorities = {
+        "QB": ["throw", "accuracy", "play action", "break sack", "speed", "acceleration", "agility", "awareness"],
+        "HB": ["speed", "acceleration", "agility", "carry", "break", "truck", "juke", "spin", "change"],
+        "FB": ["strength", "carry", "lead", "impact", "break", "truck", "run block"],
+        "WR": ["speed", "acceleration", "agility", "catch", "spectacular", "traffic", "release", "route", "jump"],
+        "TE": ["speed", "catch", "spectacular", "traffic", "route", "run block", "impact", "strength"],
+        "LT": ["pass block", "run block", "impact", "strength", "awareness"],
+        "LG": ["pass block", "run block", "impact", "strength", "awareness"],
+        "C": ["pass block", "run block", "impact", "strength", "awareness"],
+        "RG": ["pass block", "run block", "impact", "strength", "awareness"],
+        "RT": ["pass block", "run block", "impact", "strength", "awareness"],
+        "LE": ["power", "finesse", "shed", "tackle", "pursuit", "strength", "play recognition"],
+        "RE": ["power", "finesse", "shed", "tackle", "pursuit", "strength", "play recognition"],
+        "LEDGE": ["speed", "power", "finesse", "shed", "tackle", "pursuit", "play recognition"],
+        "REDGE": ["speed", "power", "finesse", "shed", "tackle", "pursuit", "play recognition"],
+        "DT": ["strength", "power", "finesse", "shed", "tackle", "pursuit", "play recognition"],
+        "LOLB": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit", "play recognition"],
+        "MLB": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit", "play recognition"],
+        "ROLB": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit", "play recognition"],
+        "SAM": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit", "play recognition"],
+        "MIKE": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit", "play recognition"],
+        "WILL": ["speed", "tackle", "shed", "hit", "zone", "man", "pursuit", "play recognition"],
+        "CB": ["speed", "acceleration", "man", "zone", "press", "play recognition", "jump", "catch"],
+        "FS": ["speed", "acceleration", "zone", "man", "play recognition", "tackle", "pursuit", "catch"],
+        "SS": ["speed", "acceleration", "zone", "man", "play recognition", "hit", "tackle", "pursuit", "catch"],
+        "K": ["kick"],
+        "P": ["punt"],
+    }
+    forbidden_keywords = {
+        "QB": ["cover", "press", "injury", "kick", "punt", "catch", "route", "block", "tackle", "hit power"],
+        "HB": ["cover", "press", "injury", "kick", "punt", "throw power", "accuracy"],
+        "FB": ["cover", "press", "injury", "kick", "punt", "throw power", "accuracy"],
+        "WR": ["cover", "press", "injury", "kick", "punt", "throw power", "accuracy", "tackle", "block shed"],
+        "TE": ["cover", "press", "injury", "kick", "punt", "throw power", "accuracy", "tackle", "block shed"],
+        "LT": ["cover", "press", "injury", "kick", "punt", "throw", "catch"],
+        "LG": ["cover", "press", "injury", "kick", "punt", "throw", "catch"],
+        "C": ["cover", "press", "injury", "kick", "punt", "throw", "catch"],
+        "RG": ["cover", "press", "injury", "kick", "punt", "throw", "catch"],
+        "RT": ["cover", "press", "injury", "kick", "punt", "throw", "catch"],
+        "LE": ["accuracy", "route", "catch", "injury", "kick", "punt"],
+        "RE": ["accuracy", "route", "catch", "injury", "kick", "punt"],
+        "LEDGE": ["accuracy", "route", "catch", "injury", "kick", "punt"],
+        "REDGE": ["accuracy", "route", "catch", "injury", "kick", "punt"],
+        "DT": ["accuracy", "route", "catch", "injury", "kick", "punt", "cover"],
+        "LOLB": ["accuracy", "route", "release", "injury", "kick", "punt"],
+        "MLB": ["accuracy", "route", "release", "injury", "kick", "punt"],
+        "ROLB": ["accuracy", "route", "release", "injury", "kick", "punt"],
+        "SAM": ["accuracy", "route", "release", "injury", "kick", "punt"],
+        "MIKE": ["accuracy", "route", "release", "injury", "kick", "punt"],
+        "WILL": ["accuracy", "route", "release", "injury", "kick", "punt"],
+        "CB": ["accuracy", "route", "release", "injury", "kick", "punt", "throw power"],
+        "FS": ["accuracy", "route", "release", "injury", "kick", "punt", "throw power"],
+        "SS": ["accuracy", "route", "release", "injury", "kick", "punt", "throw power"],
+        "K": ["injury", "cover", "route", "throw", "catch"],
+        "P": ["injury", "cover", "route", "throw", "catch"],
+    }
+    priorities = keyword_priorities.get(position, ["speed", "acceleration", "agility", "strength", "awareness", "catch", "throw", "tackle"])
+    banned = forbidden_keywords.get(position, ["injury"])
+    candidates: list[tuple[int, str, int]] = []
+    for key, raw_value in row.items():
+        key_str = str(key)
+        normalized = key_str.lower().replace("_", " ")
+        if not (key_str.endswith("_rating") or "rating" in key_str.lower()):
+            continue
+        if any(bad in normalized for bad in banned):
+            continue
+        try:
+            if raw_value is None or raw_value == "":
+                continue
+            numeric = int(float(raw_value))
+        except Exception:
+            continue
+        if numeric <= 0:
+            continue
+        label = prettify_rating_field_name(key_str)
+        if label in used_labels:
+            continue
+        score = 0
+        for idx, keyword in enumerate(priorities):
+            if keyword in normalized:
+                score += max(1, 20 - idx)
+        if score <= 0:
+            continue
+        candidates.append((score, label, numeric))
+    candidates.sort(key=lambda item: (-item[0], -item[2], item[1]))
+    out: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for _score, label, numeric in candidates:
+        if label in seen or label in used_labels:
+            continue
+        seen.add(label)
+        out.append((label, numeric))
+        if len(out) >= limit:
+            break
+    return out
+
+
+RATING_LABEL_CANDIDATES = {
+    "Speed": ("speed_rating", "speed", "player_speed_rating"),
+    "Acceleration": ("acceleration_rating", "acceleration", "accel_rating"),
+    "Agility": ("agility_rating", "agility"),
+    "Awareness": ("awareness_rating", "awareness", "awareness_grade"),
+    "Throw Power": ("throw_power_rating", "throwpower_rating"),
+    "Short Accuracy": ("short_accuracy_rating", "short_accuracy", "throw_accuracy_short_rating", "throw_accuracy_short", "throw_short_rating"),
+    "Mid Accuracy": ("mid_accuracy_rating", "mid_accuracy", "medium_accuracy_rating", "medium_accuracy", "throw_accuracy_mid_rating", "throw_accuracy_mid", "throw_medium_rating"),
+    "Deep Accuracy": ("deep_accuracy_rating", "deep_accuracy", "throw_accuracy_deep_rating", "throw_accuracy_deep", "throw_deep_rating"),
+    "Throw on Run": ("throw_on_run_rating", "throw_on_run", "throwonrun_rating"),
+    "Play Action": ("play_action_rating", "play_action", "playaction_rating"),
+    "Break Sack": ("break_sack_rating", "break_sack", "breaksack_rating"),
+    "Carrying": ("carrying_rating", "carry_rating", "carry"),
+    "Break Tackle": ("break_tackle_rating", "breaktackle_rating", "break_tackle"),
+    "Trucking": ("trucking_rating", "truck_rating", "trucking"),
+    "Change of Direction": ("change_of_direction_rating", "cod_rating"),
+    "Juke": ("juke_move_rating", "juke_rating"),
+    "Spin": ("spin_move_rating", "spin_rating"),
+    "Catch": ("catch_rating", "catching_rating", "catch"),
+    "Catch in Traffic": ("catch_in_traffic_rating", "catch_in_traffic", "cit_rating", "catchintraffic_rating"),
+    "Spec Catch": ("spectacular_catch_rating", "spec_catch_rating", "spectacularcatch_rating"),
+    "Release": ("release_rating", "release"),
+    "Short Route": ("short_route_running_rating", "short_route_rating", "route_running_short_rating", "shortroute_running_rating"),
+    "Mid Route": ("medium_route_running_rating", "mid_route_running_rating", "medium_route_rating", "route_running_medium_rating", "route_running_mid_rating"),
+    "Deep Route": ("deep_route_running_rating", "deep_route_rating", "route_running_deep_rating"),
+    "Strength": ("strength_rating", "strength"),
+    "Pass Block": ("pass_block_rating", "passblock_rating", "pass_block"),
+    "Run Block": ("run_block_rating", "runblock_rating", "run_block"),
+    "Impact Block": ("impact_block_rating", "impactblock_rating", "impact_block"),
+    "Lead Block": ("lead_block_rating", "leadblock_rating", "lead_block"),
+    "Finesse Moves": ("finesse_moves_rating", "finesse_move_rating", "finessemoves_rating", "finesse_moves"),
+    "Power Moves": ("power_moves_rating", "power_move_rating", "powermoves_rating", "power_moves"),
+    "Block Shed": ("block_shedding_rating", "block_shed_rating", "blockshedding_rating", "block_shedding"),
+    "Tackle": ("tackle_rating", "tackle"),
+    "Pursuit": ("pursuit_rating", "pursuit"),
+    "Hit Power": ("hit_power_rating", "hitpower_rating", "hit_power"),
+    "Play Recognition": ("play_recognition_rating", "playrecognition_rating", "play_recognition"),
+    "Man Coverage": ("man_coverage_rating", "mancoverage_rating", "man_coverage"),
+    "Zone Coverage": ("zone_coverage_rating", "zonecoverage_rating", "zone_coverage"),
+    "Press": ("press_rating", "press"),
+    "Jump": ("jump_rating", "jumping_rating", "jump"),
+    "Kick Power": ("kick_power_rating",),
+    "Kick Accuracy": ("kick_accuracy_rating",),
+    "Punt Power": ("punt_power_rating",),
+    "Punt Accuracy": ("punt_accuracy_rating",),
+}
+
+
+POSITION_RATING_PLANS = {
+    "QB": ["Throw Power", "Short Accuracy", "Mid Accuracy", "Deep Accuracy", "Throw on Run", "Play Action", "Break Sack", "Awareness", "Speed", "Acceleration", "Agility"],
+    "HB": ["Speed", "Acceleration", "Agility", "Carrying", "Break Tackle", "Trucking", "Change of Direction", "Juke", "Spin"],
+    "FB": ["Strength", "Carrying", "Lead Block", "Run Block", "Impact Block", "Break Tackle", "Trucking", "Speed"],
+    "WR": ["Speed", "Acceleration", "Agility", "Catch", "Catch in Traffic", "Spec Catch", "Release", "Short Route", "Mid Route", "Deep Route", "Jump"],
+    "TE": ["Speed", "Catch", "Catch in Traffic", "Spec Catch", "Short Route", "Mid Route", "Run Block", "Impact Block"],
+    "LT": ["Strength", "Awareness", "Pass Block", "Run Block", "Impact Block"],
+    "LG": ["Strength", "Awareness", "Pass Block", "Run Block", "Impact Block"],
+    "C": ["Strength", "Awareness", "Pass Block", "Run Block", "Impact Block"],
+    "RG": ["Strength", "Awareness", "Pass Block", "Run Block", "Impact Block"],
+    "RT": ["Strength", "Awareness", "Pass Block", "Run Block", "Impact Block"],
+    "LE": ["Strength", "Finesse Moves", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
+    "RE": ["Strength", "Finesse Moves", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
+    "LEDGE": ["Speed", "Finesse Moves", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
+    "REDGE": ["Speed", "Finesse Moves", "Power Moves", "Block Shed", "Tackle", "Pursuit"],
+    "DT": ["Power Moves", "Finesse Moves", "Block Shed", "Play Recognition", "Tackle", "Pursuit", "Hit Power"],
+    "LOLB": ["Speed", "Tackle", "Block Shed", "Hit Power", "Zone Coverage", "Pursuit"],
+    "MLB": ["Speed", "Awareness", "Tackle", "Block Shed", "Hit Power", "Zone Coverage", "Pursuit"],
+    "ROLB": ["Speed", "Tackle", "Block Shed", "Hit Power", "Zone Coverage", "Pursuit"],
+    "SAM": ["Speed", "Tackle", "Block Shed", "Hit Power", "Zone Coverage", "Pursuit"],
+    "MIKE": ["Speed", "Awareness", "Tackle", "Block Shed", "Hit Power", "Zone Coverage", "Pursuit"],
+    "WILL": ["Speed", "Tackle", "Block Shed", "Hit Power", "Man Coverage", "Zone Coverage", "Pursuit"],
+    "CB": ["Speed", "Acceleration", "Man Coverage", "Zone Coverage", "Press", "Play Recognition", "Jump", "Catch"],
+    "FS": ["Speed", "Acceleration", "Zone Coverage", "Man Coverage", "Play Recognition", "Tackle", "Pursuit", "Catch"],
+    "SS": ["Speed", "Acceleration", "Zone Coverage", "Hit Power", "Play Recognition", "Tackle", "Pursuit", "Catch"],
+    "K": ["Kick Power", "Kick Accuracy", "Awareness"],
+    "P": ["Punt Power", "Punt Accuracy", "Awareness"],
+}
+
+
+POSITION_FALLBACK_LABELS = {
+    "QB": ["Awareness", "Break Sack", "Speed", "Acceleration", "Agility"],
+    "HB": ["Speed", "Acceleration", "Agility", "Carrying", "Break Tackle", "Juke"],
+    "FB": ["Strength", "Carrying", "Lead Block", "Impact Block", "Break Tackle"],
+    "WR": ["Acceleration", "Agility", "Catch", "Catch in Traffic", "Spec Catch", "Release", "Jump"],
+    "TE": ["Catch", "Spec Catch", "Run Block", "Impact Block", "Strength"],
+    "LT": ["Strength", "Pass Block", "Run Block", "Impact Block", "Awareness"],
+    "LG": ["Strength", "Pass Block", "Run Block", "Impact Block", "Awareness"],
+    "C": ["Strength", "Pass Block", "Run Block", "Impact Block", "Awareness"],
+    "RG": ["Strength", "Pass Block", "Run Block", "Impact Block", "Awareness"],
+    "RT": ["Strength", "Pass Block", "Run Block", "Impact Block", "Awareness"],
+    "LE": ["Strength", "Power Moves", "Finesse Moves", "Block Shed", "Tackle"],
+    "RE": ["Strength", "Power Moves", "Finesse Moves", "Block Shed", "Tackle"],
+    "LEDGE": ["Speed", "Power Moves", "Finesse Moves", "Block Shed", "Tackle"],
+    "REDGE": ["Speed", "Power Moves", "Finesse Moves", "Block Shed", "Tackle"],
+    "DT": ["Power Moves", "Finesse Moves", "Block Shed", "Play Recognition", "Tackle", "Pursuit", "Hit Power"],
+    "LOLB": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
+    "MLB": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
+    "ROLB": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
+    "SAM": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
+    "MIKE": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
+    "WILL": ["Speed", "Tackle", "Hit Power", "Pursuit", "Zone Coverage"],
+    "CB": ["Speed", "Acceleration", "Man Coverage", "Zone Coverage", "Press"],
+    "FS": ["Speed", "Acceleration", "Zone Coverage", "Play Recognition", "Tackle"],
+    "SS": ["Speed", "Acceleration", "Hit Power", "Zone Coverage", "Tackle"],
+    "K": ["Kick Power", "Kick Accuracy"],
+    "P": ["Punt Power", "Punt Accuracy"],
+}
+
+
+POSITION_VALUE_WEIGHTS = {
+    "QB": 18,
+    "WR": 11,
+    "LT": 11,
+    "RT": 10,
+    "LE": 10,
+    "RE": 10,
+    "LEDGE": 12,
+    "REDGE": 12,
+    "DT": 9,
+    "CB": 11,
+    "FS": 8,
+    "SS": 8,
+    "MLB": 8,
+    "MIKE": 8,
+    "WILL": 8,
+    "LOLB": 8,
+    "ROLB": 8,
+    "HB": 8,
+    "FB": 4,
+    "TE": 7,
+    "LG": 8,
+    "C": 8,
+    "RG": 8,
+    "K": -2,
+    "P": -4,
+}
+
+
+def select_key_ratings(row: dict, position: str, max_items: int = 8, min_items: int = 4) -> list[tuple[str, int]]:
+    position = (position or "").upper()
+    labels = POSITION_RATING_PLANS.get(position, ["Speed", "Awareness", "Catch", "Break Tackle", "Throw Power"])
+    selected: list[tuple[str, int]] = []
+    used_labels: set[str] = set()
+
+    for label in labels:
+        candidates = RATING_LABEL_CANDIDATES.get(label, ())
+        value = rating_value(row, *candidates)
+        if value is None:
+            continue
+        selected.append((label, value))
+        used_labels.add(label)
+        if len(selected) >= max_items:
+            return selected
+
+    fallback_labels = POSITION_FALLBACK_LABELS.get(
+        position,
+        ["Speed", "Acceleration", "Agility", "Strength", "Awareness", "Catch", "Throw Power", "Carrying", "Break Tackle", "Tackle"],
+    )
+    for label in fallback_labels:
+        if label in used_labels:
+            continue
+        candidates = RATING_LABEL_CANDIDATES.get(label, ())
+        value = rating_value(row, *candidates)
+        if value is None:
+            continue
+        selected.append((label, value))
+        used_labels.add(label)
+        if len(selected) >= max_items:
+            return selected
+
+    if len(selected) < min_items:
+        needed = min(max_items - len(selected), max(0, min_items - len(selected)))
+        for label, value in extract_additional_rating_candidates(row, position, used_labels, needed):
+            selected.append((label, value))
+            used_labels.add(label)
+            if len(selected) >= max_items:
+                break
+
+    return selected
+
+
+def format_key_ratings(row: dict, position: str, max_items: int = 8) -> str:
+    items = select_key_ratings(row, position, max_items=max_items)
+    if not items:
+        return "No rating data found."
+    return "\n".join(f"{label}: {value}" for label, value in items)
+
+
+def player_value_score(row: dict) -> tuple[int, str]:
+    position = safe_text(row.get("position"), "").upper()
+    overall = resolve_display_overall(row)
+    age = safe_int(row.get("age"), 25)
+    years_pro = safe_int(row.get("years_pro"), 0)
+    dev_raw = safe_int(row.get("dev_trait"), 0)
+    years_left = safe_int(row.get("contract_years_left"), 0)
+    salary = safe_int(row.get("contract_salary"), 0)
+
+    base_score = overall * 0.65
+    base_score += POSITION_VALUE_WEIGHTS.get(position, 0) * 0.35
+    base_score += {0: 0, 1: 4, 2: 8, 3: 12}.get(dev_raw, 0)
+    base_score += min(years_left, 5) * 0.8
+
+    if position == "QB":
+        if age <= 24:
+            base_score += 5
+        elif age <= 27:
+            base_score += 3
+        elif age <= 31:
+            base_score += 1
+        elif age >= 36:
+            base_score -= 5
+    elif position in {"HB", "FB"}:
+        if age <= 23:
+            base_score += 3
+        elif age <= 26:
+            base_score += 1
+        elif age >= 29:
+            base_score -= 6
+        if years_pro >= 6:
+            base_score -= 2
+    else:
+        if age <= 23:
+            base_score += 4
+        elif age <= 26:
+            base_score += 2
+        elif age <= 29:
+            base_score += 1
+        elif age >= 32:
+            base_score -= 4
+
+    if salary >= 25_000_000:
+        base_score -= 5
+    elif salary >= 15_000_000:
+        base_score -= 3
+    elif 0 < salary <= 3_000_000:
+        base_score += 2
+
+    if overall >= 95:
+        base_score += 12
+    elif overall >= 90:
+        base_score += 8
+    elif overall >= 85:
+        base_score += 5
+    elif overall >= 80:
+        base_score += 2
+
+    score = max(1, min(99, int(round(base_score))))
+
+    if score >= 90:
+        tier = "Untouchable"
+    elif score >= 80:
+        tier = "Elite"
+    elif score >= 68:
+        tier = "High Value"
+    elif score >= 54:
+        tier = "Starter Value"
+    elif score >= 40:
+        tier = "Depth Plus"
+    else:
+        tier = "Depth / Dev"
+
+    return score, tier
+
+
 def build_player_embed(row: dict) -> discord.Embed:
     team_name = safe_text(row.get("team_name"), "Free Agent")
     dev_label = dev_trait_to_label(row.get("dev_trait"), row.get("resolved_dev_trait_label") or row.get("dev_trait_label"))
     position = safe_text(row.get("position"))
     jersey = safe_int(row.get("jersey_num"))
     title_name = safe_text(row.get("full_name"))
+    display_ovr = resolve_display_overall(row)
+    value_score, value_tier = player_value_score(row)
     title = f"🏈 {title_name}"
     if jersey:
         title += f" #{jersey}"
 
     embed = build_embed(
         title,
-        f"**{position}** • **{team_name}** • **{resolve_display_overall(row)} OVR** • **{dev_label}**",
+        f"**{position}** • **{team_name}** • **{display_ovr} OVR** • **{dev_label}**",
         0x5865F2,
     )
     embed.add_field(
@@ -2731,12 +4184,15 @@ def build_player_embed(row: dict) -> discord.Embed:
     )
     embed.add_field(
         name="Key Ratings",
+        value=format_key_ratings(row, position, max_items=8),
+        inline=True,
+    )
+    embed.add_field(
+        name="Value",
         value=(
-            f"Speed: {safe_int(row.get('speed_rating'))}\n"
-            f"Awareness: {safe_int(row.get('awareness_rating'))}\n"
-            f"Catch: {safe_int(row.get('catch_rating'))}\n"
-            f"Break Tackle: {safe_int(row.get('break_tackle_rating'))}\n"
-            f"Throw Power: {safe_int(row.get('throw_power_rating'))}"
+            f"Score: {value_score}\n"
+            f"Tier: {value_tier}\n"
+            f"Best OVR: {safe_int(row.get('player_best_ovr'))}"
         ),
         inline=True,
     )
@@ -2745,7 +4201,6 @@ def build_player_embed(row: dict) -> discord.Embed:
         value=(
             f"Years Left: {safe_int(row.get('contract_years_left'))}\n"
             f"Salary: {format_currency_compact(row.get('contract_salary'))}\n"
-            f"Best OVR: {safe_int(row.get('player_best_ovr'))}\n"
             f"Rookie Year: {safe_int(row.get('rookie_year'))}"
         ),
         inline=False,
@@ -3549,7 +5004,7 @@ async def create_week_channels(
         await channel.send("\n".join(message_lines))
 
         try:
-            weekly_rivalries = generate_weekly_rivalries(game_stage_index, game_week) if game_stage_index == 2 else []
+            weekly_rivalries = generate_weekly_rivalries(game_stage_index, game_week) if game_stage_index == 1 else []
             rivalry_game_ids = {int(r["game_id"]) for r in weekly_rivalries}
             if int(game_id) in rivalry_game_ids:
                 await channel.send("🔥 **This matchup has been tagged as a Rivalry Game.**")
@@ -3804,6 +5259,40 @@ async def regenerate_matchup_article(
     await preview_matchup_article.callback(interaction, week, phase, away_team, home_team)  # type: ignore[attr-defined]
 
 
+
+
+@bot.tree.command(name="seasonleaders", description="Show current season stat leaders.")
+async def seasonleaders(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        passing_rows = fetch_top_passing_leaders()
+        rushing_rows = fetch_top_rushing_leaders()
+        receiving_rows = fetch_top_receiving_leaders()
+        sack_rows = fetch_top_sack_leaders()
+        interception_rows = fetch_top_interception_leaders()
+    except Exception as exc:
+        await interaction.followup.send(f"Failed to load season leaders: {exc}", ephemeral=True)
+        return
+
+    sections = [
+        ("🏈 Passing Yards", format_leader_lines(passing_rows, "total_pass_yds", "Passing Yards")),
+        ("🏃 Rushing Yards", format_leader_lines(rushing_rows, "total_rush_yds", "Rushing Yards")),
+        ("🙌 Receiving Yards", format_leader_lines(receiving_rows, "total_rec_yds", "Receiving Yards")),
+        ("💥 Sacks", format_leader_lines(sack_rows, "total_sacks", "Sacks")),
+        ("🖐️ Interceptions", format_leader_lines(interception_rows, "total_ints", "Interceptions")),
+    ]
+
+    embed = discord.Embed(
+        title="📊 Season Stat Leaders",
+        description="Top 5 current season leaders",
+        color=0x5865F2,
+    )
+    for title, lines in sections:
+        embed.add_field(name=title, value="\n".join(lines), inline=False)
+
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="post_season_leaders", description="Admin: post current season stat leaders.")
 @admin_only()
 @app_commands.describe(channel="Optional channel to post in. Defaults to LEADERS_CHANNEL_ID or current channel.")
@@ -3816,6 +5305,7 @@ async def post_season_leaders(
     try:
         passing_rows = fetch_top_passing_leaders()
         rushing_rows = fetch_top_rushing_leaders()
+        receiving_rows = fetch_top_receiving_leaders()
         sack_rows = fetch_top_sack_leaders()
         interception_rows = fetch_top_interception_leaders()
     except Exception as exc:
@@ -3846,6 +5336,7 @@ async def post_season_leaders(
     sections = [
         ("🏈 Passing Yards", format_leader_lines(passing_rows, "total_pass_yds", "Passing Yards")),
         ("🏃 Rushing Yards", format_leader_lines(rushing_rows, "total_rush_yds", "Rushing Yards")),
+        ("🙌 Receiving Yards", format_leader_lines(receiving_rows, "total_rec_yds", "Receiving Yards")),
         ("💥 Sacks", format_leader_lines(sack_rows, "total_sacks", "Sacks")),
         ("🖐️ Interceptions", format_leader_lines(interception_rows, "total_ints", "Interceptions")),
     ]
@@ -4485,6 +5976,13 @@ def detect_current_sportsbook_stage_and_week() -> tuple[Optional[int], Optional[
     return phases[0]
 
 
+def fetch_upcoming_games_for_current_week():
+    stage_index, display_week = detect_current_sportsbook_stage_and_week()
+    if stage_index is None or display_week is None:
+        return []
+    return fetch_games_for_stage_week(stage_index, display_week)
+
+
 def _team_strength_for_odds(team_row: dict, is_home: bool) -> float:
     wins = float(team_row.get("wins") or 0)
     losses = float(team_row.get("losses") or 0)
@@ -4566,36 +6064,66 @@ def build_sportsbook_embed() -> discord.Embed:
     return embed
 
 
-def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
+def settle_open_bets_for_current_week() -> tuple[int, int, list[dict], int, int]:
     season_index = get_current_season_index()
-    stage_index, display_week = detect_current_sportsbook_stage_and_week()
-    if stage_index is None or display_week is None:
-        return 0, 0, []
-    raw_week = max(display_week - 1, 0)
-    games = fetch_games_for_stage_week(stage_index, display_week)
-    game_map = {int(g["game_id"]): g for g in games if looks_like_completed_game(g)}
-    if not game_map:
-        return 0, 0, []
 
     settled = 0
     paid = 0
+    skipped_unplayed = 0
+    skipped_missing = 0
     details: list[dict] = []
+
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT * FROM bot_sportsbook_bets
-                WHERE season_index = %s AND stage_index = %s AND week = %s AND status = 'open'
-                ORDER BY id ASC
+                SELECT
+                    b.*,
+                    g.away_team_id,
+                    g.home_team_id,
+                    g.away_score,
+                    g.home_score,
+                    g.status AS game_status,
+                    g.stage_index AS game_stage_index,
+                    g.week AS game_week,
+                    away.team_name AS away_team_name,
+                    home.team_name AS home_team_name
+                FROM bot_sportsbook_bets b
+                LEFT JOIN games g
+                    ON g.game_id = b.game_id
+                   AND g.season_index = b.season_index
+                LEFT JOIN teams away ON away.team_id = g.away_team_id
+                LEFT JOIN teams home ON home.team_id = g.home_team_id
+                WHERE b.status = 'open'
+                  AND b.season_index = %s
+                ORDER BY b.id ASC
                 """,
-                (season_index, stage_index, raw_week),
+                (season_index,),
             )
             bets = cur.fetchall()
 
             for bet in bets:
-                game = game_map.get(int(bet["game_id"]))
-                if not game:
+                if bet.get("away_team_id") is None or bet.get("home_team_id") is None:
+                    skipped_missing += 1
                     continue
+
+                game = {
+                    "game_id": bet.get("game_id"),
+                    "away_team_id": bet.get("away_team_id"),
+                    "home_team_id": bet.get("home_team_id"),
+                    "away_score": bet.get("away_score"),
+                    "home_score": bet.get("home_score"),
+                    "status": bet.get("game_status"),
+                    "stage_index": bet.get("game_stage_index"),
+                    "week": bet.get("game_week"),
+                    "away_team_name": bet.get("away_team_name") or "Unknown Away",
+                    "home_team_name": bet.get("home_team_name") or "Unknown Home",
+                }
+
+                if not looks_like_completed_game(game):
+                    skipped_unplayed += 1
+                    continue
+
                 away_score = int(game.get("away_score") or 0)
                 home_score = int(game.get("home_score") or 0)
                 matchup = f"{game['away_team_name']} {away_score}-{home_score} {game['home_team_name']}"
@@ -4617,7 +6145,7 @@ def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
                         """
                         INSERT INTO bot_users (user_id, username)
                         VALUES (%s, %s)
-                        ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
+                        ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
                         """,
                         (int(bet["user_id"]), bet["username"]),
                     )
@@ -4625,8 +6153,7 @@ def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
                         """
                         UPDATE bot_users
                         SET balance = balance + %s,
-                            total_earned = total_earned + %s,
-                            updated_at = NOW()
+                            total_earned = total_earned + %s
                         WHERE user_id = %s
                         """,
                         (payout, payout, int(bet["user_id"])),
@@ -4640,7 +6167,10 @@ def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
                     )
                     paid += 1
 
-                cur.execute("UPDATE bot_sportsbook_bets SET status = %s, settled_at = NOW() WHERE id = %s", (outcome, int(bet["id"])))
+                cur.execute(
+                    "UPDATE bot_sportsbook_bets SET status = %s, settled_at = NOW() WHERE id = %s",
+                    (outcome, int(bet["id"])),
+                )
                 details.append({
                     "username": bet["username"],
                     "team_name": bet["team_name"],
@@ -4652,7 +6182,7 @@ def settle_open_bets_for_current_week() -> tuple[int, int, list[dict]]:
                 })
                 settled += 1
         conn.commit()
-    return settled, paid, details
+    return settled, paid, details, skipped_unplayed, skipped_missing
 
 
 def detect_display_week_for_stage(stage_index: int) -> Optional[int]:
@@ -4756,7 +6286,7 @@ def fetch_rivalry_count_map_for_season(season_index: int):
                 """
                 SELECT away_team_id, home_team_id
                 FROM bot_weekly_rivalries
-                WHERE season_index = %s AND stage_index = 2
+                WHERE season_index = %s AND stage_index = 1
                 """,
                 (int(season_index),),
             )
@@ -4780,7 +6310,7 @@ def is_divisional_matchup(game) -> bool:
 
 def generate_weekly_rivalries(stage_index: int, display_week: int):
     ensure_weekly_rivalries_table()
-    if int(stage_index) != 2:
+    if int(stage_index) != 1:
         return []
 
     existing = fetch_existing_weekly_rivalries(stage_index, display_week)
@@ -4851,7 +6381,7 @@ def generate_weekly_rivalries(stage_index: int, display_week: int):
 
 
 def fetch_weekly_rivalry_games_for_current_week():
-    stage_index = 2
+    stage_index = 1
     display_week = detect_display_week_for_stage(stage_index)
     if display_week is None:
         return []
@@ -4859,9 +6389,9 @@ def fetch_weekly_rivalry_games_for_current_week():
 
 
 def build_weekly_rivalries_embed(display_week: Optional[int] = None, phase: Optional[str] = None) -> discord.Embed:
-    stage_index = parse_phase_to_stage_index(phase) if phase else 2
+    stage_index = parse_phase_to_stage_index(phase) if phase else 1
     if stage_index is None:
-        stage_index = 2
+        stage_index = 1
     if display_week is None:
         display_week = detect_display_week_for_stage(stage_index)
     if display_week is None:
@@ -5051,6 +6581,11 @@ def build_storyline_blurbs() -> list[str]:
     return blurbs[:6]
 
 
+@bot.tree.command(name="powerrankings", description="Show current league power rankings.")
+async def powerrankings_alias(interaction: discord.Interaction):
+    await powerrankings(interaction)
+
+
 @bot.tree.command(name="storylines", description="Show current league storylines.")
 async def storylines(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -5065,6 +6600,167 @@ async def storylines(interaction: discord.Interaction):
     )
 
 
+
+
+
+
+@bot.tree.command(name="gamerecap", description="Generate a recap for one completed game.")
+@app_commands.describe(
+    phase="Phase of the season",
+    week="Human week number",
+    matchup="Pick the matchup in Away @ Home format"
+)
+@app_commands.choices(phase=[
+    app_commands.Choice(name="Regular Season", value="regular"),
+    app_commands.Choice(name="Preseason", value="preseason"),
+    app_commands.Choice(name="Wild Card", value="wild card"),
+    app_commands.Choice(name="Divisional", value="divisional"),
+    app_commands.Choice(name="Conference Championship", value="conference championship"),
+    app_commands.Choice(name="Super Bowl", value="super bowl"),
+])
+@app_commands.autocomplete(matchup=matchup_autocomplete_for_gamerecap)
+async def gamerecap(
+    interaction: discord.Interaction,
+    phase: str,
+    week: int,
+    matchup: str,
+):
+    await interaction.response.defer()
+    try:
+        stage_index = resolve_command_stage(phase)
+    except Exception as exc:
+        await interaction.followup.send(f"Could not resolve phase: {exc}", ephemeral=True)
+        return
+
+    game_row = fetch_game_row_for_recap(stage_index, int(week), safe_int(matchup))
+    if not game_row:
+        await interaction.followup.send("Could not find that matchup for the selected phase and week.", ephemeral=True)
+        return
+    if not looks_like_completed_game(game_row):
+        await interaction.followup.send("That game does not look completed yet.", ephemeral=True)
+        return
+
+    try:
+        stat_package = fetch_game_recap_stat_package(game_row)
+        facts = build_gamerecap_facts(game_row, stat_package)
+        headline, recap_text, used_ai = await generate_gamerecap_text(facts)
+        embed = build_gamerecap_embed(facts, headline, recap_text, used_ai)
+    except Exception as exc:
+        await interaction.followup.send(f"Failed to build game recap: {exc}", ephemeral=True)
+        return
+
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="submittrade", description="Submit a trade for committee review.")
+@app_commands.describe(
+    coach_one="First coach involved in the trade",
+    coach_two="Second coach involved in the trade",
+    team_one="First team in the trade",
+    team_two="Second team in the trade",
+    team_one_gets="What the first team receives",
+    team_two_gets="What the second team receives",
+    notes="Optional notes for the committee"
+)
+async def submittrade(
+    interaction: discord.Interaction,
+    coach_one: discord.Member,
+    coach_two: discord.Member,
+    team_one: str,
+    team_two: str,
+    team_one_gets: str,
+    team_two_gets: str,
+    notes: Optional[str] = None,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not TRADE_REVIEW_CHANNEL_ID:
+        await interaction.followup.send("TRADE_REVIEW_CHANNEL_ID is not configured.", ephemeral=True)
+        return
+    if not TRADE_COMMITTEE_ROLE_ID:
+        await interaction.followup.send("TRADE_COMMITTEE_ROLE_ID is not configured.", ephemeral=True)
+        return
+    if not TRADE_ANNOUNCEMENTS_CHANNEL_ID:
+        await interaction.followup.send("TRADE_ANNOUNCEMENTS_CHANNEL_ID is not configured.", ephemeral=True)
+        return
+    if int(coach_one.id) == int(coach_two.id):
+        await interaction.followup.send("Coach one and coach two must be different users.", ephemeral=True)
+        return
+    if team_one.strip().lower() == team_two.strip().lower():
+        await interaction.followup.send("Team one and team two must be different.", ephemeral=True)
+        return
+
+    trade_row = TOKEN_DB.create_trade(
+        interaction.user,
+        coach_one,
+        coach_two,
+        team_one.strip(),
+        team_two.strip(),
+        team_one_gets.strip(),
+        team_two_gets.strip(),
+        (notes or "").strip(),
+    )
+
+    review_channel = bot.get_channel(TRADE_REVIEW_CHANNEL_ID)
+    if review_channel is None:
+        try:
+            review_channel = await bot.fetch_channel(TRADE_REVIEW_CHANNEL_ID)
+        except Exception as exc:
+            await interaction.followup.send(f"Could not find the trade review channel: {exc}", ephemeral=True)
+            return
+
+    message = await review_channel.send(
+        content=f"<@&{TRADE_COMMITTEE_ROLE_ID}>",
+        embed=build_trade_embed(trade_row),
+        view=TradeReviewView(),
+    )
+    TOKEN_DB.set_trade_review_message(safe_int(trade_row.get("id")), int(review_channel.id), int(message.id))
+    trade_row = TOKEN_DB.get_trade(safe_int(trade_row.get("id"))) or trade_row
+
+    await interaction.followup.send(
+        f"Trade **#{safe_int(trade_row.get('id'))}** submitted to the trade committee in {review_channel.mention}. Final result will post in <#{TRADE_ANNOUNCEMENTS_CHANNEL_ID}>.",
+        ephemeral=True,
+    )
+    await send_log_message(
+        f"📝 TRADE SUBMITTED: {interaction.user.mention} submitted trade #{safe_int(trade_row.get('id'))} — {safe_text(trade_row.get('team_one_name'))} / {safe_text(trade_row.get('team_two_name'))}."
+    )
+
+
+@bot.tree.command(name="forcetrade", description="Admin: force-approve or force-deny a trade.")
+@admin_only()
+@app_commands.describe(
+    trade_id="Trade ID number",
+    decision="approve or deny",
+    reason="Optional reason shown on the trade"
+)
+@app_commands.choices(decision=[
+    app_commands.Choice(name="approve", value="approve"),
+    app_commands.Choice(name="deny", value="deny"),
+])
+async def forcetrade(
+    interaction: discord.Interaction,
+    trade_id: int,
+    decision: app_commands.Choice[str],
+    reason: Optional[str] = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    trade_row = TOKEN_DB.get_trade(int(trade_id))
+    if not trade_row:
+        await interaction.followup.send(f"Trade #{trade_id} was not found.", ephemeral=True)
+        return
+
+    final_status = "approved" if decision.value == "approve" else "denied"
+    reason_text = (reason or f"Force {decision.value}d by admin").strip()
+    trade_row = TOKEN_DB.finalize_trade(int(trade_id), final_status, int(interaction.user.id), reason_text)
+    await refresh_trade_message(trade_row)
+    await post_trade_announcement(trade_row)
+    await interaction.followup.send(
+        f"Trade **#{trade_id}** was force-{decision.value}d.",
+        ephemeral=True,
+    )
+    await send_log_message(
+        f"⚖️ TRADE FORCED: {interaction.user.mention} force-{decision.value}d trade #{trade_id}. Reason: {reason_text}"
+    )
 
 @bot.tree.command(name="sportsbook", description="Show the current sportsbook lines.")
 async def sportsbook(interaction: discord.Interaction):
@@ -5138,14 +6834,22 @@ async def bet(interaction: discord.Interaction, team: str, amount: float):
     await interaction.response.send_message(f"✅ Bet placed: **{fmt_tokens(amount)}** on **{team_name}** at **{multiplier}x**.")
 
 
-@bot.tree.command(name="settlebets", description="Admin: settle sportsbook bets for the current completed slate.")
+@bot.tree.command(name="settlebets", description="Admin: settle all open sportsbook bets whose linked games are completed.")
 @admin_only()
 async def settlebets(interaction: discord.Interaction):
     await interaction.response.defer()
     init_extra_feature_tables()
-    settled, paid, details = settle_open_bets_for_current_week()
+    settled, paid, details, skipped_unplayed, skipped_missing = settle_open_bets_for_current_week()
     if not details:
-        await interaction.followup.send("No open completed bets were available to settle.", ephemeral=True)
+        extra = []
+        if skipped_unplayed:
+            extra.append(f"{skipped_unplayed} bet(s) were skipped because their games have not been completed yet")
+        if skipped_missing:
+            extra.append(f"{skipped_missing} bet(s) were skipped because no linked game row was found")
+        message = "No open completed bets were available to settle."
+        if extra:
+            message += "\n\n" + "\n".join(f"• {item}" for item in extra)
+        await interaction.followup.send(message, ephemeral=True)
         return
 
     lines = []
@@ -5161,8 +6865,605 @@ async def settlebets(interaction: discord.Interaction):
         lines.append(f"...and {len(details) - 20} more settled bets.")
 
     embed = build_embed("✅ Sportsbook Bets Settled", "\n\n".join(lines), 0x57F287)
-    embed.set_footer(text=f"Settled {settled} bets • Paid {paid} winning/push bets")
-    await interaction.response.send_message(embed=embed)
+    footer_parts = [f"Settled {settled} bets", f"Paid {paid} winning/push bets"]
+    if skipped_unplayed:
+        footer_parts.append(f"Skipped {skipped_unplayed} unfinished")
+    if skipped_missing:
+        footer_parts.append(f"Skipped {skipped_missing} missing game")
+    embed.set_footer(text=" • ".join(footer_parts))
+    await interaction.followup.send(embed=embed)
+
+
+# -----------------------------
+# Game recap v2 engine
+# -----------------------------
+GAMERECAP_V2_STORYLINES = {
+    "statement_win": {"label": "statement win", "weight": 8},
+    "survive_and_advance": {"label": "survive and advance", "weight": 7},
+    "road_statement": {"label": "road statement", "weight": 9},
+    "home_field_held": {"label": "home field held", "weight": 6},
+    "one_score_drama": {"label": "one-score drama", "weight": 8},
+    "late_pullaway": {"label": "late pullaway", "weight": 7},
+    "blowout_control": {"label": "blowout control", "weight": 8},
+    "playoff_pressure": {"label": "playoff pressure", "weight": 6},
+    "division_race": {"label": "division race", "weight": 8},
+    "rivalry_heat": {"label": "rivalry heat", "weight": 7},
+    "quarterback_led": {"label": "quarterback-led offense", "weight": 7},
+    "ground_control": {"label": "ground control", "weight": 7},
+    "receiver_takeover": {"label": "receiver takeover", "weight": 6},
+    "defensive_swing": {"label": "defensive swing", "weight": 8},
+    "turnover_story": {"label": "turnover story", "weight": 7},
+    "balanced_attack": {"label": "balanced attack", "weight": 6},
+    "contender_behavior": {"label": "contender behavior", "weight": 7},
+    "loser_pressure": {"label": "loser pressure", "weight": 6},
+    "clean_finish": {"label": "clean finish", "weight": 5},
+    "explosive_offense": {"label": "explosive offense", "weight": 7},
+    "defense_traveled": {"label": "defense traveled", "weight": 6},
+    "season_saver": {"label": "season saver", "weight": 7},
+    "message_to_league": {"label": "message to the league", "weight": 7},
+    "winner_momentum": {"label": "winner momentum", "weight": 6},
+    "pressure_rising": {"label": "pressure rising", "weight": 6},
+}
+
+GAMERECAP_V2_ANGLES = {
+    "winner_focused": 10,
+    "turning_point_first": 8,
+    "broadcast_hype": 8,
+    "newspaper_clean": 7,
+    "rivalry_frame": 7,
+    "standings_frame": 7,
+    "star_spotlight": 8,
+    "defense_first": 6,
+    "offense_first": 6,
+    "survival_mode": 6,
+    "dominance_mode": 6,
+    "pressure_mode": 6,
+}
+
+GAMERECAP_V2_HEADLINE_PATTERNS = [
+    "{winner} send a message against {loser}",
+    "{winner} hold off {loser} in Week {week}",
+    "{winner} outlast {loser} in a key Week {week} clash",
+    "{winner} defend home turf against {loser}",
+    "{winner} leave no doubt against {loser}",
+    "{winner} survive late pressure to beat {loser}",
+    "{winner} seize momentum with a win over {loser}",
+    "{winner} take control late against {loser}",
+    "{winner} make a road statement at {loser}",
+    "{winner} answer the moment against {loser}",
+    "{winner} edge {loser} in a tense Week {week} battle",
+    "{winner} push past {loser} in a game that mattered",
+    "{winner} keep rolling with a win over {loser}",
+    "{winner} close strong to beat {loser}",
+    "{winner} rise above {loser} in Week {week}",
+    "{winner} put the league on notice against {loser}",
+    "{winner} stand tall against {loser}",
+    "{winner} outfinish {loser} in Week {week}",
+    "{winner} turn back {loser} in a tough test",
+    "{winner} take the latest chapter from {loser}",
+]
+
+GAMERECAP_V2_OPENERS = {
+    "statement_win": [
+        "{winner} delivered one of their clearest statements of the season in {phase} Week {week}.",
+        "Week {week} brought another reminder that {winner} can look dangerous when the game tightens up.",
+        "{winner} did more than win this one — they made the result feel like it meant something."
+    ],
+    "one_score_drama": [
+        "This one stayed alive deep into the finish before {winner} finally shut the door.",
+        "For most of the night, there was very little separating these teams on the scoreboard.",
+        "The margin stayed thin, and that made every late possession matter."
+    ],
+    "road_statement": [
+        "Walking into someone else’s building and leaving with control is never easy, but {winner} managed it.",
+        "Road wins have a way of carrying extra weight, and {winner} earned one here.",
+        "{winner} went on the road and handled the biggest moments better than {loser}."
+    ],
+    "blowout_control": [
+        "Once {winner} found control of this game, they never really gave it back.",
+        "From the more important moments onward, {winner} looked like the stronger side.",
+        "This turned into a long night for {loser} as {winner} kept stacking answers."
+    ],
+    "default": [
+        "{winner} came out of {phase} Week {week} with a result that should play well around the league.",
+        "In {phase} Week {week}, {winner} found a way to beat {loser} and keep their momentum moving.",
+        "{winner} took care of business in {phase} Week {week} against {loser}."
+    ],
+}
+
+GAMERECAP_V2_CLOSERS = {
+    "winner_momentum": [
+        "That kind of finish should only add to the belief building around {winner} right now.",
+        "For {winner}, it is another result that adds weight to their recent stretch.",
+        "The win keeps {winner} moving in the right direction heading toward next week."
+    ],
+    "pressure_rising": [
+        "For {loser}, the result leaves more questions than comfort heading into the next game.",
+        "That loss does not end anything for {loser}, but it does add pressure fast.",
+        "{loser} leave this one knowing the margin for error is not getting any wider."
+    ],
+    "division_race": [
+        "If the standings stay tight, this is the kind of result that can matter later.",
+        "Division races usually turn on games like this, and this one could carry weight for a while.",
+        "The standings impact may eventually feel as important as the final score itself."
+    ],
+    "default": [
+        "In a league that tends to remember the sharpest weekly results, this was one worth noticing.",
+        "The score goes in the books, but the tone of the result may matter just as much.",
+        "It was not just a win — it was the kind of game that tells you something about both sides."
+    ],
+}
+
+
+def ensure_gamerecap_memory_table():
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_gamerecap_memory (
+                    id BIGSERIAL PRIMARY KEY,
+                    game_id BIGINT,
+                    stage_index INTEGER,
+                    display_week INTEGER,
+                    matchup TEXT NOT NULL,
+                    winner_team TEXT,
+                    loser_team TEXT,
+                    headline TEXT,
+                    primary_storyline TEXT,
+                    secondary_storyline TEXT,
+                    angle_family TEXT,
+                    opener_family TEXT,
+                    closer_family TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+        conn.commit()
+
+
+def recent_gamerecap_memory(limit: int = 30) -> list[dict]:
+    ensure_gamerecap_memory_table()
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT matchup, winner_team, loser_team, headline, primary_storyline, secondary_storyline,
+                       angle_family, opener_family, closer_family, created_at
+                FROM bot_gamerecap_memory
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (int(limit),),
+            )
+            return [record_to_dict(r) for r in cur.fetchall()]
+
+
+def record_gamerecap_memory(facts: dict, plan: dict, headline: str):
+    ensure_gamerecap_memory_table()
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bot_gamerecap_memory (
+                    game_id, stage_index, display_week, matchup, winner_team, loser_team, headline,
+                    primary_storyline, secondary_storyline, angle_family, opener_family, closer_family
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    safe_int(facts['game_row'].get('game_id')),
+                    safe_int(facts['game_row'].get('stage_index')),
+                    safe_int(facts['week']),
+                    facts['matchup'],
+                    facts['winner'],
+                    facts['loser'],
+                    headline,
+                    plan.get('primary_storyline', ''),
+                    plan.get('secondary_storyline', ''),
+                    plan.get('angle', ''),
+                    plan.get('opener_family', ''),
+                    plan.get('closer_family', ''),
+                ),
+            )
+        conn.commit()
+
+
+def _recap_penalty(memory: list[dict], key: str, value: str) -> int:
+    penalty = 0
+    for idx, row in enumerate(memory):
+        if safe_text(row.get(key)) == value:
+            penalty += max(1, 8 - idx)
+    return penalty
+
+
+def format_record_tuple(wins: int, losses: int, ties: int) -> str:
+    return f"{wins}-{losses}-{ties}" if ties else f"{wins}-{losses}"
+
+
+def expected_games_for_recap(stage_index: int, display_week: int) -> Optional[int]:
+    if stage_index in {0, 1}:
+        return max(0, safe_int(display_week))
+    return None
+
+
+def compute_team_record_through_game(team_id: int, season_index: int, stage_index: int, raw_week: int, game_id: int) -> dict:
+    wins = losses = ties = 0
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT game_id, week, away_team_id, home_team_id, away_score, home_score, status
+                FROM games
+                WHERE season_index = %s
+                  AND stage_index = %s
+                  AND (away_team_id = %s OR home_team_id = %s)
+                  AND (
+                        week < %s OR
+                        (week = %s AND game_id <= %s)
+                  )
+                ORDER BY week ASC, game_id ASC
+                """,
+                (int(season_index), int(stage_index), int(team_id), int(team_id), int(raw_week), int(raw_week), int(game_id)),
+            )
+            rows = [record_to_dict(r) for r in cur.fetchall()]
+    for row in rows:
+        if not looks_like_completed_game(row):
+            continue
+        away_id = safe_int(row.get('away_team_id'))
+        home_id = safe_int(row.get('home_team_id'))
+        away_score = safe_int(row.get('away_score'))
+        home_score = safe_int(row.get('home_score'))
+        if away_score == home_score:
+            ties += 1
+        else:
+            team_won = (away_id == team_id and away_score > home_score) or (home_id == team_id and home_score > away_score)
+            if team_won:
+                wins += 1
+            else:
+                losses += 1
+    return {
+        'wins': wins,
+        'losses': losses,
+        'ties': ties,
+        'games_played': wins + losses + ties,
+        'record': format_record_tuple(wins, losses, ties),
+    }
+
+
+def resolve_recap_record(game_row: dict, team_side: str) -> Optional[str]:
+    display_week = safe_int(game_row.get('display_week'))
+    stage_index = safe_int(game_row.get('stage_index'))
+    expected_games = expected_games_for_recap(stage_index, display_week)
+    fallback_record = format_record_tuple(
+        safe_int(game_row.get(f'{team_side}_wins')),
+        safe_int(game_row.get(f'{team_side}_losses')),
+        safe_int(game_row.get(f'{team_side}_ties')),
+    )
+    team_id = safe_int(game_row.get('away_team_id' if team_side == 'away' else 'home_team_id'))
+    computed = compute_team_record_through_game(
+        team_id,
+        safe_int(game_row.get('season_index')),
+        stage_index,
+        safe_int(game_row.get('week')),
+        safe_int(game_row.get('game_id')),
+    )
+    if expected_games is None:
+        return computed['record']
+    if safe_int(computed.get('games_played')) == expected_games:
+        return computed['record']
+    fallback_total = (
+        safe_int(game_row.get(f'{team_side}_wins'))
+        + safe_int(game_row.get(f'{team_side}_losses'))
+        + safe_int(game_row.get(f'{team_side}_ties'))
+    )
+    if fallback_total == expected_games:
+        return fallback_record
+    return None
+
+
+def build_gamerecap_facts(game_row: dict, stats: dict) -> dict:
+    away_score = safe_int(game_row.get('away_score'))
+    home_score = safe_int(game_row.get('home_score'))
+    away_team = safe_text(game_row.get('away_team_name'))
+    home_team = safe_text(game_row.get('home_team_name'))
+    away_record = resolve_recap_record(game_row, 'away')
+    home_record = resolve_recap_record(game_row, 'home')
+    home_won = home_score > away_score
+    winner = home_team if home_won else away_team
+    loser = away_team if home_won else home_team
+    winner_score = max(home_score, away_score)
+    loser_score = min(home_score, away_score)
+    winner_record = home_record if home_won else away_record
+    loser_record = away_record if home_won else home_record
+    margin = abs(home_score - away_score)
+    passing = pick_statline_leader(stats['home_passing'] if home_won else stats['away_passing'])
+    rushing = pick_statline_leader(stats['home_rushing'] if home_won else stats['away_rushing'])
+    receiving = pick_statline_leader(stats['home_receiving'] if home_won else stats['away_receiving'])
+    defense = pick_statline_leader(stats['home_defense'] if home_won else stats['away_defense'])
+    away_wins_now = safe_int(game_row.get('away_wins'))
+    home_wins_now = safe_int(game_row.get('home_wins'))
+    team_total_wins_gap = abs(away_wins_now - home_wins_now)
+    is_divisional = False
+    away_name_bits = away_team.split()
+    home_name_bits = home_team.split()
+    if len(away_name_bits) > 1 and len(home_name_bits) > 1:
+        is_divisional = away_name_bits[-1] != home_name_bits[-1] and away_wins_now >= 0 and home_wins_now >= 0
+    themes = []
+    if margin <= 8:
+        themes.append('one-score drama')
+    if margin >= 17:
+        themes.append('statement win')
+    if not home_won:
+        themes.append('road statement')
+    if safe_int(defense.get('ints')) > 0 or safe_int(defense.get('sacks')) >= 2:
+        themes.append('defensive swing')
+    if safe_int(passing.get('tds')) >= 3 or safe_int(passing.get('yards')) >= 275:
+        themes.append('quarterback-led offense')
+    if safe_int(rushing.get('yards')) >= 100:
+        themes.append('ground control')
+    if safe_int(receiving.get('yards')) >= 100:
+        themes.append('receiver takeover')
+    if safe_int(passing.get('yards')) >= 220 and safe_int(rushing.get('yards')) >= 75:
+        themes.append('balanced attack')
+    if team_total_wins_gap <= 1:
+        themes.append('even records')
+    return {
+        'phase': stage_display_name(safe_int(game_row.get('stage_index'))),
+        'week': safe_int(game_row.get('display_week')),
+        'matchup': f"{away_team} @ {home_team}",
+        'away_team': away_team,
+        'home_team': home_team,
+        'winner': winner,
+        'loser': loser,
+        'winning_score': winner_score,
+        'losing_score': loser_score,
+        'winner_record': winner_record,
+        'loser_record': loser_record,
+        'has_valid_records': bool(winner_record and loser_record),
+        'margin': margin,
+        'is_one_score_game': margin <= 8,
+        'is_blowout': margin >= 17,
+        'home_team_won': home_won,
+        'road_team_won': not home_won,
+        'is_divisional': is_divisional,
+        'turning_point': f"{winner} created separation late and finished the game with cleaner execution in the biggest moments.",
+        'top_passer': passing,
+        'top_rusher': rushing,
+        'top_receiver': receiving,
+        'top_defender': defense,
+        'themes': themes,
+        'game_row': game_row,
+    }
+
+
+def select_gamerecap_plan(facts: dict) -> dict:
+    memory = recent_gamerecap_memory(25)
+    candidates = {}
+    def add(tag: str, points: int):
+        candidates[tag] = candidates.get(tag, 0) + points + GAMERECAP_V2_STORYLINES.get(tag, {}).get('weight', 0)
+
+    if facts['is_one_score_game']:
+        add('one_score_drama', 10)
+        add('survive_and_advance', 8)
+    else:
+        add('clean_finish', 4)
+    if facts['is_blowout']:
+        add('blowout_control', 12)
+        add('statement_win', 10)
+    else:
+        add('late_pullaway', 4)
+    if facts['road_team_won']:
+        add('road_statement', 10)
+    else:
+        add('home_field_held', 7)
+    if facts['is_divisional']:
+        add('division_race', 8)
+        add('rivalry_heat', 6)
+    if safe_int(facts['top_passer'].get('tds')) >= 3 or safe_int(facts['top_passer'].get('yards')) >= 275:
+        add('quarterback_led', 8)
+        add('explosive_offense', 5)
+    if safe_int(facts['top_rusher'].get('yards')) >= 100:
+        add('ground_control', 8)
+    if safe_int(facts['top_receiver'].get('yards')) >= 110:
+        add('receiver_takeover', 7)
+    if safe_int(facts['top_defender'].get('ints')) >= 1 or safe_int(facts['top_defender'].get('sacks')) >= 2:
+        add('defensive_swing', 8)
+        add('turnover_story', 4)
+    if safe_int(facts['top_passer'].get('yards')) >= 220 and safe_int(facts['top_rusher'].get('yards')) >= 75:
+        add('balanced_attack', 6)
+    if facts['margin'] >= 10:
+        add('message_to_league', 5)
+        add('contender_behavior', 5)
+    if safe_text(facts['winner_record']).startswith('0-'):
+        add('season_saver', 4)
+    add('winner_momentum', 6)
+    add('loser_pressure', 5)
+    add('pressure_rising', 4)
+
+    scored = []
+    for tag, score in candidates.items():
+        penalty = _recap_penalty(memory, 'primary_storyline', tag) + _recap_penalty(memory, 'secondary_storyline', tag)
+        scored.append((score - penalty, tag))
+    scored.sort(reverse=True)
+    primary = scored[0][1] if scored else 'winner_momentum'
+    secondary = next((tag for _, tag in scored if tag != primary), 'clean_finish')
+
+    angle_scores = {k: v for k, v in GAMERECAP_V2_ANGLES.items()}
+    if primary in {'statement_win', 'message_to_league', 'road_statement'}:
+        angle_scores['broadcast_hype'] += 4
+        angle_scores['winner_focused'] += 3
+    if primary in {'one_score_drama', 'survive_and_advance'}:
+        angle_scores['turning_point_first'] += 4
+        angle_scores['survival_mode'] += 3
+    if primary in {'defensive_swing', 'turnover_story'}:
+        angle_scores['defense_first'] += 4
+    if primary in {'quarterback_led', 'explosive_offense', 'receiver_takeover'}:
+        angle_scores['star_spotlight'] += 4
+        angle_scores['offense_first'] += 3
+    if facts['is_divisional']:
+        angle_scores['rivalry_frame'] += 3
+        angle_scores['standings_frame'] += 2
+
+    angle_ranked = sorted(
+        ((score - _recap_penalty(memory, 'angle_family', angle), angle) for angle, score in angle_scores.items()),
+        reverse=True,
+    )
+    angle = angle_ranked[0][1] if angle_ranked else 'winner_focused'
+
+    opener_family = primary if primary in GAMERECAP_V2_OPENERS else 'default'
+    if _recap_penalty(memory, 'opener_family', opener_family) > 10:
+        opener_family = 'default'
+    closer_family = 'division_race' if primary in {'division_race', 'rivalry_heat'} else ('pressure_rising' if secondary in {'loser_pressure', 'pressure_rising'} else 'winner_momentum')
+    if closer_family not in GAMERECAP_V2_CLOSERS:
+        closer_family = 'default'
+
+    return {
+        'primary_storyline': primary,
+        'secondary_storyline': secondary,
+        'angle': angle,
+        'opener_family': opener_family,
+        'closer_family': closer_family,
+        'recent_memory': memory,
+    }
+
+
+def build_gamerecap_headline(facts: dict, plan: Optional[dict] = None) -> str:
+    plan = plan or select_gamerecap_plan(facts)
+    memory = plan.get('recent_memory', [])
+    candidates = []
+    for pattern in GAMERECAP_V2_HEADLINE_PATTERNS:
+        if '{loser}' in pattern and facts['road_team_won'] and 'at {loser}' in pattern:
+            rendered = pattern.format(**facts)
+        else:
+            rendered = pattern.format(**facts)
+        penalty = sum(1 for row in memory[:8] if safe_text(row.get('headline')) == rendered)
+        candidates.append((10 - penalty, rendered))
+    if plan['primary_storyline'] == 'one_score_drama':
+        candidates.append((12, f"{facts['winner']} hold off {facts['loser']} in a tense Week {facts['week']} finish"))
+    if plan['primary_storyline'] == 'blowout_control':
+        candidates.append((12, f"{facts['winner']} overwhelm {facts['loser']} in Week {facts['week']}"))
+    if plan['primary_storyline'] == 'road_statement':
+        candidates.append((13, f"{facts['winner']} make a road statement at {facts['loser']}"))
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def template_gamerecap_text_v2(facts: dict, plan: dict) -> str:
+    opener_pool = GAMERECAP_V2_OPENERS.get(plan['opener_family'], GAMERECAP_V2_OPENERS['default'])
+    opener = deterministic_choice(opener_pool, f"{facts['matchup']}-{plan['opener_family']}-{facts['margin']}")
+    snippets = [
+        _format_player_snippet(facts['top_passer'], 'passer'),
+        _format_player_snippet(facts['top_rusher'], 'rusher'),
+        _format_player_snippet(facts['top_receiver'], 'receiver'),
+        _format_player_snippet(facts['top_defender'], 'defender'),
+    ]
+    snippets = [s for s in snippets if s]
+    if plan['angle'] == 'turning_point_first':
+        middle_start = facts['turning_point']
+    elif plan['angle'] in {'defense_first'} and snippets:
+        middle_start = snippets[-1]
+        snippets = snippets[:-1]
+    elif plan['angle'] in {'star_spotlight', 'offense_first'} and snippets:
+        middle_start = snippets[0]
+        snippets = snippets[1:]
+    else:
+        middle_start = f"The final margin was {facts['margin']}, but the game felt defined by how {facts['winner']} handled the key moments."
+    body_bits = [middle_start.rstrip('.') + '.']
+    if snippets:
+        body_bits.append(' '.join(s.rstrip('.') + '.' for s in snippets[:2]))
+    if facts.get('has_valid_records') and facts.get('winner_record') and facts.get('loser_record'):
+        body_bits.append(f"The result leaves {facts['winner']} at {facts['winner_record']} while {facts['loser']} drop this one at {facts['loser_record']}.")
+    closer_pool = GAMERECAP_V2_CLOSERS.get(plan['closer_family'], GAMERECAP_V2_CLOSERS['default'])
+    closer = deterministic_choice(closer_pool, f"{facts['matchup']}-{plan['closer_family']}-{facts['week']}")
+    return ' '.join([opener] + body_bits + [closer])
+
+
+def build_gamerecap_prompt(facts: dict, plan: Optional[dict] = None) -> str:
+    plan = plan or select_gamerecap_plan(facts)
+    memory = [
+        {
+            'headline': row.get('headline'),
+            'primary_storyline': row.get('primary_storyline'),
+            'secondary_storyline': row.get('secondary_storyline'),
+            'angle_family': row.get('angle_family'),
+        }
+        for row in plan.get('recent_memory', [])[:8]
+    ]
+    payload = {k: v for k, v in facts.items() if k != 'game_row'}
+    payload['selected_plan'] = {
+        'primary_storyline': plan['primary_storyline'],
+        'secondary_storyline': plan['secondary_storyline'],
+        'angle': plan['angle'],
+        'opener_family': plan['opener_family'],
+        'closer_family': plan['closer_family'],
+    }
+    payload['recent_memory'] = memory
+    return (
+        "You are writing an original football recap for a Madden franchise Discord league.\n"
+        "Write one strong original headline on the first line, then one recap paragraph of 150 to 240 words.\n"
+        "Write with modern sports-media energy, but do not imitate any specific outlet.\n"
+        "Use the selected plan to choose the strongest narrative frame. Vary the writing and avoid repeating recent headline structures or storyline angles.\n"
+        f"Facts and recap plan JSON:\n{json.dumps(payload, indent=2, default=str)}"
+    )
+
+
+async def generate_gamerecap_text(facts: dict) -> tuple[str, str, bool]:
+    plan = select_gamerecap_plan(facts)
+    fallback_headline = build_gamerecap_headline(facts, plan)
+    fallback_body = template_gamerecap_text_v2(facts, plan)
+    used_ai = False
+    headline = fallback_headline
+    body = fallback_body
+    if OPENAI_API_KEY:
+        try:
+            ai_text = await asyncio.to_thread(call_openai_text, build_gamerecap_prompt(facts, plan), 420)
+            cleaned = _clean_generated_text(ai_text)
+            if cleaned:
+                lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+                if len(lines) >= 2:
+                    headline = lines[0]
+                    body = ' '.join(lines[1:])
+                    used_ai = True
+                elif len(lines) == 1:
+                    body = lines[0]
+                    used_ai = True
+        except Exception as exc:
+            print(f"OpenAI gamerecap v2 failed, using template fallback | game={facts['matchup']} error={exc}")
+    try:
+        record_gamerecap_memory(facts, plan, headline)
+    except Exception as exc:
+        print(f"Failed to record gamerecap memory | game={facts['matchup']} error={exc}")
+    return headline, body, used_ai
+
+
+def build_gamerecap_embed(facts: dict, headline: str, recap_text: str, used_ai: bool) -> discord.Embed:
+    game_row = facts['game_row']
+    embed = discord.Embed(
+        title=f"📝 {headline}",
+        description=recap_text,
+        color=0x3498DB,
+    )
+    embed.add_field(
+        name='Final Score',
+        value=f"{safe_text(game_row.get('away_team_name'))} {safe_int(game_row.get('away_score'))} — {safe_text(game_row.get('home_team_name'))} {safe_int(game_row.get('home_score'))}",
+        inline=False,
+    )
+    embed.add_field(
+        name='Game Notes',
+        value=f"Winner: **{facts['winner']}**\nMargin: **{facts['margin']}**\nTheme: **{GAMERECAP_V2_STORYLINES.get(select_gamerecap_plan(facts)['primary_storyline'], {}).get('label', 'game recap').title()}**",
+        inline=False,
+    )
+    for label, row, role in [
+        ('Top Passer', facts['top_passer'], 'passer'),
+        ('Top Rusher', facts['top_rusher'], 'rusher'),
+        ('Top Receiver', facts['top_receiver'], 'receiver'),
+        ('Top Defender', facts['top_defender'], 'defender'),
+    ]:
+        snippet = _format_player_snippet(row, role)
+        if snippet:
+            embed.add_field(name=label, value=snippet, inline=False)
+    embed.set_footer(text=f"{facts['phase']} Week {facts['week']} • {'AI recap v2' if used_ai else 'Template recap v2'}")
+    return embed
 
 
 if not BOT_TOKEN:
