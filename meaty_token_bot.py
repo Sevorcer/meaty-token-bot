@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from typing import Optional
 from urllib import error as urllib_error
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 import discord
@@ -51,6 +52,7 @@ DEFAULT_XP_MIN_MESSAGE_LEN = _env_int("XP_MIN_MESSAGE_LEN", 8)
 DEFAULT_XP_BLACKLIST_CHANNEL_IDS_TEXT = os.getenv("XP_BLACKLIST_CHANNEL_IDS", "")
 DEFAULT_ADMIN_ROLE_NAMES_TEXT = os.getenv("ADMIN_ROLE_NAMES", "Commissioner,Admin,COMMISH")
 DEFAULT_API_KEY = os.getenv("API_KEY", "")
+NEXUS_EXPORTER_URL = (os.getenv("NEXUS_EXPORTER_URL", "") or "").strip()
 
 STAGE_LABELS = {
     0: "Preseason",
@@ -262,6 +264,7 @@ class TokenDatabase:
                     CREATE TABLE IF NOT EXISTS guild_config (
                         guild_id                       BIGINT PRIMARY KEY,
                         api_key                        TEXT DEFAULT '',
+                        league_id                      BIGINT DEFAULT 0,
                         log_channel_id                 BIGINT DEFAULT 0,
                         leaders_channel_id             BIGINT DEFAULT 0,
                         news_channel_id                BIGINT DEFAULT 0,
@@ -280,6 +283,7 @@ class TokenDatabase:
                         updated_at                     TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
+                cur.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS league_id BIGINT DEFAULT 0")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS bot_trade_votes (
                         id BIGSERIAL PRIMARY KEY,
@@ -828,6 +832,7 @@ class GuildConfig:
     _cache: dict[int, dict] = {}
     _defaults = {
         "api_key": DEFAULT_API_KEY,
+        "league_id": 0,
         "log_channel_id": DEFAULT_LOG_CHANNEL_ID,
         "leaders_channel_id": DEFAULT_LEADERS_CHANNEL_ID,
         "news_channel_id": DEFAULT_NEWS_CHANNEL_ID,
@@ -873,6 +878,7 @@ class GuildConfig:
             raise ValueError("guild_id is required")
         allowed = [
             "api_key",
+            "league_id",
             "log_channel_id",
             "leaders_channel_id",
             "news_channel_id",
@@ -940,6 +946,116 @@ def _parse_role_names(raw: str | None) -> set[str]:
 
 def guild_id_from_interaction(interaction: discord.Interaction) -> int:
     return int(interaction.guild_id or (interaction.guild.id if interaction.guild else 0) or 0)
+
+
+def mask_sensitive_value(value: str | None) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return "Not configured"
+    if len(raw) <= 4:
+        return "••••"
+    return f"••••{raw[-4:]}"
+
+
+def format_channel_value(channel_id: int | None) -> str:
+    cid = safe_int(channel_id)
+    return f"<#{cid}>" if cid else "Not configured"
+
+
+def format_role_value(role_id: int | None) -> str:
+    rid = safe_int(role_id)
+    return f"<@&{rid}>" if rid else "Not configured"
+
+
+def _extract_exporter_rows(payload: dict | list | None, preferred_keys: list[str]) -> list[dict]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in preferred_keys + ["data", "items", "results"]:
+        maybe = payload.get(key)
+        if isinstance(maybe, list):
+            return [item for item in maybe if isinstance(item, dict)]
+    return []
+
+
+def _is_completed_exporter_game(row: dict) -> bool:
+    status = safe_text(row.get("status") or row.get("game_status"), "").strip().lower()
+    if status in {"final", "completed", "complete"}:
+        return True
+    try:
+        if int(status) in COMPLETE_GAME_STATUS_VALUES:
+            return True
+    except Exception:
+        pass
+    away_score = safe_int(row.get("away_score") or row.get("awayScore"))
+    home_score = safe_int(row.get("home_score") or row.get("homeScore"))
+    return away_score > 0 or home_score > 0
+
+
+def exporter_prereq_error(guild_id: int) -> Optional[str]:
+    cfg = GuildConfig.get(guild_id)
+    if not NEXUS_EXPORTER_URL:
+        return "Nexus Exporter URL is not configured by the bot host."
+    if not str(cfg.get("api_key") or "").strip():
+        return "No exporter API key configured. Use `/setup apikey` first."
+    if safe_int(cfg.get("league_id")) <= 0:
+        return "No league ID configured. Use `/setup league_id` first."
+    return None
+
+
+async def fetch_from_exporter(guild_id: int, endpoint: str, params: dict = None) -> dict | list | None:
+    cfg = GuildConfig.get(guild_id)
+    api_key = str(cfg.get("api_key") or "").strip()
+    league_id = safe_int(cfg.get("league_id"))
+    base_url = NEXUS_EXPORTER_URL.strip().rstrip("/")
+    endpoint_text = (endpoint or "").strip()
+    if not api_key or not base_url or league_id <= 0 or not endpoint_text:
+        return None
+
+    if "{league_id}" in endpoint_text:
+        resolved_endpoint = endpoint_text.format(league_id=league_id)
+    else:
+        cleaned_endpoint = endpoint_text.lstrip("/")
+        if cleaned_endpoint.startswith("api/"):
+            resolved_endpoint = f"/{cleaned_endpoint}"
+        else:
+            resolved_endpoint = f"/api/{league_id}/{cleaned_endpoint}"
+
+    query_params = {k: v for k, v in (params or {}).items() if v is not None}
+    query = urllib_parse.urlencode(query_params, doseq=True)
+    target_url = f"{base_url}{resolved_endpoint}"
+    if query:
+        target_url = f"{target_url}?{query}"
+
+    def _request() -> dict | list | None:
+        req = urllib_request.Request(
+            target_url,
+            headers={
+                "Accept": "application/json",
+                "X-API-Key": api_key,
+            },
+            method="GET",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=15) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib_error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            print(f"Exporter HTTP {exc.code} for guild {guild_id} endpoint {resolved_endpoint}: {details[:300]}")
+        except Exception as exc:
+            print(f"Exporter request failed for guild {guild_id} endpoint {resolved_endpoint}: {exc}")
+        return None
+
+    return await asyncio.to_thread(_request)
+
+
+async def fetch_from_exporter_any(guild_id: int, endpoints: list[str], params: dict = None) -> dict | list | None:
+    for endpoint in endpoints:
+        payload = await fetch_from_exporter(guild_id, endpoint, params=params)
+        if payload is not None:
+            return payload
+    return None
 
 
 # -----------------------------
@@ -2528,58 +2644,33 @@ async def ping(interaction: discord.Interaction):
 
 @bot.tree.command(name="standings", description="Show current league standings.")
 async def standings(interaction: discord.Interaction):
+    guild_id = guild_id_from_interaction(interaction)
+    prereq_error = exporter_prereq_error(guild_id)
+    if prereq_error:
+        await interaction.response.send_message(prereq_error, ephemeral=True)
+        return
+
     await interaction.response.defer()
-    try:
-        rows = fetch_standings_rows()
-    except Exception as exc:
-        await interaction.followup.send(f"Failed to load standings: {exc}", ephemeral=True)
-        return
-
+    payload = await fetch_from_exporter_any(guild_id, ["standings", "standing"])
+    rows = _extract_exporter_rows(payload, ["standings", "table"])
     if not rows:
-        await interaction.followup.send("No standings data found.")
+        await interaction.followup.send("No standings data yet. The exporter data may not be synced.", ephemeral=True)
         return
 
-    lines = []
-    for idx, row in enumerate(rows, start=1):
-        team_name = row["team_name"]
-        wins = row["wins"]
-        losses = row["losses"]
-        ties = row["ties"]
-        win_pct = row["win_pct"] or 0
-        seed = row["seed"] or 0
-        team_ovr = row["team_ovr"] or 0
-        pts_for = row["pts_for"] or 0
-        pts_against = row["pts_against"] or 0
-        turnover_diff = row["turnover_diff"] or 0
-
-        lines.append(
-            f"**{idx}. {team_name}** ({wins}-{losses}-{ties}) | "
-            f"Win%: {win_pct:.3f} | Seed: {seed} | Ovr: {team_ovr} | "
-            f"PF: {pts_for} | PA: {pts_against} | TO: {turnover_diff}"
+    embed = discord.Embed(title="🏈 League Standings", color=0x5865F2)
+    for idx, row in enumerate(rows[:20], start=1):
+        team_name = safe_text(row.get("team_name") or row.get("team") or row.get("name"), "Unknown Team")
+        wins = safe_int(row.get("wins"))
+        losses = safe_int(row.get("losses"))
+        ties = safe_int(row.get("ties"))
+        division = safe_text(row.get("division_name") or row.get("division"), "N/A")
+        seed = safe_int(row.get("seed") or row.get("playoff_seed"))
+        embed.add_field(
+            name=f"{idx}. {team_name}",
+            value=f"Record: {wins}-{losses}-{ties} | Division: {division} | Seed: {seed or 'N/A'}",
+            inline=False,
         )
-
-    chunks = []
-    current = []
-    current_len = 0
-    for line in lines:
-        line_len = len(line) + 1
-        if current_len + line_len > 3800:
-            chunks.append("\n".join(current))
-            current = [line]
-            current_len = line_len
-        else:
-            current.append(line)
-            current_len += line_len
-    if current:
-        chunks.append("\n".join(current))
-
-    await interaction.followup.send(
-        embed=build_embed("🏈 League Standings", chunks[0], 0x5865F2)
-    )
-    for page_num, chunk in enumerate(chunks[1:], start=2):
-        await interaction.followup.send(
-            embed=build_embed(f"🏈 League Standings (Page {page_num})", chunk, 0x5865F2)
-        )
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="player", description="Look up a player card with dev trait and ratings.")
@@ -2647,25 +2738,61 @@ class RosterPaginationView(discord.ui.View):
         await interaction.response.edit_message(embed=build_roster_embed(self.title_team, self.roster_rows, self.page), view=self)
 
 
-@bot.tree.command(name="roster", description="Show a team roster with 12 players per page.")
-@app_commands.describe(team_name="Team name or mascot", page="Roster page number")
-async def roster(interaction: discord.Interaction, team_name: str, page: Optional[int] = 1):
-    team_row = resolve_team_row(team_name)
-    if not team_row:
-        await interaction.response.send_message(f"Could not find a team matching **{team_name}**.", ephemeral=True)
+@bot.tree.command(name="roster", description="Show live roster data from Nexus Exporter.")
+@app_commands.describe(team="Optional team name")
+async def roster(interaction: discord.Interaction, team: Optional[str] = None):
+    guild_id = guild_id_from_interaction(interaction)
+    prereq_error = exporter_prereq_error(guild_id)
+    if prereq_error:
+        await interaction.response.send_message(prereq_error, ephemeral=True)
         return
 
-    roster_rows = fetch_team_roster_rows(safe_int(team_row.get("team_id")))
-    if not roster_rows:
-        await interaction.response.send_message(f"No roster rows found for **{safe_text(team_row.get('team_name'))}**.", ephemeral=True)
+    await interaction.response.defer()
+    params = {"team": team} if team else None
+    payload = await fetch_from_exporter_any(guild_id, ["roster", "rosters"], params=params)
+    rows = _extract_exporter_rows(payload, ["roster", "rosters", "players"])
+    if not rows and isinstance(payload, dict) and isinstance(payload.get("teams"), list):
+        teams = [item for item in payload.get("teams") if isinstance(item, dict)]
+        if not teams:
+            await interaction.followup.send("No roster data yet. The exporter data may not be synced.", ephemeral=True)
+            return
+        embed = discord.Embed(title="📋 Team Roster Summary", color=0x5865F2)
+        for item in teams[:25]:
+            team_name = safe_text(item.get("team_name") or item.get("team") or item.get("name"), "Unknown Team")
+            player_count = safe_int(item.get("player_count") or len(item.get("players") or []))
+            embed.add_field(name=team_name, value=f"Players: {player_count}", inline=True)
+        await interaction.followup.send(embed=embed)
         return
 
-    standing_row = fetch_team_standing(safe_int(team_row.get("team_id"))) or {}
-    merged_team = {**team_row, **standing_row}
-    current_page = max(1, page or 1)
-    embed = build_roster_embed(merged_team, roster_rows, current_page)
-    view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, page=current_page)
-    await interaction.response.send_message(embed=embed, view=view)
+    if not rows:
+        await interaction.followup.send("No roster data yet. The exporter data may not be synced.", ephemeral=True)
+        return
+
+    if team:
+        team_label = team
+        embed = discord.Embed(title=f"📋 {team_label} Roster", color=0x5865F2)
+        player_lines = []
+        for idx, row in enumerate(rows[:30], start=1):
+            player_name = safe_text(row.get("full_name") or row.get("player_name") or row.get("name"), "Unknown Player")
+            position = safe_text(row.get("position"), "N/A")
+            overall = safe_int(row.get("overall_rating") or row.get("overall"))
+            player_lines.append(f"**{idx}.** {player_name} — {position} ({overall if overall else 'N/A'} OVR)")
+        embed.description = "\n".join(player_lines)
+        await interaction.followup.send(embed=embed)
+        return
+
+    team_counts: dict[str, int] = {}
+    for row in rows:
+        team_name = safe_text(row.get("team_name") or row.get("team") or row.get("team_abbr"), "Unknown Team")
+        team_counts[team_name] = team_counts.get(team_name, 0) + 1
+    if not team_counts:
+        await interaction.followup.send("No roster data yet. The exporter data may not be synced.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="📋 Team Roster Summary", color=0x5865F2)
+    for team_name, count in sorted(team_counts.items(), key=lambda item: item[0])[:25]:
+        embed.add_field(name=team_name, value=f"Players: {count}", inline=True)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="team", description="Show a team summary and its first roster page.")
@@ -2682,6 +2809,111 @@ async def team(interaction: discord.Interaction, team_name: str):
     embed = build_roster_embed(merged_team, roster_rows, 1)
     view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, page=1)
     await interaction.response.send_message(embed=embed, view=view)
+
+
+@bot.tree.command(name="schedule", description="Show live schedule data from Nexus Exporter.")
+@app_commands.describe(week="Optional week number")
+async def schedule(interaction: discord.Interaction, week: Optional[int] = None):
+    guild_id = guild_id_from_interaction(interaction)
+    prereq_error = exporter_prereq_error(guild_id)
+    if prereq_error:
+        await interaction.response.send_message(prereq_error, ephemeral=True)
+        return
+    if week is not None and week <= 0:
+        await interaction.response.send_message("Week must be a positive number.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    selected_week = week if week is not None else None
+    params = {"week": selected_week} if selected_week is not None else None
+    payload = await fetch_from_exporter_any(guild_id, ["schedule", "schedules"], params=params)
+    rows = _extract_exporter_rows(payload, ["schedule", "schedules", "games"])
+    if not rows:
+        await interaction.followup.send("No schedule data yet. The exporter data may not be synced.", ephemeral=True)
+        return
+
+    if selected_week is None:
+        known_weeks: list[int] = []
+        for row in rows:
+            week_num = safe_int(row.get("week"))
+            if week_num > 0:
+                known_weeks.append(week_num)
+        display_week = max(known_weeks) if known_weeks else None
+    else:
+        display_week = selected_week
+
+    filtered_rows = [row for row in rows if display_week is None or safe_int(row.get("week")) == display_week]
+    if not filtered_rows:
+        filtered_rows = rows
+
+    embed = discord.Embed(
+        title=f"🗓️ Schedule{f' — Week {display_week}' if display_week is not None else ''}",
+        color=0x5865F2,
+    )
+    game_lines = []
+    for row in filtered_rows[:25]:
+        away_team = safe_text(row.get("away_team_name") or row.get("away_team") or row.get("away"), "Away")
+        home_team = safe_text(row.get("home_team_name") or row.get("home_team") or row.get("home"), "Home")
+        if _is_completed_exporter_game(row):
+            away_score = safe_int(row.get("away_score") or row.get("awayScore"))
+            home_score = safe_int(row.get("home_score") or row.get("homeScore"))
+            game_lines.append(f"**{away_team} {away_score} - {home_score} {home_team}**")
+        else:
+            game_lines.append(f"**{away_team} @ {home_team}**")
+    embed.description = "\n".join(game_lines) if game_lines else "No games available."
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="statleaders", description="Show live stat leaders from Nexus Exporter.")
+async def statleaders(interaction: discord.Interaction):
+    guild_id = guild_id_from_interaction(interaction)
+    prereq_error = exporter_prereq_error(guild_id)
+    if prereq_error:
+        await interaction.response.send_message(prereq_error, ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    payload = await fetch_from_exporter_any(guild_id, ["statleaders", "stats/leaders", "stats"])
+    if payload is None:
+        await interaction.followup.send("Unable to load stat leaders right now. Please try again later.", ephemeral=True)
+        return
+
+    categories = {
+        "Passing": _extract_exporter_rows(payload if isinstance(payload, dict) else None, ["passing"]),
+        "Rushing": _extract_exporter_rows(payload if isinstance(payload, dict) else None, ["rushing"]),
+        "Receiving": _extract_exporter_rows(payload if isinstance(payload, dict) else None, ["receiving"]),
+        "Defense": _extract_exporter_rows(payload if isinstance(payload, dict) else None, ["defense"]),
+    }
+    if isinstance(payload, list):
+        categories["Passing"] = [row for row in payload if isinstance(row, dict)][:5]
+
+    if not any(categories.values()):
+        await interaction.followup.send("No stat leader data yet. The exporter data may not be synced.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="📊 Stat Leaders", color=0x5865F2)
+    for category, rows in categories.items():
+        if not rows:
+            embed.add_field(name=category, value="No data", inline=False)
+            continue
+        lines = []
+        for idx, row in enumerate(rows[:3], start=1):
+            player_name = safe_text(row.get("full_name") or row.get("player_name") or row.get("name"), "Unknown Player")
+            team_name = safe_text(row.get("team_name") or row.get("team"), "N/A")
+            stat_value = (
+                row.get("value")
+                or row.get("yards")
+                or row.get("total")
+                or row.get("total_pass_yds")
+                or row.get("total_rush_yds")
+                or row.get("total_rec_yds")
+                or row.get("total_sacks")
+                or row.get("total_ints")
+                or "N/A"
+            )
+            lines.append(f"**{idx}.** {player_name} ({team_name}) — {stat_value}")
+        embed.add_field(name=category, value="\n".join(lines), inline=False)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="balance", description="Check your token balance.")
@@ -3405,6 +3637,18 @@ async def setup_openai_key(interaction: discord.Interaction, key: str):
     await interaction.response.send_message("✅ Saved OpenAI API key for this server.", ephemeral=True)
 
 
+@setup_group.command(name="league_id", description="Set the Nexus Exporter league ID for this server.")
+@admin_only()
+@app_commands.describe(league_id="League ID from Nexus Exporter")
+async def setup_league_id(interaction: discord.Interaction, league_id: int):
+    guild_id = guild_id_from_interaction(interaction)
+    if league_id <= 0:
+        await interaction.response.send_message("League ID must be a positive number.", ephemeral=True)
+        return
+    GuildConfig.set(guild_id, league_id=league_id)
+    await interaction.response.send_message(f"✅ League ID set to `{league_id}`.", ephemeral=True)
+
+
 @setup_group.command(name="log_channel", description="Set the log channel for this server.")
 @admin_only()
 @app_commands.describe(channel="Channel for admin and audit log messages")
@@ -3495,6 +3739,62 @@ async def setup_xp_settings(
         xp_blacklist_channel_ids=(blacklist_channels or "").strip(),
     )
     await interaction.response.send_message("✅ XP settings updated for this server.", ephemeral=True)
+
+
+@setup_group.command(name="view", description="View this server's current bot configuration.")
+@admin_only()
+async def setup_view(interaction: discord.Interaction):
+    guild_id = guild_id_from_interaction(interaction)
+    cfg = GuildConfig.get(guild_id)
+
+    blacklist_ids = sorted(_parse_channel_ids(str(cfg.get("xp_blacklist_channel_ids") or "")))
+    blacklist_value = ", ".join(f"<#{cid}>" for cid in blacklist_ids) if blacklist_ids else "Not configured"
+    admin_roles = ", ".join([item.strip() for item in str(cfg.get("admin_role_names") or "").split(",") if item.strip()]) or "Not configured"
+    league_id = safe_int(cfg.get("league_id"))
+
+    embed = discord.Embed(title="⚙️ Current Server Configuration", color=0x5865F2)
+    embed.add_field(
+        name="Channels",
+        value=(
+            f"**Log:** {format_channel_value(cfg.get('log_channel_id'))}\n"
+            f"**Leaders:** {format_channel_value(cfg.get('leaders_channel_id'))}\n"
+            f"**News:** {format_channel_value(cfg.get('news_channel_id'))}\n"
+            f"**Trade Review:** {format_channel_value(cfg.get('trade_review_channel_id'))}\n"
+            f"**Trade Announcements:** {format_channel_value(cfg.get('trade_announcements_channel_id'))}\n"
+            f"**Level Up:** {format_channel_value(cfg.get('level_up_channel_id'))}\n"
+            f"**XP Blacklist:** {blacklist_value}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Roles & Thresholds",
+        value=(
+            f"**Trade Committee:** {format_role_value(cfg.get('trade_committee_role_id'))}\n"
+            f"**Trade Approvals Required:** {safe_int(cfg.get('trade_required_approvals')) or 'Not configured'}\n"
+            f"**Trade Denials Required:** {safe_int(cfg.get('trade_required_denials')) or 'Not configured'}\n"
+            f"**Admin Role Names:** {admin_roles}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="XP Settings",
+        value=(
+            f"**Cooldown Seconds:** {safe_int(cfg.get('xp_cooldown_seconds')) or 'Not configured'}\n"
+            f"**Min Message Length:** {safe_int(cfg.get('xp_min_message_len')) or 'Not configured'}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Integration",
+        value=(
+            f"**Nexus API Key:** {mask_sensitive_value(str(cfg.get('api_key') or ''))}\n"
+            f"**OpenAI API Key:** {mask_sensitive_value(str(cfg.get('openai_api_key') or ''))}\n"
+            f"**League ID:** {league_id if league_id > 0 else 'Not configured'}\n"
+            f"**Exporter URL:** {NEXUS_EXPORTER_URL or 'Not configured'}"
+        ),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 bot.tree.add_command(setup_group)
