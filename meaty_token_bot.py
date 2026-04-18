@@ -10,6 +10,7 @@ from urllib import request as urllib_request
 
 import discord
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 from discord import app_commands
 from discord.ext import commands
@@ -633,7 +634,7 @@ class TokenDatabase:
 
     def create_trade(
         self,
-        guild_id: int,
+        guild_id: int | None,
         submitted_by: discord.abc.User,
         coach_one: discord.abc.User,
         coach_two: discord.abc.User,
@@ -644,6 +645,9 @@ class TokenDatabase:
         notes: str = "",
         announcement_channel_id: int = 0,
     ) -> dict:
+        guild_id = int(guild_id or 0)
+        if guild_id <= 0:
+            raise ValueError("guild_id is required to create a trade.")
         with self.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -665,7 +669,7 @@ class TokenDatabase:
                     RETURNING *
                     """,
                     (
-                        int(guild_id),
+                        guild_id,
                         int(submitted_by.id),
                         str(submitted_by),
                         int(coach_one.id),
@@ -887,23 +891,29 @@ class GuildConfig:
         updates = {k: kwargs[k] for k in allowed if k in kwargs}
         if not updates:
             return cls.get(guild_id)
-        columns = ", ".join(updates.keys())
-        placeholders = ", ".join(["%s"] * len(updates))
-        update_sql = ", ".join(f"{col} = EXCLUDED.{col}" for col in updates.keys())
+        column_identifiers = [sql.Identifier(col) for col in updates.keys()]
         values = [updates[col] for col in updates.keys()]
+        assignments = [
+            sql.SQL("{col} = EXCLUDED.{col}").format(col=sql.Identifier(col))
+            for col in updates.keys()
+        ]
+        query = sql.SQL(
+            """
+            INSERT INTO guild_config (guild_id, {columns})
+            VALUES (%s, {placeholders})
+            ON CONFLICT (guild_id) DO UPDATE
+            SET {assignments},
+                updated_at = NOW()
+            RETURNING *
+            """
+        ).format(
+            columns=sql.SQL(", ").join(column_identifiers),
+            placeholders=sql.SQL(", ").join(sql.Placeholder() for _ in updates),
+            assignments=sql.SQL(", ").join(assignments),
+        )
         with TOKEN_DB.connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    INSERT INTO guild_config (guild_id, {columns})
-                    VALUES (%s, {placeholders})
-                    ON CONFLICT (guild_id) DO UPDATE
-                    SET {update_sql},
-                        updated_at = NOW()
-                    RETURNING *
-                    """,
-                    [int(guild_id), *values],
-                )
+                cur.execute(query, [int(guild_id), *values])
                 row = cur.fetchone()
             conn.commit()
         cls._cache.pop(int(guild_id), None)
@@ -1572,13 +1582,13 @@ def build_gamerecap_prompt(facts: dict) -> str:
 
 
 
-async def generate_gamerecap_text(facts: dict) -> tuple[str, str, bool]:
+async def generate_gamerecap_text(facts: dict, guild_id: int | None = None) -> tuple[str, str, bool]:
     fallback_headline = build_gamerecap_headline(facts)
     fallback_body = template_gamerecap_text(facts)
-    if not resolve_openai_api_key():
+    if not resolve_openai_api_key(guild_id):
         return fallback_headline, fallback_body, False
     try:
-        ai_text = await asyncio.to_thread(call_openai_text, build_gamerecap_prompt(facts), 320)
+        ai_text = await asyncio.to_thread(call_openai_text, build_gamerecap_prompt(facts), 320, guild_id)
         cleaned = _clean_generated_text(ai_text)
         if cleaned:
             lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
@@ -5110,14 +5120,14 @@ def build_weekly_news_prompt(facts: dict) -> str:
     )
 
 
-async def generate_matchup_preview_text(game_row, is_gotw: bool) -> tuple[str, bool]:
+async def generate_matchup_preview_text(game_row, is_gotw: bool, guild_id: int | None = None) -> tuple[str, bool]:
     facts = build_matchup_facts(game_row, is_gotw)
     fallback = template_matchup_preview_text(facts)
-    if not resolve_openai_api_key():
+    if not resolve_openai_api_key(guild_id):
         return fallback, False
 
     try:
-        ai_text = await asyncio.to_thread(call_openai_text, build_matchup_prompt(facts), 180)
+        ai_text = await asyncio.to_thread(call_openai_text, build_matchup_prompt(facts), 180, guild_id)
         cleaned = re.sub(r"\s+", " ", ai_text).strip()
         return cleaned or fallback, True
     except Exception as exc:
@@ -5125,14 +5135,14 @@ async def generate_matchup_preview_text(game_row, is_gotw: bool) -> tuple[str, b
         return fallback, False
 
 
-async def generate_weekly_news_text(week: int, games, gotw_game_ids: set[int]) -> tuple[str, bool]:
+async def generate_weekly_news_text(week: int, games, gotw_game_ids: set[int], guild_id: int | None = None) -> tuple[str, bool]:
     facts = build_league_news_facts(week, games, gotw_game_ids)
     fallback = template_weekly_news_text(facts)
-    if not resolve_openai_api_key():
+    if not resolve_openai_api_key(guild_id):
         return fallback, False
 
     try:
-        ai_text = await asyncio.to_thread(call_openai_text, build_weekly_news_prompt(facts), 260)
+        ai_text = await asyncio.to_thread(call_openai_text, build_weekly_news_prompt(facts), 260, guild_id)
         cleaned = re.sub(r"\s+", " ", ai_text).strip()
         return cleaned or fallback, True
     except Exception as exc:
@@ -5168,6 +5178,8 @@ async def post_weekly_news_article(
     fallback_channel: Optional[discord.TextChannel] = None,
     stage_index: Optional[int] = None,
 ):
+    if guild is None:
+        return None, False
     target_channel = await resolve_news_channel(guild, fallback_channel)
     if target_channel is None:
         return None, False
