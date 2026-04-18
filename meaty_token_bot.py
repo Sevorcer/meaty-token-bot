@@ -2432,16 +2432,22 @@ async def on_ready():
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
-        if interaction.response.is_done():
-            await interaction.followup.send(str(error), ephemeral=True)
-        else:
-            await interaction.response.send_message(str(error), ephemeral=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(str(error), ephemeral=True)
+            else:
+                await interaction.response.send_message(str(error), ephemeral=True)
+        except (discord.NotFound, discord.HTTPException):
+            print(f"Could not send check failure to user: {error}")
         return
 
-    if interaction.response.is_done():
-        await interaction.followup.send(f"Something went wrong: {error}", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"Something went wrong: {error}", ephemeral=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(f"Something went wrong: {error}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Something went wrong: {error}", ephemeral=True)
+    except (discord.NotFound, discord.HTTPException):
+        print(f"Could not send error to user: {error}")
 
 
 # -----------------------------
@@ -3623,57 +3629,63 @@ setup_group = app_commands.Group(name="setup", description="Configure this serve
 @admin_only()
 @app_commands.describe(key="Nexus Exporter API key")
 async def setup_apikey(interaction: discord.Interaction, key: str):
+    await interaction.response.defer(ephemeral=True)
     guild_id = guild_id_from_interaction(interaction)
     GuildConfig.set(guild_id, api_key=(key or "").strip())
-    await interaction.response.send_message("✅ Saved API key for this server.", ephemeral=True)
+    await interaction.followup.send("✅ Saved API key for this server.", ephemeral=True)
 
 
 @setup_group.command(name="openai_key", description="Set the OpenAI API key for this server.")
 @admin_only()
 @app_commands.describe(key="OpenAI API key")
 async def setup_openai_key(interaction: discord.Interaction, key: str):
+    await interaction.response.defer(ephemeral=True)
     guild_id = guild_id_from_interaction(interaction)
     GuildConfig.set(guild_id, openai_api_key=(key or "").strip())
-    await interaction.response.send_message("✅ Saved OpenAI API key for this server.", ephemeral=True)
+    await interaction.followup.send("✅ Saved OpenAI API key for this server.", ephemeral=True)
 
 
 @setup_group.command(name="league_id", description="Set the Nexus Exporter league ID for this server.")
 @admin_only()
 @app_commands.describe(league_id="League ID from Nexus Exporter")
 async def setup_league_id(interaction: discord.Interaction, league_id: int):
+    await interaction.response.defer(ephemeral=True)
     guild_id = guild_id_from_interaction(interaction)
     if league_id <= 0:
-        await interaction.response.send_message("League ID must be a positive number.", ephemeral=True)
+        await interaction.followup.send("League ID must be a positive number.", ephemeral=True)
         return
     GuildConfig.set(guild_id, league_id=league_id)
-    await interaction.response.send_message(f"✅ League ID set to `{league_id}`.", ephemeral=True)
+    await interaction.followup.send(f"✅ League ID set to `{league_id}`.", ephemeral=True)
 
 
 @setup_group.command(name="log_channel", description="Set the log channel for this server.")
 @admin_only()
 @app_commands.describe(channel="Channel for admin and audit log messages")
 async def setup_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)
     guild_id = guild_id_from_interaction(interaction)
     GuildConfig.set(guild_id, log_channel_id=int(channel.id))
-    await interaction.response.send_message(f"✅ Log channel set to {channel.mention}.", ephemeral=True)
+    await interaction.followup.send(f"✅ Log channel set to {channel.mention}.", ephemeral=True)
 
 
 @setup_group.command(name="news_channel", description="Set the news channel for this server.")
 @admin_only()
 @app_commands.describe(channel="Channel for weekly news and articles")
 async def setup_news_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)
     guild_id = guild_id_from_interaction(interaction)
     GuildConfig.set(guild_id, news_channel_id=int(channel.id))
-    await interaction.response.send_message(f"✅ News channel set to {channel.mention}.", ephemeral=True)
+    await interaction.followup.send(f"✅ News channel set to {channel.mention}.", ephemeral=True)
 
 
 @setup_group.command(name="leaders_channel", description="Set the leaders channel for this server.")
 @admin_only()
 @app_commands.describe(channel="Channel for season leaders posts")
 async def setup_leaders_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)
     guild_id = guild_id_from_interaction(interaction)
     GuildConfig.set(guild_id, leaders_channel_id=int(channel.id))
-    await interaction.response.send_message(f"✅ Leaders channel set to {channel.mention}.", ephemeral=True)
+    await interaction.followup.send(f"✅ Leaders channel set to {channel.mention}.", ephemeral=True)
 
 
 @setup_group.command(name="trade_channels", description="Set trade committee role and channels for this server.")
@@ -3693,6 +3705,7 @@ async def setup_trade_channels(
     required_approvals: Optional[int] = None,
     required_denials: Optional[int] = None,
 ):
+    await interaction.response.defer(ephemeral=True)
     guild_id = guild_id_from_interaction(interaction)
     GuildConfig.set(
         guild_id,
@@ -3702,7 +3715,7 @@ async def setup_trade_channels(
         trade_required_approvals=max(1, int(required_approvals or DEFAULT_TRADE_REQUIRED_APPROVALS)),
         trade_required_denials=max(1, int(required_denials or DEFAULT_TRADE_REQUIRED_DENIALS)),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "✅ Trade settings updated "
         f"(committee: {committee_role.mention}, review: {review_channel.mention}, announcements: {announcements_channel.mention}).",
         ephemeral=True,
@@ -3713,9 +3726,10 @@ async def setup_trade_channels(
 @admin_only()
 @app_commands.describe(channel="Channel for level-up announcements")
 async def setup_levelup_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)
     guild_id = guild_id_from_interaction(interaction)
     GuildConfig.set(guild_id, level_up_channel_id=int(channel.id))
-    await interaction.response.send_message(f"✅ Level-up channel set to {channel.mention}.", ephemeral=True)
+    await interaction.followup.send(f"✅ Level-up channel set to {channel.mention}.", ephemeral=True)
 
 
 @setup_group.command(name="xp_settings", description="Set XP cooldown/min length/blacklist channels for this server.")
@@ -3731,6 +3745,7 @@ async def setup_xp_settings(
     min_message_len: int,
     blacklist_channels: Optional[str] = None,
 ):
+    await interaction.response.defer(ephemeral=True)
     guild_id = guild_id_from_interaction(interaction)
     GuildConfig.set(
         guild_id,
@@ -3738,12 +3753,13 @@ async def setup_xp_settings(
         xp_min_message_len=max(1, int(min_message_len)),
         xp_blacklist_channel_ids=(blacklist_channels or "").strip(),
     )
-    await interaction.response.send_message("✅ XP settings updated for this server.", ephemeral=True)
+    await interaction.followup.send("✅ XP settings updated for this server.", ephemeral=True)
 
 
 @setup_group.command(name="view", description="View this server's current bot configuration.")
 @admin_only()
 async def setup_view(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     guild_id = guild_id_from_interaction(interaction)
     cfg = GuildConfig.get(guild_id)
 
@@ -3794,7 +3810,7 @@ async def setup_view(interaction: discord.Interaction):
         ),
         inline=False,
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 bot.tree.add_command(setup_group)
