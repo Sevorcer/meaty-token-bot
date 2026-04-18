@@ -952,6 +952,8 @@ def mask_sensitive_value(value: str | None) -> str:
     raw = (value or "").strip()
     if not raw:
         return "Not configured"
+    if len(raw) <= 4:
+        return "••••"
     return f"••••{raw[-4:]}"
 
 
@@ -978,17 +980,17 @@ def _extract_exporter_rows(payload: dict | list | None, preferred_keys: list[str
 
 
 def _is_completed_exporter_game(row: dict) -> bool:
-    away_score = safe_int(row.get("away_score") or row.get("awayScore"))
-    home_score = safe_int(row.get("home_score") or row.get("homeScore"))
-    if away_score > 0 or home_score > 0:
-        return True
     status = safe_text(row.get("status") or row.get("game_status"), "").strip().lower()
     if status in {"final", "completed", "complete"}:
         return True
     try:
-        return int(status) in COMPLETE_GAME_STATUS_VALUES
+        if int(status) in COMPLETE_GAME_STATUS_VALUES:
+            return True
     except Exception:
-        return False
+        pass
+    away_score = safe_int(row.get("away_score") or row.get("awayScore"))
+    home_score = safe_int(row.get("home_score") or row.get("homeScore"))
+    return away_score > 0 or home_score > 0
 
 
 def exporter_prereq_error(guild_id: int) -> Optional[str]:
@@ -1036,7 +1038,7 @@ async def fetch_from_exporter(guild_id: int, endpoint: str, params: dict = None)
             method="GET",
         )
         try:
-            with urllib_request.urlopen(req, timeout=25) as response:
+            with urllib_request.urlopen(req, timeout=15) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib_error.HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace")
@@ -2817,27 +2819,35 @@ async def schedule(interaction: discord.Interaction, week: Optional[int] = None)
     if prereq_error:
         await interaction.response.send_message(prereq_error, ephemeral=True)
         return
+    if week is not None and week <= 0:
+        await interaction.response.send_message("Week must be a positive number.", ephemeral=True)
+        return
 
     await interaction.response.defer()
-    params = {"week": max(1, int(week))} if week else None
+    selected_week = week if week is not None else None
+    params = {"week": selected_week} if selected_week is not None else None
     payload = await fetch_from_exporter_any(guild_id, ["schedule", "schedules"], params=params)
     rows = _extract_exporter_rows(payload, ["schedule", "schedules", "games"])
     if not rows:
         await interaction.followup.send("No schedule data yet. The exporter data may not be synced.", ephemeral=True)
         return
 
-    if week is None:
-        known_weeks = [safe_int(row.get("week")) for row in rows if safe_int(row.get("week")) > 0]
-        selected_week = max(known_weeks) if known_weeks else 0
+    if selected_week is None:
+        known_weeks: list[int] = []
+        for row in rows:
+            week_num = safe_int(row.get("week"))
+            if week_num > 0:
+                known_weeks.append(week_num)
+        display_week = max(known_weeks) if known_weeks else None
     else:
-        selected_week = max(1, int(week))
+        display_week = selected_week
 
-    filtered_rows = [row for row in rows if not selected_week or safe_int(row.get("week")) == selected_week]
+    filtered_rows = [row for row in rows if display_week is None or safe_int(row.get("week")) == display_week]
     if not filtered_rows:
         filtered_rows = rows
 
     embed = discord.Embed(
-        title=f"🗓️ Schedule{f' — Week {selected_week}' if selected_week else ''}",
+        title=f"🗓️ Schedule{f' — Week {display_week}' if display_week is not None else ''}",
         color=0x5865F2,
     )
     game_lines = []
@@ -3629,14 +3639,14 @@ async def setup_openai_key(interaction: discord.Interaction, key: str):
 
 @setup_group.command(name="league_id", description="Set the Nexus Exporter league ID for this server.")
 @admin_only()
-@app_commands.describe(id="League ID from Nexus Exporter")
-async def setup_league_id(interaction: discord.Interaction, id: int):
+@app_commands.describe(league_id="League ID from Nexus Exporter")
+async def setup_league_id(interaction: discord.Interaction, league_id: int):
     guild_id = guild_id_from_interaction(interaction)
-    if int(id) <= 0:
+    if league_id <= 0:
         await interaction.response.send_message("League ID must be a positive number.", ephemeral=True)
         return
-    GuildConfig.set(guild_id, league_id=int(id))
-    await interaction.response.send_message(f"✅ League ID set to `{int(id)}`.", ephemeral=True)
+    GuildConfig.set(guild_id, league_id=league_id)
+    await interaction.response.send_message(f"✅ League ID set to `{league_id}`.", ephemeral=True)
 
 
 @setup_group.command(name="log_channel", description="Set the log channel for this server.")
