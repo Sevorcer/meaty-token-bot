@@ -170,7 +170,7 @@ class TokenDatabase:
         self._init_db()
 
     def connect(self):
-        return psycopg.connect(self.database_url, row_factory=dict_row)
+        return psycopg.connect(self.database_url, row_factory=dict_row, client_encoding="utf8")
 
     def _init_db(self):
         with self.connect() as conn:
@@ -1136,7 +1136,7 @@ def roulette_spin() -> tuple[int, str]:
 def get_pg_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set.")
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row, client_encoding="utf8")
 
 
 def fetch_standings_rows():
