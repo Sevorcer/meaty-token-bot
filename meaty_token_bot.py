@@ -31,8 +31,14 @@ def _env_int(name: str, default: int) -> int:
 
 
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
-GUILD_IDS_RAW = os.getenv("GUILD_IDS") or os.getenv("GUILD_ID", "")
-GUILD_IDS = [int(x.strip()) for x in GUILD_IDS_RAW.split(",") if x.strip()]
+
+
+def parse_guild_ids() -> list[int]:
+    raw = (os.getenv("GUILD_IDS") or os.getenv("GUILD_ID", "")).strip()
+    return [int(x.strip()) for x in raw.split(",") if x.strip()]
+
+
+GUILD_IDS = parse_guild_ids()
 DEFAULT_LOG_CHANNEL_ID = _env_int("LOG_CHANNEL_ID", 0)
 DEFAULT_LEADERS_CHANNEL_ID = _env_int("LEADERS_CHANNEL_ID", 0)
 DEFAULT_NEWS_CHANNEL_ID = _env_int("NEWS_CHANNEL_ID", 0)
@@ -2422,11 +2428,24 @@ async def on_ready():
                 bot.tree.copy_global_to(guild=guild)
                 synced = await bot.tree.sync(guild=guild)
                 print(f"Synced {len(synced)} guild commands to {guild_id}")
+            bot.tree.clear_commands(guild=None)
+            await bot.tree.sync()
+            print("Cleared global commands")
         else:
             synced = await bot.tree.sync()
             print(f"Synced {len(synced)} global commands")
     except Exception as exc:
         print(f"Slash command sync failed: {exc}")
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild) -> None:
+    if not GUILD_IDS:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+        except Exception as exc:
+            print(f"Failed to sync commands to new guild {guild.id}: {exc}")
 
 
 @bot.tree.error
