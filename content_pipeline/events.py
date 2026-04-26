@@ -2,9 +2,25 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Optional
 
 from .db import ContentDB
+
+# Only allow column names that consist of alphanumeric characters and underscores
+_VALID_IDENT = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def _safe_col(name: Optional[str]) -> Optional[str]:
+    """Return `name` only if it is a safe SQL identifier, else None."""
+    if name and _VALID_IDENT.match(name):
+        return name
+    return None
+
+
+def _safe_cols(*names: Optional[str]) -> list[str]:
+    """Return only the non-None, safe column names from the given list."""
+    return [c for c in names if _safe_col(c)]
 
 
 class EventScanner:
@@ -63,12 +79,12 @@ class EventScanner:
         if not cols:
             return events
 
-        home_score_col = self.db.pick_column("games", ["home_score", "home_final_score"])
-        away_score_col = self.db.pick_column("games", ["away_score", "away_final_score"])
-        week_col = self.db.pick_column("games", ["week", "schedule_week"])
-        played_col = self.db.pick_column("games", ["is_played", "played", "game_played"])
-        home_team_col = self.db.pick_column("games", ["home_team_name", "home_team"])
-        away_team_col = self.db.pick_column("games", ["away_team_name", "away_team"])
+        home_score_col = _safe_col(self.db.pick_column("games", ["home_score", "home_final_score"]))
+        away_score_col = _safe_col(self.db.pick_column("games", ["away_score", "away_final_score"]))
+        week_col = _safe_col(self.db.pick_column("games", ["week", "schedule_week"]))
+        played_col = _safe_col(self.db.pick_column("games", ["is_played", "played", "game_played"]))
+        home_team_col = _safe_col(self.db.pick_column("games", ["home_team_name", "home_team"]))
+        away_team_col = _safe_col(self.db.pick_column("games", ["away_team_name", "away_team"]))
 
         if not all([home_score_col, away_score_col, played_col]):
             return events
@@ -77,10 +93,10 @@ class EventScanner:
             with self.db._conn() as conn:
                 with conn.cursor() as cur:
                     select_cols = ", ".join(
-                        c for c in [
+                        _safe_cols(
                             "id", home_score_col, away_score_col,
                             week_col, played_col, home_team_col, away_team_col,
-                        ] if c
+                        )
                     )
                     cur.execute(
                         f"SELECT {select_cols} FROM games WHERE {played_col} = TRUE ORDER BY id DESC LIMIT 20"
@@ -95,8 +111,8 @@ class EventScanner:
         try:
             standings_cols = self.db.get_table_columns("standings")
             if standings_cols:
-                team_col = self.db.pick_column("standings", ["team_name", "team"])
-                wins_col = self.db.pick_column("standings", ["total_wins", "wins", "win_count"])
+                team_col = _safe_col(self.db.pick_column("standings", ["team_name", "team"]))
+                wins_col = _safe_col(self.db.pick_column("standings", ["total_wins", "wins", "win_count"]))
                 if team_col and wins_col:
                     with self.db._conn() as conn:
                         with conn.cursor() as cur:
@@ -188,9 +204,9 @@ class EventScanner:
         if not cols:
             return events
 
-        yds_col = self.db.pick_column("player_passing_stats", ["pass_yds", "pass_yards", "passing_yards"])
-        player_col = self.db.pick_column("player_passing_stats", ["player_name", "full_name", "name"])
-        game_col = self.db.pick_column("player_passing_stats", ["game_id", "schedule_id"])
+        yds_col = _safe_col(self.db.pick_column("player_passing_stats", ["pass_yds", "pass_yards", "passing_yards"]))
+        player_col = _safe_col(self.db.pick_column("player_passing_stats", ["player_name", "full_name", "name"]))
+        game_col = _safe_col(self.db.pick_column("player_passing_stats", ["game_id", "schedule_id"]))
 
         if not yds_col:
             return events
@@ -198,7 +214,7 @@ class EventScanner:
         try:
             with self.db._conn() as conn:
                 with conn.cursor() as cur:
-                    select_cols = ", ".join(c for c in ["id", yds_col, player_col, game_col] if c)
+                    select_cols = ", ".join(_safe_cols("id", yds_col, player_col, game_col))
                     cur.execute(
                         f"SELECT {select_cols} FROM player_passing_stats WHERE {yds_col} >= 350 ORDER BY {yds_col} DESC LIMIT 5"
                     )
@@ -228,8 +244,8 @@ class EventScanner:
         if not cols:
             return events
 
-        yds_col = self.db.pick_column("player_rushing_stats", ["rush_yds", "rush_yards", "rushing_yards"])
-        player_col = self.db.pick_column("player_rushing_stats", ["player_name", "full_name", "name"])
+        yds_col = _safe_col(self.db.pick_column("player_rushing_stats", ["rush_yds", "rush_yards", "rushing_yards"]))
+        player_col = _safe_col(self.db.pick_column("player_rushing_stats", ["player_name", "full_name", "name"]))
 
         if not yds_col:
             return events
@@ -237,7 +253,7 @@ class EventScanner:
         try:
             with self.db._conn() as conn:
                 with conn.cursor() as cur:
-                    select_cols = ", ".join(c for c in ["id", yds_col, player_col] if c)
+                    select_cols = ", ".join(_safe_cols("id", yds_col, player_col))
                     cur.execute(
                         f"SELECT {select_cols} FROM player_rushing_stats WHERE {yds_col} >= 150 ORDER BY {yds_col} DESC LIMIT 5"
                     )
@@ -267,8 +283,8 @@ class EventScanner:
         if not cols:
             return events
 
-        yds_col = self.db.pick_column("player_receiving_stats", ["rec_yds", "rec_yards", "receiving_yards"])
-        player_col = self.db.pick_column("player_receiving_stats", ["player_name", "full_name", "name"])
+        yds_col = _safe_col(self.db.pick_column("player_receiving_stats", ["rec_yds", "rec_yards", "receiving_yards"]))
+        player_col = _safe_col(self.db.pick_column("player_receiving_stats", ["player_name", "full_name", "name"]))
 
         if not yds_col:
             return events
@@ -276,7 +292,7 @@ class EventScanner:
         try:
             with self.db._conn() as conn:
                 with conn.cursor() as cur:
-                    select_cols = ", ".join(c for c in ["id", yds_col, player_col] if c)
+                    select_cols = ", ".join(_safe_cols("id", yds_col, player_col))
                     cur.execute(
                         f"SELECT {select_cols} FROM player_receiving_stats WHERE {yds_col} >= 150 ORDER BY {yds_col} DESC LIMIT 5"
                     )
@@ -306,9 +322,9 @@ class EventScanner:
         if not cols:
             return events
 
-        sacks_col = self.db.pick_column("player_defense_stats", ["sacks", "def_sacks"])
-        ints_col = self.db.pick_column("player_defense_stats", ["ints", "interceptions", "def_ints"])
-        player_col = self.db.pick_column("player_defense_stats", ["player_name", "full_name", "name"])
+        sacks_col = _safe_col(self.db.pick_column("player_defense_stats", ["sacks", "def_sacks"]))
+        ints_col = _safe_col(self.db.pick_column("player_defense_stats", ["ints", "interceptions", "def_ints"]))
+        player_col = _safe_col(self.db.pick_column("player_defense_stats", ["player_name", "full_name", "name"]))
 
         if not sacks_col and not ints_col:
             return events
@@ -322,7 +338,7 @@ class EventScanner:
                     if ints_col:
                         conditions.append(f"{ints_col} >= 2")
                     where_clause = " OR ".join(conditions)
-                    select_cols = ", ".join(c for c in ["id", sacks_col, ints_col, player_col] if c)
+                    select_cols = ", ".join(_safe_cols("id", sacks_col, ints_col, player_col))
                     cur.execute(
                         f"SELECT {select_cols} FROM player_defense_stats WHERE {where_clause} ORDER BY id DESC LIMIT 5"
                     )
@@ -382,15 +398,15 @@ class EventScanner:
         if not cols:
             return events
 
-        odds_col = self.db.pick_column("bot_sportsbook_bets", ["odds", "payout_multiplier", "multiplier"])
-        status_col = self.db.pick_column("bot_sportsbook_bets", ["status", "bet_status"])
+        odds_col = _safe_col(self.db.pick_column("bot_sportsbook_bets", ["odds", "payout_multiplier", "multiplier"]))
+        status_col = _safe_col(self.db.pick_column("bot_sportsbook_bets", ["status", "bet_status"]))
         if not status_col:
             return events
 
         try:
             with self.db._conn() as conn:
                 with conn.cursor() as cur:
-                    select_cols = ", ".join(c for c in ["id", odds_col, status_col] if c)
+                    select_cols = ", ".join(_safe_cols("id", odds_col, status_col))
                     if odds_col:
                         cur.execute(
                             f"SELECT {select_cols} FROM bot_sportsbook_bets "
@@ -426,7 +442,7 @@ class EventScanner:
         if not cols:
             return events
 
-        claimed_col = self.db.pick_column("bot_bounties", ["claimed_at", "completed_at", "claimed"])
+        claimed_col = _safe_col(self.db.pick_column("bot_bounties", ["claimed_at", "completed_at", "claimed"]))
         if not claimed_col:
             return events
 

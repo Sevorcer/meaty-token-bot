@@ -244,7 +244,7 @@ class ContentDB:
                     WHERE guild_id = %s
                       AND event_type = %s
                       AND source_id = %s
-                      AND created_at >= NOW() - INTERVAL '%s hours'
+                      AND created_at >= NOW() - INTERVAL '1 hour' * %s
                     LIMIT 1
                     """,
                     (int(guild_id), event_type, source_id, int(hours)),

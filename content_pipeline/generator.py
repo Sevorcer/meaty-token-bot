@@ -83,7 +83,7 @@ class ContentGenerator:
             return self._client
         try:
             import openai  # noqa: PLC0415 — lazy import
-            self._client = openai.AsyncOpenAI(api_key=self.api_key)
+            self._client = openai.AsyncOpenAI(api_key=self.api_key)  # noqa: PLC0415 - lazy import
         except ImportError:
             print("[ContentPipeline] openai package not installed — AI generation disabled.", file=sys.stderr)
             self._client = None

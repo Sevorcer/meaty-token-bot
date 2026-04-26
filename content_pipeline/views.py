@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Optional, TYPE_CHECKING
 
 import discord
@@ -208,7 +209,6 @@ class ContentReviewView(discord.ui.View):
         try:
             meta = item.get("metadata") or {}
             if isinstance(meta, str):
-                import json
                 meta = json.loads(meta) if meta else {}
 
             new_content = await self.generator.generate(

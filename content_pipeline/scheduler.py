@@ -46,7 +46,15 @@ class ContentScheduler:
 
     async def _run_all_guilds(self):
         raw = os.getenv("GUILD_IDS", "")
-        guild_ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        guild_ids: list[int] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                guild_ids.append(int(part))
+            except ValueError:
+                print(f"[ContentPipeline] Invalid guild ID in GUILD_IDS: {part!r} — skipping.")
         for guild_id in guild_ids:
             try:
                 cfg = await asyncio.to_thread(self.db.get_guild_config, guild_id)
