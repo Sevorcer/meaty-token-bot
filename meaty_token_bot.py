@@ -861,8 +861,8 @@ class TokenDatabase:
                 )
                 return {int(row["team_id"]): row["discord_user_id"] for row in cur.fetchall()}
 
-    def get_claimed_team_ids(self, guild_id: int) -> set:
-        """Return set of team_ids manually assigned (non-NULL user) for this guild."""
+    def get_claimed_team_ids(self, guild_id: int) -> set[int]:
+        """Return set of team_ids that have a manual discord_user_id assignment for this guild."""
         with self.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2951,17 +2951,18 @@ async def openteams(interaction: discord.Interaction):
         return
 
     await interaction.response.defer()
-    guild    = interaction.guild
-    guild_id = guild_id_from_interaction(interaction)
+    guild      = interaction.guild
+    guild_id   = guild_id_from_interaction(interaction)
 
-    # build_open_teams_list is synchronous (DB + in-memory guild.members scan)
+    # build_open_teams_list uses guild.members (in-memory, Members intent already enabled)
+    # and DB calls — run in thread to avoid blocking event loop
     open_teams = await asyncio.to_thread(build_open_teams_list, guild, guild_id)
 
     if not open_teams:
         await interaction.followup.send(
             embed=build_embed(
                 "✅ No Open Teams",
-                "All franchise teams are currently claimed.\nUse `/standings` to see the full league or `/team <name>` to look up any team.",
+                "All franchise teams are currently claimed. Use `/standings` to see the full league or `/team` to look up any team.",
                 0x57F287,
             )
         )
@@ -4520,48 +4521,51 @@ def fetch_open_teams(guild_id: int) -> list[dict]:
     return open_teams
 
 
-def build_open_teams_list(guild: discord.Guild, guild_id: int) -> list:
+def build_open_teams_list(guild: discord.Guild, guild_id: int) -> list[dict]:
     """
-    Return all franchise teams not currently claimed.
+    Return all franchise teams that are NOT claimed.
 
-    Two-layer claim detection:
-      Layer 1 (auto):   find_member_for_team(guild, team_name) returns a member
-                        whose nickname/username matches the team name.
-      Layer 2 (manual): team_id exists in bot_team_assignments with a non-NULL
-                        discord_user_id for this guild.
+    Claim detection uses TWO layers (either marks a team as claimed):
+      Layer 1 (auto): Any guild member whose display_name or username matches
+                      a team name via the existing find_member_for_team() logic.
+      Layer 2 (manual override): Any team_id in bot_team_assignments with a
+                      non-NULL discord_user_id for this guild.
 
-    Each returned dict is a merged team+standings row plus:
-      'top_players': list of up to 8 player dicts sorted by OVR descending
+    Each returned dict is a merged team+standings row with:
+      - 'top_players': list of up to 8 player dicts (by OVR)
+      - 'claimed_by_member': None (always None for open teams)
     """
     all_teams = fetch_all_team_rows()
     if not all_teams:
         return []
 
     # Layer 2: manual DB overrides
-    manual_claimed: set = set()
+    manual_claimed_ids: set[int] = set()
     try:
-        manual_claimed = TOKEN_DB.get_claimed_team_ids(guild_id)
+        manual_claimed_ids = TOKEN_DB.get_claimed_team_ids(guild_id)
     except Exception as exc:
         print(f"[openteams] Could not read bot_team_assignments: {exc}")
 
     open_teams = []
     for team in all_teams:
-        team_id   = safe_int(team.get("team_id"))
+        team_id = safe_int(team.get("team_id"))
         team_name = safe_text(team.get("team_name"), "")
 
-        # Layer 2: manual override says claimed
-        if team_id in manual_claimed:
+        # Layer 2 check: manual DB override says claimed
+        if team_id in manual_claimed_ids:
             continue
 
-        # Layer 1: auto-detect via guild member nicknames
-        if find_member_for_team(guild, team_name) is not None:
+        # Layer 1 check: auto-detect via guild member nicknames
+        matched_member = find_member_for_team(guild, team_name)
+        if matched_member is not None:
             continue
 
         # Team is open — enrich with standings + top 8 players
         standing = fetch_team_standing(team_id) or {}
-        merged   = {**team, **standing}
-        roster   = fetch_team_roster_rows(team_id)
+        merged = {**team, **standing}
+        roster = fetch_team_roster_rows(team_id)
         merged["top_players"] = roster[:8]
+        merged["claimed_by_member"] = None
         open_teams.append(merged)
 
     return open_teams
