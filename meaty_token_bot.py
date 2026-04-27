@@ -861,6 +861,16 @@ class TokenDatabase:
                 )
                 return {int(row["team_id"]): row["discord_user_id"] for row in cur.fetchall()}
 
+    def get_claimed_team_ids(self, guild_id: int) -> set:
+        """Return set of team_ids manually assigned (non-NULL user) for this guild."""
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT team_id FROM bot_team_assignments WHERE guild_id = %s AND discord_user_id IS NOT NULL",
+                    (guild_id,),
+                )
+                return {int(row["team_id"]) for row in cur.fetchall()}
+
     def assign_team(self, guild_id: int, team_id: int, discord_user_id: int | None, notes: str = ""):
         """Assign or unassign a team. Pass discord_user_id=None to mark as open."""
         import datetime
@@ -2936,23 +2946,29 @@ async def team(interaction: discord.Interaction, team_name: str):
 
 @bot.tree.command(name="openteams", description="Browse all open (unclaimed) franchise teams with roster previews.")
 async def openteams(interaction: discord.Interaction):
-    guild_id = guild_id_from_interaction(interaction)
-    await interaction.response.defer()
+    if not interaction.guild:
+        await interaction.response.send_message("This command must be used inside a server.", ephemeral=True)
+        return
 
-    open_teams = await asyncio.to_thread(fetch_open_teams, guild_id)
+    await interaction.response.defer()
+    guild    = interaction.guild
+    guild_id = guild_id_from_interaction(interaction)
+
+    # build_open_teams_list is synchronous (DB + in-memory guild.members scan)
+    open_teams = await asyncio.to_thread(build_open_teams_list, guild, guild_id)
 
     if not open_teams:
         await interaction.followup.send(
             embed=build_embed(
                 "✅ No Open Teams",
-                "All franchise teams are currently claimed. Use `/standings` to see the full league.",
+                "All franchise teams are currently claimed.\nUse `/standings` to see the full league or `/team <name>` to look up any team.",
                 0x57F287,
             )
         )
         return
 
     embed = build_open_team_embed(open_teams[0], 1, len(open_teams))
-    view = OpenTeamsPaginationView(open_teams, interaction.user.id, page=1)
+    view  = OpenTeamsPaginationView(open_teams, interaction.user.id, page=1)
     await interaction.followup.send(embed=embed, view=view)
 
 
@@ -4498,6 +4514,53 @@ def fetch_open_teams(guild_id: int) -> list[dict]:
         standing = fetch_team_standing(team_id) or {}
         merged = {**team, **standing}
         roster = fetch_team_roster_rows(team_id)
+        merged["top_players"] = roster[:8]
+        open_teams.append(merged)
+
+    return open_teams
+
+
+def build_open_teams_list(guild: discord.Guild, guild_id: int) -> list:
+    """
+    Return all franchise teams not currently claimed.
+
+    Two-layer claim detection:
+      Layer 1 (auto):   find_member_for_team(guild, team_name) returns a member
+                        whose nickname/username matches the team name.
+      Layer 2 (manual): team_id exists in bot_team_assignments with a non-NULL
+                        discord_user_id for this guild.
+
+    Each returned dict is a merged team+standings row plus:
+      'top_players': list of up to 8 player dicts sorted by OVR descending
+    """
+    all_teams = fetch_all_team_rows()
+    if not all_teams:
+        return []
+
+    # Layer 2: manual DB overrides
+    manual_claimed: set = set()
+    try:
+        manual_claimed = TOKEN_DB.get_claimed_team_ids(guild_id)
+    except Exception as exc:
+        print(f"[openteams] Could not read bot_team_assignments: {exc}")
+
+    open_teams = []
+    for team in all_teams:
+        team_id   = safe_int(team.get("team_id"))
+        team_name = safe_text(team.get("team_name"), "")
+
+        # Layer 2: manual override says claimed
+        if team_id in manual_claimed:
+            continue
+
+        # Layer 1: auto-detect via guild member nicknames
+        if find_member_for_team(guild, team_name) is not None:
+            continue
+
+        # Team is open — enrich with standings + top 8 players
+        standing = fetch_team_standing(team_id) or {}
+        merged   = {**team, **standing}
+        roster   = fetch_team_roster_rows(team_id)
         merged["top_players"] = roster[:8]
         open_teams.append(merged)
 
