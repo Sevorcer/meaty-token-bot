@@ -325,6 +325,15 @@ class TokenDatabase:
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_team_assignments (
+                        team_id     INTEGER PRIMARY KEY,
+                        guild_id    BIGINT NOT NULL,
+                        discord_user_id BIGINT,
+                        assigned_at TIMESTAMPTZ,
+                        notes       TEXT DEFAULT ''
+                    )
+                """)
             conn.commit()
 
     def ensure_user(self, user: discord.abc.User):
@@ -841,6 +850,36 @@ class TokenDatabase:
                     (int(trade_id),),
                 )
                 return [dict(row) for row in cur.fetchall()]
+
+    def get_team_assignments(self, guild_id: int) -> dict[int, int | None]:
+        """Returns {team_id: discord_user_id or None} for all assigned teams in this guild."""
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT team_id, discord_user_id FROM bot_team_assignments WHERE guild_id = %s",
+                    (guild_id,),
+                )
+                return {int(row["team_id"]): row["discord_user_id"] for row in cur.fetchall()}
+
+    def assign_team(self, guild_id: int, team_id: int, discord_user_id: int | None, notes: str = ""):
+        """Assign or unassign a team. Pass discord_user_id=None to mark as open."""
+        import datetime
+        assigned_at = datetime.datetime.utcnow() if discord_user_id else None
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bot_team_assignments (team_id, guild_id, discord_user_id, assigned_at, notes)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (team_id) DO UPDATE
+                    SET guild_id = EXCLUDED.guild_id,
+                        discord_user_id = EXCLUDED.discord_user_id,
+                        assigned_at = EXCLUDED.assigned_at,
+                        notes = EXCLUDED.notes
+                    """,
+                    (int(team_id), int(guild_id), discord_user_id, assigned_at, notes),
+                )
+            conn.commit()
 
 
 TOKEN_DB = TokenDatabase(DATABASE_URL)
@@ -2775,6 +2814,51 @@ class RosterPaginationView(discord.ui.View):
         await interaction.response.edit_message(embed=build_roster_embed(self.title_team, self.roster_rows, self.page), view=self)
 
 
+class OpenTeamsPaginationView(discord.ui.View):
+    """
+    Paginated browser for open (unassigned) teams.
+    Each page = one open team card with top 8 players and current record.
+    Only the user who ran the command can use the buttons.
+    """
+
+    def __init__(self, open_teams: list[dict], requester_id: int, page: int = 1, timeout: int = 300):
+        super().__init__(timeout=timeout)
+        self.open_teams = open_teams
+        self.requester_id = requester_id
+        self.page = max(1, min(page, max(len(open_teams), 1)))
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        self.prev_team.disabled = self.page <= 1
+        self.next_team.disabled = self.page >= len(self.open_teams)
+
+    def _current_embed(self) -> discord.Embed:
+        team_data = self.open_teams[self.page - 1]
+        return build_open_team_embed(team_data, self.page, len(self.open_teams))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who ran `/openteams` can browse this list.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_team(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if self.page > 1:
+            self.page -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._current_embed(), view=self)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.primary)
+    async def next_team(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if self.page < len(self.open_teams):
+            self.page += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._current_embed(), view=self)
+
+
 @bot.tree.command(name="roster", description="Show live roster data from Nexus Exporter.")
 @app_commands.describe(team="Optional team name")
 async def roster(interaction: discord.Interaction, team: Optional[str] = None):
@@ -2846,6 +2930,71 @@ async def team(interaction: discord.Interaction, team_name: str):
     embed = build_roster_embed(merged_team, roster_rows, 1)
     view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, page=1)
     await interaction.response.send_message(embed=embed, view=view)
+
+
+@bot.tree.command(name="openteams", description="Browse all open (unclaimed) franchise teams with roster previews.")
+async def openteams(interaction: discord.Interaction):
+    guild_id = guild_id_from_interaction(interaction)
+    await interaction.response.defer()
+
+    open_teams = await asyncio.to_thread(fetch_open_teams, guild_id)
+
+    if not open_teams:
+        await interaction.followup.send(
+            embed=build_embed(
+                "✅ No Open Teams",
+                "All franchise teams are currently claimed. Use `/standings` to see the full league.",
+                0x57F287,
+            )
+        )
+        return
+
+    embed = build_open_team_embed(open_teams[0], 1, len(open_teams))
+    view = OpenTeamsPaginationView(open_teams, interaction.user.id, page=1)
+    await interaction.followup.send(embed=embed, view=view)
+
+
+@bot.tree.command(name="assignteam", description="Admin: Assign or unassign a franchise team to a Discord user.")
+@admin_only()
+@app_commands.describe(
+    team_name="Team name to assign",
+    user="Discord user to assign the team to (leave blank to mark as open/unassigned)",
+    notes="Optional notes",
+)
+async def assignteam(
+    interaction: discord.Interaction,
+    team_name: str,
+    user: Optional[discord.Member] = None,
+    notes: Optional[str] = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    guild_id = guild_id_from_interaction(interaction)
+
+    team_row = resolve_team_row(team_name)
+    if not team_row:
+        await interaction.followup.send(f"Could not find a team matching **{team_name}**.", ephemeral=True)
+        return
+
+    team_id = safe_int(team_row.get("team_id"))
+    display_name = safe_text(team_row.get("team_name"), team_name)
+    discord_user_id = int(user.id) if user else None
+
+    await asyncio.to_thread(
+        TOKEN_DB.assign_team, guild_id, team_id, discord_user_id, notes or ""
+    )
+
+    if user:
+        msg = f"✅ **{display_name}** has been assigned to {user.mention}."
+        await send_log_message(
+            f"🏈 ADMIN: {interaction.user.mention} assigned **{display_name}** to {user.mention}."
+        )
+    else:
+        msg = f"✅ **{display_name}** has been marked as **open** (no owner)."
+        await send_log_message(
+            f"🏈 ADMIN: {interaction.user.mention} marked **{display_name}** as open/unassigned."
+        )
+
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 @bot.tree.command(name="schedule", description="Show live schedule data from Nexus Exporter.")
@@ -4313,6 +4462,46 @@ def fetch_all_team_rows() -> list[dict]:
             return [record_to_dict(row) for row in cur.fetchall()]
 
 
+def fetch_open_teams(guild_id: int) -> list[dict]:
+    """
+    Return all teams that do NOT have an assigned discord_user_id in bot_team_assignments
+    for this guild. If bot_team_assignments has no rows at all for this guild, all teams
+    are considered open. Each returned dict is a merged team+standing row with top 8
+    roster rows attached under key 'top_players'.
+    """
+    all_teams = fetch_all_team_rows()
+    if not all_teams:
+        return []
+
+    assigned_team_ids: set[int] = set()
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT team_id FROM bot_team_assignments
+                    WHERE guild_id = %s AND discord_user_id IS NOT NULL
+                    """,
+                    (guild_id,),
+                )
+                assigned_team_ids = {int(row["team_id"]) for row in cur.fetchall()}
+    except Exception as exc:
+        print(f"[openteams] Could not query bot_team_assignments: {exc}")
+
+    open_teams = []
+    for team in all_teams:
+        team_id = safe_int(team.get("team_id"))
+        if team_id in assigned_team_ids:
+            continue
+        standing = fetch_team_standing(team_id) or {}
+        merged = {**team, **standing}
+        roster = fetch_team_roster_rows(team_id)
+        merged["top_players"] = roster[:8]
+        open_teams.append(merged)
+
+    return open_teams
+
+
 def resolve_team_row(team_name: str):
     normalized_query = normalize_team_name(team_name)
     if not normalized_query:
@@ -4908,6 +5097,67 @@ def build_roster_embed(team_row: dict, roster_rows: list[dict], page: int) -> di
         inline=False,
     )
     embed.set_footer(text=f"Page {page}/{total_pages} • 12 players per page")
+    return embed
+
+
+def build_open_team_embed(team_data: dict, page: int, total: int) -> discord.Embed:
+    """
+    Build an embed for a single open team card showing:
+    - Team name, record, OVR
+    - Conference / Division
+    - Top 8 players (name, position, OVR, dev trait)
+    - Open team recruiting CTA
+    """
+    team_name = safe_text(team_data.get("team_name"), "Unknown Team")
+    wins = safe_int(team_data.get("wins"))
+    losses = safe_int(team_data.get("losses"))
+    ties = safe_int(team_data.get("ties"))
+    team_ovr = safe_int(team_data.get("team_ovr"))
+    conference = safe_text(team_data.get("conference_name"), "N/A")
+    division = safe_text(team_data.get("division_name"), "N/A")
+    pts_for = safe_int(team_data.get("pts_for"))
+    pts_against = safe_int(team_data.get("pts_against"))
+    seed = safe_int(team_data.get("seed"))
+
+    record_str = f"{wins}-{losses}-{ties}"
+    seed_str = f" • #{seed} Seed" if seed else ""
+    ovr_str = f" • {team_ovr} OVR" if team_ovr else ""
+
+    embed = build_embed(
+        f"🟢 {team_name} — OPEN",
+        f"**Record:** {record_str}{seed_str}{ovr_str}\n"
+        f"**{conference} / {division}**\n"
+        f"**Points:** {pts_for} PF / {pts_against} PA",
+        0x57F287,
+    )
+
+    top_players: list[dict] = team_data.get("top_players") or []
+    if top_players:
+        player_lines = []
+        for idx, row in enumerate(top_players, start=1):
+            p_name = safe_text(row.get("full_name"), "Unknown")
+            position = safe_text(row.get("position"), "?")
+            ovr = resolve_display_overall(row)
+            dev_label = dev_trait_to_label(
+                row.get("dev_trait"),
+                row.get("resolved_dev_trait_label") or row.get("dev_trait_label"),
+            )
+            ovr_display = f"{ovr} OVR" if ovr else "? OVR"
+            player_lines.append(f"**{idx}.** {p_name} — {position} | {ovr_display} | {dev_label}")
+        embed.add_field(
+            name="🏆 Top 8 Players",
+            value="\n".join(player_lines),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="🏆 Top 8 Players", value="No roster data yet.", inline=False)
+
+    embed.add_field(
+        name="📣 This team is available!",
+        value="DM the commissioner or use `/joinleague` to claim this team.",
+        inline=False,
+    )
+    embed.set_footer(text=f"Open Team {page} of {total} • Use buttons to browse")
     return embed
 
 
