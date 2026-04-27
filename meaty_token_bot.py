@@ -864,7 +864,7 @@ class TokenDatabase:
     def assign_team(self, guild_id: int, team_id: int, discord_user_id: int | None, notes: str = ""):
         """Assign or unassign a team. Pass discord_user_id=None to mark as open."""
         import datetime
-        assigned_at = datetime.datetime.utcnow() if discord_user_id else None
+        assigned_at = datetime.datetime.now(datetime.timezone.utc) if discord_user_id else None
         with self.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2823,9 +2823,11 @@ class OpenTeamsPaginationView(discord.ui.View):
 
     def __init__(self, open_teams: list[dict], requester_id: int, page: int = 1, timeout: int = 300):
         super().__init__(timeout=timeout)
+        if not open_teams:
+            raise ValueError("OpenTeamsPaginationView requires at least one team.")
         self.open_teams = open_teams
         self.requester_id = requester_id
-        self.page = max(1, min(page, max(len(open_teams), 1)))
+        self.page = max(1, min(page, len(open_teams)))
         self._update_buttons()
 
     def _update_buttons(self) -> None:
