@@ -167,6 +167,7 @@ BLACKJACK_WIN_MULTIPLIER = 2.0
 
 CASINO_DELETE_DELAY = 60
 BLACKJACK_FINISHED_DELETE_DELAY = 180
+DELETE_CHANNELS_MAX_DISPLAY = 20
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -1296,6 +1297,16 @@ def stage_channel_prefix(stage_index: int) -> str:
         4: "conf",
         5: "sb",
     }.get(stage_index, f"s{stage_index}-w")
+
+
+def channel_name_prefixes_for_week_phase(week: int, stage_index: int) -> list[str]:
+    """Return all channel-name prefixes used by /create_week_channels for the given week+phase.
+
+    Regular channels are named ``<prefix><week>-…`` and Game-of-the-Week channels
+    add a ``gotw-`` leader, so both prefixes are returned.
+    """
+    base = f"{stage_channel_prefix(stage_index)}{week}-"
+    return [base, f"gotw-{base}"]
 
 
 def stage_week_label(stage_index: int, display_week: int) -> str:
@@ -4349,6 +4360,100 @@ async def finalize_trade_if_threshold_met(trade_row: dict, acting_user_id: int |
     return trade_row
 
 
+class DeleteChannelsConfirmView(discord.ui.View):
+    """Ephemeral confirmation view for the /delete_channels command."""
+
+    def __init__(
+        self,
+        channel_ids: list[int],
+        guild_id: int,
+        user_id: int,
+        week: int,
+        phase_label: str,
+    ):
+        super().__init__(timeout=60)
+        self.channel_ids = channel_ids
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.week = week
+        self.phase_label = phase_label
+
+    @discord.ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the command invoker can confirm this deletion.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Guild not found.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        deleted: list[str] = []
+        failed: list[str] = []
+
+        for channel_id in self.channel_ids:
+            channel = guild.get_channel(channel_id)
+            if channel is None:
+                try:
+                    channel = await guild.fetch_channel(channel_id)
+                except Exception:
+                    failed.append(f"<#{channel_id}> (not found)")
+                    continue
+            try:
+                cname = channel.name
+                await channel.delete(
+                    reason=(
+                        f"Deleted by {interaction.user} via /delete_channels "
+                        f"week={self.week} phase={self.phase_label}"
+                    )
+                )
+                deleted.append(cname)
+                print(
+                    f"[delete_channels] Deleted #{cname} (id={channel_id}) "
+                    f"guild={self.guild_id} user={self.user_id} "
+                    f"week={self.week} phase={self.phase_label}"
+                )
+            except discord.Forbidden:
+                failed.append(f"{channel.name} (no permission)")
+            except Exception as exc:
+                failed.append(f"{channel.name} ({exc})")
+
+        lines = [f"✅ Deleted **{len(deleted)}** channel(s) for **{self.phase_label} Week {self.week}**."]
+        if deleted:
+            lines.append("Deleted:\n" + "\n".join(f"• {name}" for name in deleted[:DELETE_CHANNELS_MAX_DISPLAY]))
+        if failed:
+            lines.append("Failed:\n" + "\n".join(f"• {name}" for name in failed[:DELETE_CHANNELS_MAX_DISPLAY]))
+
+        await interaction.followup.send("\n\n".join(lines), ephemeral=True)
+
+        truncated = len(deleted) > DELETE_CHANNELS_MAX_DISPLAY
+        log_channel_names = ', '.join(deleted[:DELETE_CHANNELS_MAX_DISPLAY])
+        if truncated:
+            log_channel_names += f" …and {len(deleted) - DELETE_CHANNELS_MAX_DISPLAY} more"
+        log_msg = (
+            f"🗑️ CHANNELS DELETED: <@{self.user_id}> deleted {len(deleted)} channel(s) "
+            f"for **{self.phase_label} Week {self.week}** | "
+            f"Guild: {self.guild_id} | "
+            f"Channels: {log_channel_names if deleted else 'none'}"
+        )
+        await send_log_message(log_msg, guild_id=self.guild_id)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the command invoker can cancel this.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="❌ Channel deletion cancelled.", view=None)
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        self.stop()
+
+
 class TradeReviewView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -6037,6 +6142,91 @@ async def create_week_channels(
         summary_lines.append("GOTW:\n" + "\n".join(f"• {name}" for name in gotw_created))
 
     await interaction.followup.send("\n\n".join(summary_lines), ephemeral=True)
+
+
+@bot.tree.command(name="delete_channels", description="Admin: delete matchup channels for a specific week and phase.")
+@admin_only()
+@app_commands.describe(
+    week="Human week number whose channels should be deleted (e.g. 5).",
+    phase="Season phase / segment the channels belong to.",
+)
+@app_commands.choices(phase=[
+    app_commands.Choice(name="Preseason", value="preseason"),
+    app_commands.Choice(name="Regular Season", value="regular"),
+    app_commands.Choice(name="Wild Card", value="wild card"),
+    app_commands.Choice(name="Divisional", value="divisional"),
+    app_commands.Choice(name="Conference Championship", value="conference championship"),
+    app_commands.Choice(name="Super Bowl", value="super bowl"),
+])
+async def delete_channels(
+    interaction: discord.Interaction,
+    week: int,
+    phase: str,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message(
+            "❌ You need the **Manage Channels** permission to use this command.",
+            ephemeral=True,
+        )
+        return
+
+    if week < 1:
+        await interaction.response.send_message("Week must be 1 or greater.", ephemeral=True)
+        return
+
+    stage_index = parse_phase_to_stage_index(phase)
+    if stage_index is None:
+        await interaction.response.send_message(
+            f"❌ Unknown phase `{phase}`. Choose from the provided options.",
+            ephemeral=True,
+        )
+        return
+
+    prefixes = channel_name_prefixes_for_week_phase(week, stage_index)
+    guild = interaction.guild
+    matching_channels = [
+        ch for ch in guild.text_channels
+        if any(ch.name.startswith(p) for p in prefixes)
+    ]
+
+    phase_label = stage_display_name(stage_index)
+
+    if not matching_channels:
+        await interaction.response.send_message(
+            f"❌ No text channels found for **{phase_label} Week {week}** "
+            f"(expected names starting with: {', '.join(f'`{p}`' for p in prefixes)}).",
+            ephemeral=True,
+        )
+        return
+
+    channel_list = "\n".join(f"• {ch.name}" for ch in matching_channels[:DELETE_CHANNELS_MAX_DISPLAY])
+    overflow = len(matching_channels) - DELETE_CHANNELS_MAX_DISPLAY
+    overflow_text = f"\n…and {overflow} more" if overflow > 0 else ""
+    preview = (
+        f"⚠️ This will permanently delete **{len(matching_channels)} channel(s)** "
+        f"for **{phase_label} Week {week}**:\n\n"
+        f"{channel_list}{overflow_text}\n\n"
+        f"Press **Confirm Delete** to proceed or **Cancel** to abort."
+    )
+
+    print(
+        f"[delete_channels] Preview: guild={guild.id} user={interaction.user.id} "
+        f"week={week} phase={phase_label} "
+        f"channels={[ch.name for ch in matching_channels]}"
+    )
+
+    view = DeleteChannelsConfirmView(
+        channel_ids=[ch.id for ch in matching_channels],
+        guild_id=guild.id,
+        user_id=interaction.user.id,
+        week=week,
+        phase_label=phase_label,
+    )
+    await interaction.response.send_message(preview, view=view, ephemeral=True)
 
 
 @bot.tree.command(name="post_weekly_news", description="Admin: post the main weekly league news article.")
