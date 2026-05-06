@@ -482,7 +482,7 @@ class ContentDB:
 
         All identifiers (table name, column names) are validated through _safe_ident
         before being interpolated into the query.  Only the season_index parameter
-        is passed as a proper query parameter (%s) to avoid injection.
+        is passed as a proper query parameter (%s) to prevent SQL injection.
         """
         safe_table = _safe_ident(table)
         if not safe_table:

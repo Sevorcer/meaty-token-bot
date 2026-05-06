@@ -754,7 +754,7 @@ class ContentPipelineCog(commands.Cog, name="ContentPipeline"):
         # ------------------------------------------------------------------
         # 2. Fetch season-to-date stat leaders (defensive — returns [] if tables missing)
         # ------------------------------------------------------------------
-        passing_leaders, rushing_leaders, receiving_leaders, sack_leaders, int_leaders = (
+        passing_leaders, rushing_leaders, receiving_leaders, sack_leaders, interception_leaders = (
             await asyncio.gather(
                 asyncio.to_thread(self.db.get_season_passing_leaders, season_index),
                 asyncio.to_thread(self.db.get_season_rushing_leaders, season_index),
@@ -795,8 +795,8 @@ class ContentPipelineCog(commands.Cog, name="ContentPipeline"):
             mvp_context_parts.append(f"Receiving Leaders:\n{_fmt_leaders(receiving_leaders)}")
         if sack_leaders:
             mvp_context_parts.append(f"Sack Leaders:\n{_fmt_leaders(sack_leaders)}")
-        if int_leaders:
-            mvp_context_parts.append(f"Interception Leaders:\n{_fmt_leaders(int_leaders)}")
+        if interception_leaders:
+            mvp_context_parts.append(f"Interception Leaders:\n{_fmt_leaders(interception_leaders)}")
         mvp_combined = "\n\n".join(mvp_context_parts) if mvp_context_parts else "No stat data available."
 
         # Each entry: (content_type, platform, context_dict)
@@ -859,7 +859,7 @@ class ContentPipelineCog(commands.Cog, name="ContentPipeline"):
                 {
                     "season": season_label,
                     "scope": "combined (regular season + playoffs)",
-                    "leaders": _fmt_leaders(int_leaders),
+                    "leaders": _fmt_leaders(interception_leaders),
                 },
             ),
             # MVP race and TikTok scripts — only add when data is available
