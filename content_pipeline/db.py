@@ -3,10 +3,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Optional
 
 import psycopg
 from psycopg.rows import dict_row
+
+# Only allow column names that consist of alphanumeric characters and underscores
+_VALID_IDENT = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def _safe_ident(name: Optional[str]) -> Optional[str]:
+    """Return name only if it is a safe SQL identifier, else None."""
+    if name and _VALID_IDENT.match(name):
+        return name
+    return None
 
 
 class ContentDB:
@@ -424,3 +435,183 @@ class ContentDB:
             return int(cfg.get("recruit_channel_id") or 0)
         except (TypeError, ValueError):
             return 0
+
+    # ------------------------------------------------------------------
+    # Season-leader queries (defensive — handles missing tables/columns)
+    # ------------------------------------------------------------------
+
+    def get_current_season_index(self) -> Optional[int]:
+        """
+        Detect the current season_index by taking MAX(season_index) from available tables.
+        Checks games first, then standings, then passing/rushing stat tables.
+        Returns None if no season_index column is found in any table.
+        """
+        # All table names are literals here; _safe_ident used as an extra safety guard.
+        for table in ("games", "standings", "player_passing_stats", "player_rushing_stats"):
+            safe_table = _safe_ident(table)
+            if not safe_table:
+                continue
+            cols = self.get_table_columns(safe_table)
+            if "season_index" not in cols:
+                continue
+            try:
+                with self._conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(f"SELECT MAX(season_index) AS si FROM {safe_table}")  # noqa: S608
+                        row = cur.fetchone()
+                        if row and row.get("si") is not None:
+                            return int(row["si"])
+            except Exception as exc:
+                print(f"[ContentPipeline] get_current_season_index from {safe_table}: {exc}")
+        return None
+
+    def _get_season_leaders(
+        self,
+        table: str,
+        yards_candidates: list[str],
+        td_candidates: list[str],
+        extra_candidates: list[str],
+        extra_label: str,
+        season_index: Optional[int],
+        limit: int = 5,
+    ) -> list[dict]:
+        """
+        Generic helper: aggregate season-to-date leaders from *table*.
+        Returns a list of dicts with player, team, yards, td (optional), extra (optional).
+        Skips gracefully if the table or key columns are absent.
+
+        All identifiers (table name, column names) are validated through _safe_ident
+        before being interpolated into the query.  Only the season_index parameter
+        is passed as a proper query parameter (%s) to prevent SQL injection.
+        """
+        safe_table = _safe_ident(table)
+        if not safe_table:
+            print(f"[ContentPipeline] _get_season_leaders: unsafe table name '{table}' — skipping.")
+            return []
+
+        cols = self.get_table_columns(safe_table)
+        if not cols:
+            return []
+
+        yds_col = _safe_ident(self.pick_column(safe_table, yards_candidates))
+        player_col = _safe_ident(
+            self.pick_column(safe_table, ["player_name", "full_name", "name", "player_full_name"])
+        )
+        team_col = _safe_ident(
+            self.pick_column(safe_table, ["team_name", "team", "club_name", "team_abbr"])
+        )
+        td_col = _safe_ident(self.pick_column(safe_table, td_candidates)) if td_candidates else None
+        extra_col = _safe_ident(self.pick_column(safe_table, extra_candidates)) if extra_candidates else None
+        season_col = _safe_ident("season_index") if "season_index" in cols else None
+        player_id_col = _safe_ident(
+            self.pick_column(safe_table, ["roster_id", "player_id", "playerId", "rosterId"])
+        )
+
+        if not yds_col or not player_col:
+            print(f"[ContentPipeline] {safe_table}: required columns (yards/player) not found — skipping season leaders.")
+            return []
+
+        # Build GROUP BY — include player_id for uniqueness when available
+        group_cols = [player_col]
+        if player_id_col:
+            group_cols.insert(0, player_id_col)
+
+        # All identifiers here have been validated by _safe_ident above.
+        select_parts = [f"MAX({player_col}) AS player"]
+        if team_col:
+            select_parts.append(f"MAX({team_col}) AS team")
+        select_parts.append(f"SUM({yds_col}) AS total_yards")
+        if td_col:
+            select_parts.append(f"SUM({td_col}) AS total_tds")
+        if extra_col:
+            # extra_label is a fixed string supplied by internal callers only.
+            safe_extra_label = _safe_ident(extra_label) or "total_extra"
+            select_parts.append(f"SUM({extra_col}) AS {safe_extra_label}")
+
+        select_clause = ", ".join(select_parts)
+        group_clause = ", ".join(group_cols)
+
+        # Use a parameterized placeholder for season_index to follow SQL best practices.
+        if season_col and season_index is not None:
+            where_clause = f"WHERE {season_col} = %s"
+            params: tuple = (int(season_index), int(limit))
+        else:
+            where_clause = ""
+            params = (int(limit),)
+
+        query = (
+            f"SELECT {select_clause} FROM {safe_table} "
+            f"{where_clause} "
+            f"GROUP BY {group_clause} "
+            f"ORDER BY total_yards DESC NULLS LAST "
+            f"LIMIT %s"
+        )
+
+        try:
+            with self._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, params)
+                    return [dict(row) for row in cur.fetchall()]
+        except Exception as exc:
+            print(f"[ContentPipeline] {safe_table} season leaders query error: {exc}")
+            return []
+
+    def get_season_passing_leaders(self, season_index: Optional[int], limit: int = 5) -> list[dict]:
+        """Season-to-date passing yards leaders."""
+        return self._get_season_leaders(
+            table="player_passing_stats",
+            yards_candidates=["pass_yds", "pass_yards", "passing_yards", "passYds"],
+            td_candidates=["pass_td", "pass_tds", "passing_tds", "pass_touchdowns", "passTDs"],
+            extra_candidates=["ints", "interceptions", "pass_ints", "passInts"],
+            extra_label="total_ints",
+            season_index=season_index,
+            limit=limit,
+        )
+
+    def get_season_rushing_leaders(self, season_index: Optional[int], limit: int = 5) -> list[dict]:
+        """Season-to-date rushing yards leaders."""
+        return self._get_season_leaders(
+            table="player_rushing_stats",
+            yards_candidates=["rush_yds", "rush_yards", "rushing_yards", "rushYds"],
+            td_candidates=["rush_td", "rush_tds", "rushing_tds", "rush_touchdowns", "rushTDs"],
+            extra_candidates=["rush_att", "rush_attempts", "carries", "rushAtt"],
+            extra_label="total_carries",
+            season_index=season_index,
+            limit=limit,
+        )
+
+    def get_season_receiving_leaders(self, season_index: Optional[int], limit: int = 5) -> list[dict]:
+        """Season-to-date receiving yards leaders."""
+        return self._get_season_leaders(
+            table="player_receiving_stats",
+            yards_candidates=["rec_yds", "rec_yards", "receiving_yards", "recYds"],
+            td_candidates=["rec_td", "rec_tds", "receiving_tds", "rec_touchdowns", "recTDs"],
+            extra_candidates=["receptions", "catches", "recs", "rec"],
+            extra_label="total_receptions",
+            season_index=season_index,
+            limit=limit,
+        )
+
+    def get_season_defense_leaders_sacks(self, season_index: Optional[int], limit: int = 5) -> list[dict]:
+        """Season-to-date sacks leaders."""
+        return self._get_season_leaders(
+            table="player_defense_stats",
+            yards_candidates=["sacks", "def_sacks", "sacksForLoss"],
+            td_candidates=[],
+            extra_candidates=["tackles", "total_tackles", "def_tackles"],
+            extra_label="total_tackles",
+            season_index=season_index,
+            limit=limit,
+        )
+
+    def get_season_defense_leaders_ints(self, season_index: Optional[int], limit: int = 5) -> list[dict]:
+        """Season-to-date interceptions leaders."""
+        return self._get_season_leaders(
+            table="player_defense_stats",
+            yards_candidates=["ints", "interceptions", "def_ints", "defInts"],
+            td_candidates=["int_td", "int_tds", "def_int_tds"],
+            extra_candidates=["sacks", "def_sacks"],
+            extra_label="total_sacks",
+            season_index=season_index,
+            limit=limit,
+        )

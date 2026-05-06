@@ -268,4 +268,136 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "hook, voiceover, on_screen_text, clip_instructions."
         ),
     },
+    "season_leaders_passing": {
+        "platform": "discord",
+        "prompt_template": (
+            "You are an ESPN-style sports analyst covering a competitive Madden CFM franchise league.\n"
+            "Write a season-to-date passing yards leaderboard post for Discord.\n\n"
+            "Leaderboard data:\n{context}\n\n"
+            "Requirements:\n"
+            "- Title: Punchy passing leader headline (e.g. '🏈 Passing Yards — Season Leaders')\n"
+            "- Body: 5–8 sentences. Name the top passer, their stats, who's chasing them, MVP implications.\n"
+            "- Caption: One-liner teaser for social sharing\n"
+            "- Hook: 0–3 second attention grabber for short-form video\n"
+            "- Hashtags: Stats/league tags (include #MaddenCFM #MaddenFranchise)\n"
+            "- CTA: Invite debate, open team interest, or DM to join\n\n"
+            "Tone: SportsCenter energy. Make the numbers feel dramatic.\n\n"
+            "Return a JSON object with keys: title, body, caption, hashtags, cta, source_summary, "
+            "hook, voiceover, on_screen_text, clip_instructions."
+        ),
+    },
+    "season_leaders_rushing": {
+        "platform": "discord",
+        "prompt_template": (
+            "You are an ESPN-style sports analyst covering a competitive Madden CFM franchise league.\n"
+            "Write a season-to-date rushing yards leaderboard post for Discord.\n\n"
+            "Leaderboard data:\n{context}\n\n"
+            "Requirements:\n"
+            "- Title: Punchy rushing leader headline (e.g. '🏃 Rushing Yards — Season Leaders')\n"
+            "- Body: 5–8 sentences. Highlight the lead rusher, their dominance, closest challengers.\n"
+            "- Caption: One-liner for social sharing\n"
+            "- Hook: 0–3 second grabber for short-form video\n"
+            "- Hashtags: Stats/league tags (include #MaddenCFM #MaddenFranchise)\n"
+            "- CTA: League open team pitch or community reaction prompt\n\n"
+            "Tone: Powerful. The ground game is a weapon.\n\n"
+            "Return a JSON object with keys: title, body, caption, hashtags, cta, source_summary, "
+            "hook, voiceover, on_screen_text, clip_instructions."
+        ),
+    },
+    "season_leaders_receiving": {
+        "platform": "discord",
+        "prompt_template": (
+            "You are an ESPN-style sports analyst covering a competitive Madden CFM franchise league.\n"
+            "Write a season-to-date receiving yards leaderboard post for Discord.\n\n"
+            "Leaderboard data:\n{context}\n\n"
+            "Requirements:\n"
+            "- Title: Punchy receiving leader headline (e.g. '🙌 Receiving Yards — Season Leaders')\n"
+            "- Body: 5–8 sentences. Best receiver, who's on pace for monster numbers, TD leaders.\n"
+            "- Caption: One-liner for social sharing\n"
+            "- Hook: 0–3 second grabber for short-form video\n"
+            "- Hashtags: Stats/league tags (include #MaddenCFM #MaddenFranchise)\n"
+            "- CTA: Recruit pitch or community reaction prompt\n\n"
+            "Tone: Flashy. These pass-catchers are making plays.\n\n"
+            "Return a JSON object with keys: title, body, caption, hashtags, cta, source_summary, "
+            "hook, voiceover, on_screen_text, clip_instructions."
+        ),
+    },
+    "season_leaders_defense_sacks": {
+        "platform": "discord",
+        "prompt_template": (
+            "You are an ESPN-style sports analyst covering a competitive Madden CFM franchise league.\n"
+            "Write a season-to-date sacks leaderboard post for Discord.\n\n"
+            "Leaderboard data:\n{context}\n\n"
+            "Requirements:\n"
+            "- Title: Sack leader headline (e.g. '💥 Sack Leaders — Season-to-Date')\n"
+            "- Body: 5–7 sentences. Who's terrorizing QBs, closest challengers, impact on their team.\n"
+            "- Caption: Defensive energy one-liner\n"
+            "- Hook: 0–3 second grabber for short-form video\n"
+            "- Hashtags: Defense/league tags (include #MaddenCFM #MaddenFranchise)\n"
+            "- CTA: Open defensive roster spots or community reaction\n\n"
+            "Tone: Ferocious. These pass-rushers own the edge.\n\n"
+            "Return a JSON object with keys: title, body, caption, hashtags, cta, source_summary, "
+            "hook, voiceover, on_screen_text, clip_instructions."
+        ),
+    },
+    "season_leaders_defense_ints": {
+        "platform": "discord",
+        "prompt_template": (
+            "You are an ESPN-style sports analyst covering a competitive Madden CFM franchise league.\n"
+            "Write a season-to-date interceptions leaderboard post for Discord.\n\n"
+            "Leaderboard data:\n{context}\n\n"
+            "Requirements:\n"
+            "- Title: INT leader headline (e.g. '🚨 Interception Leaders — Season-to-Date')\n"
+            "- Body: 5–7 sentences. Ball hawk highlights, what the picks mean for standings, drama.\n"
+            "- Caption: Ball hawk energy one-liner\n"
+            "- Hook: 0–3 second grabber for short-form video\n"
+            "- Hashtags: Defense/league tags (include #MaddenCFM #MaddenFranchise)\n"
+            "- CTA: Open secondary roster spots or community reaction\n\n"
+            "Tone: Opportunistic. These DBs are changing games.\n\n"
+            "Return a JSON object with keys: title, body, caption, hashtags, cta, source_summary, "
+            "hook, voiceover, on_screen_text, clip_instructions."
+        ),
+    },
+    "mvp_race_update": {
+        "platform": "discord",
+        "prompt_template": (
+            "You are a sports analyst covering the season-long MVP race in a Madden CFM franchise league.\n"
+            "Write a season-to-date MVP race update post for Discord.\n\n"
+            "Multi-stat leaderboard data (passing/rushing/receiving/defense):\n{context}\n\n"
+            "Requirements:\n"
+            "- Title: MVP race headline (e.g. '🏆 MVP Race — Who's Running Away With It?')\n"
+            "- Body: 5–8 sentences. Current leader(s), challengers across positions, stat narratives, "
+            "what it means for the season story.\n"
+            "- Caption: MVP debate one-liner\n"
+            "- Hook: 0–3 second grabber for short-form video\n"
+            "- Hashtags: MVP/stats tags (include #MaddenCFM #MaddenFranchise)\n"
+            "- CTA: Get the community debating — crown them or challenge them\n\n"
+            "Tone: Statistical authority with debate energy. Like ESPN First Take meets PFR.\n\n"
+            "Return a JSON object with keys: title, body, caption, hashtags, cta, source_summary, "
+            "hook, voiceover, on_screen_text, clip_instructions."
+        ),
+    },
+    "season_leaders_tiktok": {
+        "platform": "tiktok",
+        "prompt_template": (
+            "You are a viral TikTok/Reels/Shorts scriptwriter for a Madden CFM franchise league.\n"
+            "Create a short-form video script (15–45 seconds) about season stat leaders.\n\n"
+            "Leaderboard data:\n{context}\n\n"
+            "IMPORTANT: Return ONLY a valid JSON object with these exact fields:\n"
+            "- title: Video title (short, searchable)\n"
+            "- hook: 0–3 second scroll-stopping opening line\n"
+            "- body: 10–20 second stat storyline narration\n"
+            "- voiceover: Full voiceover script (read aloud, 30–45 seconds total)\n"
+            "- on_screen_text: Array of 3–5 text overlay lines that appear during the video\n"
+            "- clip_instructions: Array of 3–5 specific clip suggestions (what to show)\n"
+            "- caption: Social media caption for the post (engaging, emoji-friendly)\n"
+            "- hashtags: Array of hashtags — ALWAYS include #Madden #MaddenCFM #MaddenFranchise #GamingLeague\n"
+            "- cta: Call to action (follow, join the league, DM for info, etc.)\n\n"
+            "Hook examples: 'The stat sheet doesn't lie — this league is elite.' "
+            "'Top 5 in the league. And the season isn't over yet.' "
+            "'You want competition? Look at these numbers.'\n\n"
+            "Tone: Viral, punchy, recruiting-focused. Make non-Madden players want to join.\n\n"
+            "Return ONLY the JSON object. No markdown, no explanation."
+        ),
+    },
 }

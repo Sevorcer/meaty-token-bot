@@ -725,7 +725,7 @@ class ContentPipelineCog(commands.Cog, name="ContentPipeline"):
 
     @app_commands.command(
         name="weekly_media_generate",
-        description="Admin: Generate a full weekly media package.",
+        description="Admin: Generate a full weekly media package (season-to-date stat leaders + editorial).",
     )
     async def weekly_media_generate(self, interaction: discord.Interaction):
         if not _is_admin(interaction, self.db):
@@ -744,25 +744,169 @@ class ContentPipelineCog(commands.Cog, name="ContentPipeline"):
             )
             return
 
-        types_to_generate = [
-            ("gotw_hype", "discord"),
-            ("weekly_news", "discord"),
-            ("player_spotlight", "discord"),
-            ("open_team_recruiting", "discord"),
+        # ------------------------------------------------------------------
+        # 1. Detect current season_index (combined = reg + playoffs)
+        # ------------------------------------------------------------------
+        season_index: Optional[int] = await asyncio.to_thread(self.db.get_current_season_index)
+        season_label = f"Season {season_index}" if season_index is not None else "Current Season"
+        print(f"[ContentPipeline] weekly_media_generate: guild={guild_id} season_index={season_index}")
+
+        # ------------------------------------------------------------------
+        # 2. Fetch season-to-date stat leaders (defensive — returns [] if tables missing)
+        # ------------------------------------------------------------------
+        passing_leaders, rushing_leaders, receiving_leaders, sack_leaders, interception_leaders = (
+            await asyncio.gather(
+                asyncio.to_thread(self.db.get_season_passing_leaders, season_index),
+                asyncio.to_thread(self.db.get_season_rushing_leaders, season_index),
+                asyncio.to_thread(self.db.get_season_receiving_leaders, season_index),
+                asyncio.to_thread(self.db.get_season_defense_leaders_sacks, season_index),
+                asyncio.to_thread(self.db.get_season_defense_leaders_ints, season_index),
+            )
+        )
+
+        def _fmt_leaders(rows: list[dict], yards_key: str = "total_yards") -> str:
+            """Format a leader list into a readable context string for the AI prompt."""
+            if not rows:
+                return "No data available."
+            lines = []
+            for i, row in enumerate(rows, 1):
+                player = str(row.get("player") or "Unknown")
+                team = str(row.get("team") or "")
+                yards = row.get(yards_key) or row.get("total_yards") or 0
+                tds = row.get("total_tds")
+                extra_keys = [k for k in row if k not in {"player", "team", yards_key, "total_yards", "total_tds"}]
+                extras = ", ".join(f"{k.replace('total_', '')}: {row[k]}" for k in extra_keys if row.get(k) is not None)
+                stat_str = f"{yards} yards"
+                if tds is not None:
+                    stat_str += f", {tds} TD"
+                if extras:
+                    stat_str += f", {extras}"
+                team_str = f" ({team})" if team else ""
+                lines.append(f"#{i}: {player}{team_str} — {stat_str}")
+            return "\n".join(lines)
+
+        # Build combined MVP context from all leader tables
+        mvp_context_parts: list[str] = []
+        if passing_leaders:
+            mvp_context_parts.append(f"Passing Leaders:\n{_fmt_leaders(passing_leaders)}")
+        if rushing_leaders:
+            mvp_context_parts.append(f"Rushing Leaders:\n{_fmt_leaders(rushing_leaders)}")
+        if receiving_leaders:
+            mvp_context_parts.append(f"Receiving Leaders:\n{_fmt_leaders(receiving_leaders)}")
+        if sack_leaders:
+            mvp_context_parts.append(f"Sack Leaders:\n{_fmt_leaders(sack_leaders)}")
+        if interception_leaders:
+            mvp_context_parts.append(f"Interception Leaders:\n{_fmt_leaders(interception_leaders)}")
+        mvp_combined = "\n\n".join(mvp_context_parts) if mvp_context_parts else "No stat data available."
+
+        # Each entry: (content_type, platform, context_dict)
+        tasks_to_generate: list[tuple[str, str, dict]] = [
+            # Editorial / game-based content
+            (
+                "gotw_hype", "discord",
+                {"guild_id": guild_id, "note": "Game of the Week hype", "season": season_label},
+            ),
+            (
+                "weekly_news", "discord",
+                {
+                    "guild_id": guild_id,
+                    "season": season_label,
+                    "passing_leaders": _fmt_leaders(passing_leaders),
+                    "rushing_leaders": _fmt_leaders(rushing_leaders),
+                    "receiving_leaders": _fmt_leaders(receiving_leaders),
+                    "note": "Weekly league news wrap-up",
+                },
+            ),
+            (
+                "open_team_recruiting", "discord",
+                {"guild_id": guild_id, "note": "Recruiting push", "season": season_label},
+            ),
+            # Season-leader leaderboard posts
+            (
+                "season_leaders_passing", "discord",
+                {
+                    "season": season_label,
+                    "scope": "combined (regular season + playoffs)",
+                    "leaders": _fmt_leaders(passing_leaders),
+                },
+            ),
+            (
+                "season_leaders_rushing", "discord",
+                {
+                    "season": season_label,
+                    "scope": "combined (regular season + playoffs)",
+                    "leaders": _fmt_leaders(rushing_leaders),
+                },
+            ),
+            (
+                "season_leaders_receiving", "discord",
+                {
+                    "season": season_label,
+                    "scope": "combined (regular season + playoffs)",
+                    "leaders": _fmt_leaders(receiving_leaders),
+                },
+            ),
+            (
+                "season_leaders_defense_sacks", "discord",
+                {
+                    "season": season_label,
+                    "scope": "combined (regular season + playoffs)",
+                    "leaders": _fmt_leaders(sack_leaders),
+                },
+            ),
+            (
+                "season_leaders_defense_ints", "discord",
+                {
+                    "season": season_label,
+                    "scope": "combined (regular season + playoffs)",
+                    "leaders": _fmt_leaders(interception_leaders),
+                },
+            ),
+            # MVP race and TikTok scripts — only add when data is available
         ]
 
-        created_ids = []
-        base_context = {
-            "guild_id": guild_id,
-            "note": "Weekly media package generation",
-        }
+        # Only generate MVP race if we have at least one leaderboard
+        if mvp_context_parts:
+            tasks_to_generate.append((
+                "mvp_race_update", "discord",
+                {
+                    "season": season_label,
+                    "scope": "combined (regular season + playoffs)",
+                    "leaderboards": mvp_combined,
+                },
+            ))
 
-        for content_type, platform in types_to_generate:
+        # TikTok scripts for passing + rushing if data is available
+        if passing_leaders:
+            tasks_to_generate.append((
+                "season_leaders_tiktok", "tiktok",
+                {
+                    "season": season_label,
+                    "stat_category": "Passing Yards",
+                    "leaders": _fmt_leaders(passing_leaders),
+                },
+            ))
+        if rushing_leaders:
+            tasks_to_generate.append((
+                "season_leaders_tiktok", "tiktok",
+                {
+                    "season": season_label,
+                    "stat_category": "Rushing Yards",
+                    "leaders": _fmt_leaders(rushing_leaders),
+                },
+            ))
+
+        # ------------------------------------------------------------------
+        # 3. Generate and store content items
+        # ------------------------------------------------------------------
+        created_ids: list[tuple[str, Optional[int]]] = []
+
+        for content_type, platform, ctx in tasks_to_generate:
             try:
                 content = await gen.generate(
                     content_type=content_type,
                     platform=platform,
-                    context_data=base_context,
+                    context_data=ctx,
                 )
                 item_id = await asyncio.to_thread(
                     self.db.create_content_item,
@@ -782,7 +926,7 @@ class ContentPipelineCog(commands.Cog, name="ContentPipeline"):
                     "weekly_media",
                     "",
                     int(interaction.user.id),
-                    base_context,
+                    {**ctx, "season_index": season_index},
                 )
                 created_ids.append((content_type, item_id))
 
@@ -794,9 +938,16 @@ class ContentPipelineCog(commands.Cog, name="ContentPipeline"):
                 print(f"[ContentPipeline] Weekly media error for {content_type}: {exc}")
                 created_ids.append((content_type, None))
 
+        # ------------------------------------------------------------------
+        # 4. Summary embed
+        # ------------------------------------------------------------------
+        season_note = f" — {season_label}" if season_index is not None else ""
         embed = discord.Embed(
-            title="📦 Weekly Media Package Generated",
-            description="The following content items have been created and sent to review:",
+            title=f"📦 Weekly Media Package Generated{season_note}",
+            description=(
+                "Season-to-date stat leaders + editorial content items created and sent to review.\n"
+                f"Scope: **combined** (regular season + playoffs){season_note}"
+            ),
             color=0x5865F2,
         )
 
