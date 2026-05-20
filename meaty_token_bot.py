@@ -48,7 +48,7 @@ STAGE_LABELS = {
     3: "Divisional",
     4: "Conference Championship",
     5: "Super Bowl",
-    6: "Offseason",
+    6: "Super Bowl",
 }
 STAGE_PARSE_MAP = {
     "auto": None,
@@ -936,11 +936,40 @@ def find_member_for_team(guild: discord.Guild, team_name: str) -> Optional[disco
     return None
 
 
+def get_current_stage_indexes() -> set[int]:
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT stage_index
+                FROM games
+                WHERE season_index = (SELECT MAX(season_index) FROM games)
+                """
+            )
+            return {int(row["stage_index"]) for row in cur.fetchall() if row.get("stage_index") is not None}
+
+
+def resolve_stage_alias(stage_index: Optional[int]) -> Optional[int]:
+    if stage_index is None:
+        return None
+    try:
+        stages = get_current_stage_indexes()
+    except Exception:
+        return stage_index
+    if stage_index == 5 and 5 not in stages and 6 in stages:
+        return 6
+    if stage_index == 6 and 6 not in stages and 5 in stages:
+        return 5
+    return stage_index
+
+
 def stage_display_name(stage_index: int) -> str:
-    return STAGE_LABELS.get(stage_index, f"Stage {stage_index}")
+    resolved_stage = resolve_stage_alias(stage_index)
+    return STAGE_LABELS.get(int(resolved_stage if resolved_stage is not None else stage_index), f"Stage {stage_index}")
 
 
 def stage_channel_prefix(stage_index: int) -> str:
+    resolved_stage = resolve_stage_alias(stage_index)
     return {
         0: "pre-wk",
         1: "wk",
@@ -948,23 +977,19 @@ def stage_channel_prefix(stage_index: int) -> str:
         3: "div",
         4: "conf",
         5: "sb",
-    }.get(stage_index, f"s{stage_index}-w")
+        6: "sb",
+    }.get(int(resolved_stage if resolved_stage is not None else stage_index), f"s{stage_index}-w")
 
 
 def stage_week_label(stage_index: int, display_week: int) -> str:
-    if stage_index == 1:
+    resolved_stage = int(resolve_stage_alias(stage_index) if resolve_stage_alias(stage_index) is not None else stage_index)
+    if resolved_stage == 1:
         return f"Week {display_week}"
-    if stage_index == 0:
+    if resolved_stage == 0:
         return f"Preseason Week {display_week}"
-    if stage_index == 2:
-        return f"Wild Card Week {display_week}"
-    if stage_index == 3:
-        return f"Divisional Week {display_week}"
-    if stage_index == 4:
-        return f"Conference Championship Week {display_week}"
-    if stage_index == 5:
-        return "Super Bowl"
-    return f"{stage_display_name(stage_index)} Week {display_week}"
+    if resolved_stage in {2, 3, 4, 5, 6}:
+        return stage_display_name(resolved_stage)
+    return f"{stage_display_name(resolved_stage)} Week {display_week}"
 
 
 def parse_phase_to_stage_index(phase: Optional[str]) -> Optional[int]:
@@ -1021,12 +1046,13 @@ def detect_current_stage_and_week() -> tuple[Optional[int], Optional[int]]:
 def resolve_command_stage(phase: Optional[str]) -> int:
     chosen = parse_phase_to_stage_index(phase)
     if chosen is not None:
-        return chosen
+        resolved = resolve_stage_alias(chosen)
+        return int(resolved if resolved is not None else chosen)
     detected_stage, detected_week = detect_current_stage_and_week()
     if detected_stage is None:
         raise RuntimeError("Unable to detect the current phase from imported games.")
     print(f"Auto-detected stage {stage_display_name(detected_stage)} at display week {detected_week}")
-    return detected_stage
+    return int(resolve_stage_alias(detected_stage) if resolve_stage_alias(detected_stage) is not None else detected_stage)
 
 
 def fetch_games_for_stage_week(stage_index: int, display_week: int):
@@ -5839,68 +5865,69 @@ def sportsbook_stage_label(stage_index: int, display_week: int) -> str:
     return stage_week_label(stage_index, display_week)
 
 
-def sportsbook_phase_choices() -> list[tuple[int,int]]:
+def sportsbook_phase_choices() -> list[tuple[int, int]]:
     season_index = get_current_season_index()
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT DISTINCT stage_index, week
+                SELECT stage_index, week, status, away_score, home_score
                 FROM games
                 WHERE season_index = %s
-                ORDER BY stage_index DESC, week DESC
+                ORDER BY stage_index ASC, week ASC, game_id ASC
                 """,
                 (season_index,),
             )
             rows = cur.fetchall()
-    return [(int(r["stage_index"]), int(r["week"]) + 1) for r in rows]
+    progress: dict[tuple[int, int], dict[str, int]] = {}
+    for row in rows:
+        key = (int(row["stage_index"]), int(row["week"]))
+        bucket = progress.setdefault(key, {"total": 0, "completed": 0})
+        bucket["total"] += 1
+        if looks_like_completed_game(row):
+            bucket["completed"] += 1
+    return [(stage_index, raw_week + 1) for stage_index, raw_week in sorted(progress.keys(), key=lambda item: (item[0], item[1]))]
 
 
 def detect_current_sportsbook_stage_and_week() -> tuple[Optional[int], Optional[int]]:
+    phases = sportsbook_phase_choices()
+    if not phases:
+        return None, None
     season_index = get_current_season_index()
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT
-                    g.stage_index,
-                    g.week,
-                    COUNT(*) AS total_games,
-                    COUNT(*) FILTER (
-                        WHERE (COALESCE(g.away_score, 0) > 0 OR COALESCE(g.home_score, 0) > 0)
-                           OR g.status IN (2, 4, 5, 6, 7, 8)
-                    ) AS completed_games
-                FROM games g
-                WHERE g.season_index = %s
-                GROUP BY g.stage_index, g.week
-                ORDER BY g.stage_index DESC, g.week DESC
+                SELECT stage_index, week, status, away_score, home_score
+                FROM games
+                WHERE season_index = %s
+                ORDER BY stage_index ASC, week ASC, game_id ASC
                 """,
                 (season_index,),
             )
-            rows = [dict(r) for r in cur.fetchall()]
-
-    if not rows:
-        return None, None
-
+            rows = cur.fetchall()
+    progress: dict[tuple[int, int], dict[str, int]] = {}
     for row in rows:
-        stage_index = safe_int(row.get("stage_index"))
-        display_week = safe_int(row.get("week")) + 1
-        total_games = safe_int(row.get("total_games"))
-        completed_games = safe_int(row.get("completed_games"))
-        if total_games > 0 and completed_games < total_games:
-            return stage_index, display_week
-
-    latest = rows[0]
-    return safe_int(latest.get("stage_index")), safe_int(latest.get("week")) + 1
+        key = (int(row["stage_index"]), int(row["week"]))
+        bucket = progress.setdefault(key, {"total": 0, "completed": 0})
+        bucket["total"] += 1
+        if looks_like_completed_game(row):
+            bucket["completed"] += 1
+    ordered = sorted(progress.items(), key=lambda item: (item[0][0], item[0][1]))
+    for (stage_index, raw_week), counts in reversed(ordered):
+        if counts["completed"] < counts["total"]:
+            resolved_stage = resolve_stage_alias(stage_index)
+            return int(resolved_stage if resolved_stage is not None else stage_index), raw_week + 1
+    last_stage, last_week = ordered[-1][0]
+    resolved_stage = resolve_stage_alias(last_stage)
+    return int(resolved_stage if resolved_stage is not None else last_stage), last_week + 1
 
 
 def fetch_upcoming_games_for_current_week():
     stage_index, display_week = detect_current_sportsbook_stage_and_week()
     if stage_index is None or display_week is None:
         return []
-    games = fetch_games_for_stage_week(stage_index, display_week)
-    upcoming = [game for game in games if not looks_like_completed_game(game)]
-    return upcoming if upcoming else games
+    return fetch_games_for_stage_week(stage_index, display_week)
 
 
 def _team_strength_for_odds(team_row: dict, is_home: bool) -> float:
