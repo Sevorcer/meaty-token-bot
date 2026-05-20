@@ -48,7 +48,7 @@ STAGE_LABELS = {
     3: "Divisional",
     4: "Conference Championship",
     5: "Super Bowl",
-    6: "Super Bowl",
+    6: "Offseason",
 }
 STAGE_PARSE_MAP = {
     "auto": None,
@@ -936,40 +936,11 @@ def find_member_for_team(guild: discord.Guild, team_name: str) -> Optional[disco
     return None
 
 
-def get_current_stage_indexes() -> set[int]:
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT DISTINCT stage_index
-                FROM games
-                WHERE season_index = (SELECT MAX(season_index) FROM games)
-                """
-            )
-            return {int(row["stage_index"]) for row in cur.fetchall() if row.get("stage_index") is not None}
-
-
-def resolve_stage_alias(stage_index: Optional[int]) -> Optional[int]:
-    if stage_index is None:
-        return None
-    try:
-        stages = get_current_stage_indexes()
-    except Exception:
-        return stage_index
-    if stage_index == 5 and 5 not in stages and 6 in stages:
-        return 6
-    if stage_index == 6 and 6 not in stages and 5 in stages:
-        return 5
-    return stage_index
-
-
 def stage_display_name(stage_index: int) -> str:
-    resolved_stage = resolve_stage_alias(stage_index)
-    return STAGE_LABELS.get(int(resolved_stage if resolved_stage is not None else stage_index), f"Stage {stage_index}")
+    return STAGE_LABELS.get(stage_index, f"Stage {stage_index}")
 
 
 def stage_channel_prefix(stage_index: int) -> str:
-    resolved_stage = resolve_stage_alias(stage_index)
     return {
         0: "pre-wk",
         1: "wk",
@@ -977,19 +948,23 @@ def stage_channel_prefix(stage_index: int) -> str:
         3: "div",
         4: "conf",
         5: "sb",
-        6: "sb",
-    }.get(int(resolved_stage if resolved_stage is not None else stage_index), f"s{stage_index}-w")
+    }.get(stage_index, f"s{stage_index}-w")
 
 
 def stage_week_label(stage_index: int, display_week: int) -> str:
-    resolved_stage = int(resolve_stage_alias(stage_index) if resolve_stage_alias(stage_index) is not None else stage_index)
-    if resolved_stage == 1:
+    if stage_index == 1:
         return f"Week {display_week}"
-    if resolved_stage == 0:
+    if stage_index == 0:
         return f"Preseason Week {display_week}"
-    if resolved_stage in {2, 3, 4, 5, 6}:
-        return stage_display_name(resolved_stage)
-    return f"{stage_display_name(resolved_stage)} Week {display_week}"
+    if stage_index == 2:
+        return f"Wild Card Week {display_week}"
+    if stage_index == 3:
+        return f"Divisional Week {display_week}"
+    if stage_index == 4:
+        return f"Conference Championship Week {display_week}"
+    if stage_index == 5:
+        return "Super Bowl"
+    return f"{stage_display_name(stage_index)} Week {display_week}"
 
 
 def parse_phase_to_stage_index(phase: Optional[str]) -> Optional[int]:
@@ -1046,13 +1021,12 @@ def detect_current_stage_and_week() -> tuple[Optional[int], Optional[int]]:
 def resolve_command_stage(phase: Optional[str]) -> int:
     chosen = parse_phase_to_stage_index(phase)
     if chosen is not None:
-        resolved = resolve_stage_alias(chosen)
-        return int(resolved if resolved is not None else chosen)
+        return chosen
     detected_stage, detected_week = detect_current_stage_and_week()
     if detected_stage is None:
         raise RuntimeError("Unable to detect the current phase from imported games.")
     print(f"Auto-detected stage {stage_display_name(detected_stage)} at display week {detected_week}")
-    return int(resolve_stage_alias(detected_stage) if resolve_stage_alias(detected_stage) is not None else detected_stage)
+    return detected_stage
 
 
 def fetch_games_for_stage_week(stage_index: int, display_week: int):
@@ -2508,6 +2482,71 @@ async def team(interaction: discord.Interaction, team_name: str):
     await interaction.response.send_message(embed=embed, view=view)
 
 
+@bot.tree.command(name="openteams", description="Show teams that do not currently have a matched Discord user.")
+async def openteams(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command must be used inside a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        open_rows = fetch_open_team_rows_for_guild(interaction.guild)
+    except Exception as exc:
+        await interaction.followup.send(f"Failed to load open teams: {exc}", ephemeral=True)
+        return
+
+    if not open_rows:
+        await interaction.followup.send(
+            embed=build_embed(
+                "📋 Open Teams",
+                "No open teams found. Every franchise appears to have a Discord match.",
+                0x57F287,
+            )
+        )
+        return
+
+    lines = []
+    for idx, row in enumerate(open_rows, start=1):
+        wins = safe_int(row.get("wins"))
+        losses = safe_int(row.get("losses"))
+        ties = safe_int(row.get("ties"))
+        record = f"{wins}-{losses}-{ties}" if ties else f"{wins}-{losses}"
+        team_name = safe_text(row.get("team_name"))
+        conference = safe_text(row.get("conference_name"))
+        division = safe_text(row.get("division_name"))
+        ovr = safe_int(row.get("team_ovr"))
+        lines.append(
+            f"**{idx}. {team_name}** — Record: {record} | OVR: {ovr} | {conference} / {division}"
+        )
+
+    chunks = []
+    current = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + 1
+        if current_len + line_len > 3800:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = line_len
+        else:
+            current.append(line)
+            current_len += line_len
+    if current:
+        chunks.append("\n".join(current))
+
+    first_embed = build_embed(
+        f"📋 Open Teams ({len(open_rows)})",
+        chunks[0],
+        0x3498DB,
+    )
+    first_embed.set_footer(text="Teams listed here do not currently have a Discord nickname/user match.")
+    await interaction.followup.send(embed=first_embed)
+    for page_num, chunk in enumerate(chunks[1:], start=2):
+        embed = build_embed(f"📋 Open Teams ({len(open_rows)}) — Page {page_num}", chunk, 0x3498DB)
+        embed.set_footer(text="Teams listed here do not currently have a Discord nickname/user match.")
+        await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="balance", description="Check your token balance.")
 @app_commands.describe(user="Optional: check another user's balance")
 async def balance(interaction: discord.Interaction, user: Optional[discord.Member] = None):
@@ -3608,6 +3647,27 @@ def fetch_all_team_rows() -> list[dict]:
                 """
             )
             return [record_to_dict(row) for row in cur.fetchall()]
+
+
+def fetch_open_team_rows_for_guild(guild: discord.Guild) -> list[dict]:
+    teams = fetch_all_team_rows()
+    open_rows: list[dict] = []
+    for team in teams:
+        team_name = safe_text(team.get("team_name"))
+        matched_member = find_member_for_team(guild, team_name)
+        if matched_member is not None:
+            continue
+        standing_row = fetch_team_standing(safe_int(team.get("team_id"))) or {}
+        open_rows.append({**team, **standing_row})
+    open_rows.sort(
+        key=lambda row: (
+            -safe_int(row.get("wins")),
+            safe_int(row.get("losses")),
+            -safe_int(row.get("team_ovr")),
+            safe_text(row.get("team_name")),
+        )
+    )
+    return open_rows
 
 
 def resolve_team_row(team_name: str):
@@ -5865,69 +5925,31 @@ def sportsbook_stage_label(stage_index: int, display_week: int) -> str:
     return stage_week_label(stage_index, display_week)
 
 
-def sportsbook_phase_choices() -> list[tuple[int, int]]:
+def sportsbook_phase_choices() -> list[tuple[int,int]]:
     season_index = get_current_season_index()
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT stage_index, week, status, away_score, home_score
+                SELECT DISTINCT stage_index, week
                 FROM games
                 WHERE season_index = %s
-                ORDER BY stage_index ASC, week ASC, game_id ASC
+                ORDER BY stage_index DESC, week DESC
                 """,
                 (season_index,),
             )
             rows = cur.fetchall()
-    progress: dict[tuple[int, int], dict[str, int]] = {}
-    for row in rows:
-        key = (int(row["stage_index"]), int(row["week"]))
-        bucket = progress.setdefault(key, {"total": 0, "completed": 0})
-        bucket["total"] += 1
-        if looks_like_completed_game(row):
-            bucket["completed"] += 1
-    return [(stage_index, raw_week + 1) for stage_index, raw_week in sorted(progress.keys(), key=lambda item: (item[0], item[1]))]
+    return [(int(r["stage_index"]), int(r["week"]) + 1) for r in rows]
 
 
 def detect_current_sportsbook_stage_and_week() -> tuple[Optional[int], Optional[int]]:
     phases = sportsbook_phase_choices()
     if not phases:
         return None, None
-    season_index = get_current_season_index()
-    with get_pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT stage_index, week, status, away_score, home_score
-                FROM games
-                WHERE season_index = %s
-                ORDER BY stage_index ASC, week ASC, game_id ASC
-                """,
-                (season_index,),
-            )
-            rows = cur.fetchall()
-    progress: dict[tuple[int, int], dict[str, int]] = {}
-    for row in rows:
-        key = (int(row["stage_index"]), int(row["week"]))
-        bucket = progress.setdefault(key, {"total": 0, "completed": 0})
-        bucket["total"] += 1
-        if looks_like_completed_game(row):
-            bucket["completed"] += 1
-    ordered = sorted(progress.items(), key=lambda item: (item[0][0], item[0][1]))
-    for (stage_index, raw_week), counts in reversed(ordered):
-        if counts["completed"] < counts["total"]:
-            resolved_stage = resolve_stage_alias(stage_index)
-            return int(resolved_stage if resolved_stage is not None else stage_index), raw_week + 1
-    last_stage, last_week = ordered[-1][0]
-    resolved_stage = resolve_stage_alias(last_stage)
-    return int(resolved_stage if resolved_stage is not None else last_stage), last_week + 1
-
-
-def fetch_upcoming_games_for_current_week():
-    stage_index, display_week = detect_current_sportsbook_stage_and_week()
-    if stage_index is None or display_week is None:
-        return []
-    return fetch_games_for_stage_week(stage_index, display_week)
+    for stage_index, display_week in phases:
+        if stage_index == 1:
+            return stage_index, display_week
+    return phases[0]
 
 
 def _team_strength_for_odds(team_row: dict, is_home: bool) -> float:
