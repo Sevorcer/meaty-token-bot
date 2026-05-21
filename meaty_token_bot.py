@@ -5042,16 +5042,25 @@ def format_currency_compact(value) -> str:
 
 
 def fetch_all_team_rows() -> list[dict]:
+    # Only whitelist safe alphanumeric/underscore column names to prevent injection.
+    _safe_col_re = re.compile(r'^[a-z_][a-z0-9_]*$')
+    extra_name_candidates = ["nick_name", "abbr_name", "display_name", "city_name"]
+    teams_cols = get_table_columns("teams")
+    extra_cols = [
+        c for c in extra_name_candidates
+        if c in teams_cols and _safe_col_re.match(c)
+    ]
+    extra_select = (", " + ", ".join(extra_cols)) if extra_cols else ""
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT
                     team_id,
                     team_name,
                     conference_name,
                     division_name,
-                    team_ovr
+                    team_ovr{extra_select}
                 FROM teams
                 ORDER BY team_name ASC
                 """
@@ -5182,17 +5191,30 @@ def resolve_team_row(team_name: str):
 
     for team in teams:
         team_display = safe_text(team.get("team_name"), "")
-        team_norm = normalize_team_name(team_display)
+        # Collect all available name fields for matching
+        name_candidates = [
+            team_display,
+            safe_text(team.get("nick_name"), ""),
+            safe_text(team.get("abbr_name"), ""),
+            safe_text(team.get("display_name"), ""),
+            safe_text(team.get("city_name"), ""),
+        ]
+        team_norms = [normalize_team_name(v) for v in name_candidates if v and v != "Unknown"]
         mascot = normalize_team_name(team_display.split()[-1]) if team_display else ""
 
-        if team_norm == normalized_query:
+        # Exact match against any name field
+        if normalized_query in team_norms:
             best_exact = team
             break
+        # Mascot / last-word match
         if mascot == normalized_query and best_suffix is None:
             best_suffix = team
-        if normalized_query in team_norm or team_norm in normalized_query:
-            if best_contains is None:
-                best_contains = team
+        # Substring match against any name field
+        if best_contains is None:
+            for norm in team_norms:
+                if norm and (normalized_query in norm or norm in normalized_query):
+                    best_contains = team
+                    break
 
     return best_exact or best_suffix or best_contains
 
@@ -5239,10 +5261,29 @@ def fetch_player_search_results(name: str, limit: int = 10) -> list[dict]:
 
 
 def fetch_team_roster_rows(team_id: int) -> list[dict]:
+    # Dynamically check for season/week snapshot columns so we only return
+    # the most recent export and never show stale historical rows.
+    season_col = pick_existing_column("players", ["season_index"])
+    week_col = pick_existing_column("players", ["week_index", "week"])
+
+    where_parts = ["p.team_id = %s"]
+    if season_col and week_col:
+        where_parts.append(
+            f"p.{season_col} = (SELECT MAX({season_col}) FROM players)"
+            f" AND p.{week_col} = (SELECT MAX({week_col}) FROM players"
+            f" WHERE {season_col} = (SELECT MAX({season_col}) FROM players))"
+        )
+    elif season_col:
+        where_parts.append(
+            f"p.{season_col} = (SELECT MAX({season_col}) FROM players)"
+        )
+
+    where_clause = " AND ".join(where_parts)
+
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT
                     p.*,
                     t.team_name,
@@ -5258,10 +5299,11 @@ def fetch_team_roster_rows(team_id: int) -> list[dict]:
                     ) AS resolved_dev_trait_label
                 FROM players p
                 LEFT JOIN teams t ON t.team_id = p.team_id
-                WHERE p.team_id = %s
+                WHERE {where_clause}
                 ORDER BY
                     COALESCE(NULLIF(p.overall_rating, 0), p.player_best_ovr, 0) DESC,
                     p.full_name ASC
+                LIMIT 53  -- NFL active roster limit
                 """,
                 (team_id,),
             )
