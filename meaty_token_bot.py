@@ -1273,6 +1273,8 @@ def find_discord_member_for_username(madden_username: str, members) -> Optional[
     username = safe_text(madden_username, "").strip()
     if not username:
         return None
+    username_folded = username.casefold()
+    username_words = _name_words(username)
 
     def possible_names(member: discord.Member) -> list[str]:
         return [
@@ -1285,28 +1287,28 @@ def find_discord_member_for_username(madden_username: str, members) -> Optional[
         return bool(member_value) and member_value == username
 
     def match_case_insensitive(member_value: str) -> bool:
-        return bool(member_value) and member_value.casefold() == username.casefold()
+        return bool(member_value) and member_value.casefold() == username_folded
 
     def match_contains(member_value: str) -> bool:
         if not member_value:
             return False
         member_folded = member_value.casefold()
-        username_folded = username.casefold()
         return username_folded in member_folded or member_folded in username_folded
 
     def match_word_level(member_value: str) -> bool:
         if not member_value:
             return False
-        username_words = _name_words(username)
         member_words = _name_words(member_value)
         return bool(username_words and member_words and username_words & member_words)
+
+    member_names = [(member, possible_names(member)) for member in members]
 
     for matcher in (match_exact, match_case_insensitive, match_contains, match_word_level):
         for name_index in range(3):
             matches = [
                 member
-                for member in members
-                if matcher(possible_names(member)[name_index])
+                for member, names in member_names
+                if matcher(names[name_index])
             ]
             if len(matches) == 1:
                 return matches[0]
