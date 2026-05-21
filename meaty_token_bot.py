@@ -3098,7 +3098,7 @@ class OpenTeamsPaginationView(discord.ui.View):
 
 @bot.tree.command(name="rosters", description="Show live roster data from Nexus Exporter.")
 @app_commands.describe(team="Optional team name")
-async def roster(interaction: discord.Interaction, team: Optional[str] = None):
+async def rosters(interaction: discord.Interaction, team: Optional[str] = None):
     guild_id = guild_id_from_interaction(interaction)
     prereq_error = exporter_prereq_error(guild_id)
     if prereq_error:
