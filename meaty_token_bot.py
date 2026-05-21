@@ -1233,6 +1233,24 @@ def fetch_standings_rows():
             return cur.fetchall()
 
 
+def fetch_standings_rows_for_guild(guild_id: int) -> list[dict]:
+    """Return standings rows from the local DB (conference_name + division_name included)."""
+    try:
+        rows = fetch_standings_rows()
+        return [record_to_dict(r) if not isinstance(r, dict) else r for r in rows]
+    except Exception:
+        return []
+
+
+def _standings_record_text(row: dict) -> str:
+    wins = safe_int(row.get("wins"))
+    losses = safe_int(row.get("losses"))
+    ties = safe_int(row.get("ties"))
+    if ties:
+        return f"{wins}-{losses}-{ties}"
+    return f"{wins}-{losses}"
+
+
 def slugify_channel_name(value: str) -> str:
     value = value.lower().strip()
     value = re.sub(r"[^a-z0-9]+", "-", value)
@@ -2767,15 +2785,171 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong. Meaty Token Bot is online.", ephemeral=True)
 
 
+# --------------------------------------------------------
+# Upgrade 1: /standings — Conference/Division filter view
+# --------------------------------------------------------
+STANDINGS_PAGE_SIZE = 8
+
+
+def _build_standings_embed(
+    rows: list[dict],
+    filter_label: str,
+    page: int,
+    total_pages: int,
+    guild: Optional[discord.Guild],
+) -> discord.Embed:
+    """Build a standings embed for the given (filtered, sorted) rows slice."""
+    embed = discord.Embed(
+        title=f"🏈 League Standings — {filter_label}",
+        color=0x5865F2,
+    )
+    start = (page - 1) * STANDINGS_PAGE_SIZE
+    page_rows = rows[start:start + STANDINGS_PAGE_SIZE]
+    for idx, row in enumerate(page_rows, start=start + 1):
+        team_name = safe_text(row.get("team_name") or row.get("team") or row.get("name"), "Unknown Team")
+        record = _standings_record_text(row)
+        discord_user_mention = ""
+        if guild is not None:
+            member = find_member_for_team(guild, team_name)
+            if member is not None:
+                discord_user_mention = f" — {member.mention}"
+        division = safe_text(row.get("division_name") or row.get("division"), "")
+        seed = safe_int(row.get("seed") or row.get("playoff_seed"))
+        seed_text = f" | Seed {seed}" if seed else ""
+        div_text = f" | {division}" if division else ""
+        embed.add_field(
+            name=f"{idx}. {team_name}{discord_user_mention}",
+            value=f"**{record}**{div_text}{seed_text}",
+            inline=False,
+        )
+    if not page_rows:
+        embed.description = "No teams match this filter."
+    embed.set_footer(text=f"Page {page}/{total_pages}" if total_pages > 1 else f"{len(rows)} team(s)")
+    return embed
+
+
+class StandingsFilterView(discord.ui.View):
+    FILTER_OPTIONS = [
+        discord.SelectOption(label="NFL (All Teams)", value="NFL", default=True),
+        discord.SelectOption(label="AFC", value="AFC"),
+        discord.SelectOption(label="NFC", value="NFC"),
+        discord.SelectOption(label="AFC East", value="AFC East"),
+        discord.SelectOption(label="AFC North", value="AFC North"),
+        discord.SelectOption(label="AFC South", value="AFC South"),
+        discord.SelectOption(label="AFC West", value="AFC West"),
+        discord.SelectOption(label="NFC East", value="NFC East"),
+        discord.SelectOption(label="NFC North", value="NFC North"),
+        discord.SelectOption(label="NFC South", value="NFC South"),
+        discord.SelectOption(label="NFC West", value="NFC West"),
+    ]
+
+    def __init__(
+        self,
+        all_rows: list[dict],
+        guild: Optional[discord.Guild],
+        requester_id: int,
+        timeout: int = 120,
+    ):
+        super().__init__(timeout=timeout)
+        self.all_rows = all_rows
+        self.guild = guild
+        self.requester_id = requester_id
+        self.current_filter = "NFL"
+        self.page = 1
+        self._filtered: list[dict] = list(all_rows)
+        self._total_pages = max(1, (len(self._filtered) + STANDINGS_PAGE_SIZE - 1) // STANDINGS_PAGE_SIZE)
+        self._update_buttons()
+
+    def _apply_filter(self, filter_value: str) -> list[dict]:
+        if filter_value == "NFL":
+            return list(self.all_rows)
+        # Conference filter (AFC / NFC)
+        if filter_value in ("AFC", "NFC"):
+            return [
+                r for r in self.all_rows
+                if safe_text(r.get("conference_name"), "").upper().startswith(filter_value)
+            ]
+        # Division filter (e.g. "AFC East")
+        parts = filter_value.split(" ", 1)
+        conf = parts[0]
+        div = parts[1] if len(parts) > 1 else ""
+        return [
+            r for r in self.all_rows
+            if safe_text(r.get("conference_name"), "").upper().startswith(conf)
+            and safe_text(r.get("division_name"), "").lower().endswith(div.lower())
+        ]
+
+    def _update_buttons(self) -> None:
+        self.prev_page_btn.disabled = self.page <= 1
+        self.next_page_btn.disabled = self.page >= self._total_pages
+
+    def _current_embed(self) -> discord.Embed:
+        return _build_standings_embed(
+            self._filtered,
+            self.current_filter,
+            self.page,
+            self._total_pages,
+            self.guild,
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who ran `/standings` can use these controls.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.select(placeholder="Filter by Conference/Division", options=FILTER_OPTIONS)
+    async def filter_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.current_filter = select.values[0]
+        self.page = 1
+        # Update default highlight on select options
+        for opt in select.options:
+            opt.default = opt.value == self.current_filter
+        self._filtered = self._apply_filter(self.current_filter)
+        self._total_pages = max(1, (len(self._filtered) + STANDINGS_PAGE_SIZE - 1) // STANDINGS_PAGE_SIZE)
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._current_embed(), view=self)
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=1)
+    async def prev_page_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if self.page > 1:
+            self.page -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._current_embed(), view=self)
+
+    @discord.ui.button(label="▶ Next", style=discord.ButtonStyle.primary, row=1)
+    async def next_page_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if self.page < self._total_pages:
+            self.page += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._current_embed(), view=self)
+
+
 @bot.tree.command(name="standings", description="Show current league standings.")
 async def standings(interaction: discord.Interaction):
     guild_id = guild_id_from_interaction(interaction)
-    prereq_error = exporter_prereq_error(guild_id)
-    if prereq_error:
-        await interaction.response.send_message(prereq_error, ephemeral=True)
-        return
 
     await interaction.response.defer()
+
+    # Try local DB first (has conference_name + division_name)
+    db_rows = await asyncio.to_thread(fetch_standings_rows_for_guild, guild_id)
+    if db_rows:
+        # Sort by wins desc, losses asc
+        rows = sorted(db_rows, key=lambda r: (-safe_int(r.get("wins")), safe_int(r.get("losses"))))
+        guild = interaction.guild
+        total_pages = max(1, (len(rows) + STANDINGS_PAGE_SIZE - 1) // STANDINGS_PAGE_SIZE)
+        embed = _build_standings_embed(rows, "NFL", 1, total_pages, guild)
+        view = StandingsFilterView(rows, guild, interaction.user.id)
+        await interaction.followup.send(embed=embed, view=view)
+        return
+
+    # Fallback: exporter API (no filter dropdown, legacy display)
+    prereq_error = exporter_prereq_error(guild_id)
+    if prereq_error:
+        await interaction.followup.send(prereq_error, ephemeral=True)
+        return
     payload = await fetch_from_exporter_any(guild_id, ["standings", "standing"])
     rows = _extract_exporter_rows(payload, ["standings", "table"])
     if not rows:
@@ -3075,6 +3249,23 @@ async def schedule(interaction: discord.Interaction, week: Optional[int] = None)
         await interaction.followup.send("No schedule data yet. The exporter data may not be synced.", ephemeral=True)
         return
 
+    # Upgrade 2: Load team records from local DB for inline display
+    _records_by_team: dict[str, str] = {}
+    try:
+        standing_rows = await asyncio.to_thread(fetch_standings_rows_for_guild, guild_id)
+        for sr in standing_rows:
+            tname = safe_text(sr.get("team_name") or sr.get("team") or sr.get("name"), "")
+            if tname:
+                _records_by_team[tname.lower()] = _standings_record_text(sr)
+    except Exception:
+        pass
+
+    def _team_with_record(team_name: str) -> str:
+        record = _records_by_team.get(team_name.lower())
+        if record:
+            return f"{team_name} ({record})"
+        return team_name
+
     if selected_week is None:
         known_weeks: list[int] = []
         for row in rows:
@@ -3097,14 +3288,276 @@ async def schedule(interaction: discord.Interaction, week: Optional[int] = None)
     for row in filtered_rows[:25]:
         away_team = safe_text(row.get("away_team_name") or row.get("away_team") or row.get("away"), "Away")
         home_team = safe_text(row.get("home_team_name") or row.get("home_team") or row.get("home"), "Home")
+        away_display = _team_with_record(away_team)
+        home_display = _team_with_record(home_team)
         if _is_completed_exporter_game(row):
             away_score = safe_int(row.get("away_score") or row.get("awayScore"))
             home_score = safe_int(row.get("home_score") or row.get("homeScore"))
-            game_lines.append(f"**{away_team} {away_score} - {home_score} {home_team}**")
+            game_lines.append(f"**{away_display} {away_score} - {home_score} {home_display}**")
         else:
-            game_lines.append(f"**{away_team} @ {home_team}**")
+            game_lines.append(f"**{away_display} @ {home_display}**")
     embed.description = "\n".join(game_lines) if game_lines else "No games available."
     await interaction.followup.send(embed=embed)
+
+
+# --------------------------------------------------------
+# Upgrade 3: /sims — Sim tracker command
+# --------------------------------------------------------
+SIMS_PAGE_SIZE = 10
+SIMS_RESULT_LABELS = {"FW": "Force Win", "FL": "Force Loss", "FS": "Fair Sim"}
+SIMS_RESULT_VALUES = ["FW", "FL", "FS"]
+
+
+def _fetch_sim_seasons(guild_id: int) -> list[int]:
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT season_index FROM bot_sims WHERE guild_id = %s ORDER BY season_index DESC",
+                    (guild_id,),
+                )
+                return [int(r["season_index"]) for r in cur.fetchall()]
+    except Exception:
+        return []
+
+
+def _fetch_sim_summary(guild_id: int, season_index: int) -> list[dict]:
+    """Return per-user sim counts for a given season."""
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        discord_user_id,
+                        COUNT(*) FILTER (WHERE result = 'FW') AS fw,
+                        COUNT(*) FILTER (WHERE result = 'FL') AS fl,
+                        COUNT(*) FILTER (WHERE result = 'FS') AS fs,
+                        COUNT(*) AS total
+                    FROM bot_sims
+                    WHERE guild_id = %s AND season_index = %s
+                    GROUP BY discord_user_id
+                    """,
+                    (guild_id, season_index),
+                )
+                return [dict(r) for r in cur.fetchall()]
+    except Exception:
+        return []
+
+
+def _build_sims_embed(
+    rows: list[dict],
+    sort_key: str,
+    page: int,
+    total_pages: int,
+    season_index: int,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"📋 Sim Tracker — Season {season_index + 1}",
+        color=0xE67E22,
+    )
+    start = (page - 1) * SIMS_PAGE_SIZE
+    page_rows = rows[start:start + SIMS_PAGE_SIZE]
+    lines = []
+    for idx, row in enumerate(page_rows, start=start + 1):
+        uid = row.get("discord_user_id")
+        fw = safe_int(row.get("fw"))
+        fl = safe_int(row.get("fl"))
+        fs = safe_int(row.get("fs"))
+        total = safe_int(row.get("total"))
+        user_label = f"<@{uid}>" if uid else "Unknown"
+        lines.append(f"**{idx}.** {user_label} — FW: **{fw}** | FL: **{fl}** | FS: **{fs}** | Total: **{total}**")
+    embed.description = "\n".join(lines) if lines else "No sims recorded yet."
+    sort_label = {"total": "Total Sims", "fw": "Force Wins", "fl": "Force Losses"}.get(sort_key, sort_key)
+    embed.set_footer(text=f"Sorted by {sort_label} • Page {page}/{total_pages}")
+    return embed
+
+
+class SimsView(discord.ui.View):
+    def __init__(
+        self,
+        guild_id: int,
+        seasons: list[int],
+        requester_id: int,
+        timeout: int = 120,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+        self.seasons = seasons
+        self.requester_id = requester_id
+        self.current_season = seasons[0] if seasons else 0
+        self.sort_key = "total"
+        self.page = 1
+        self._rows: list[dict] = []
+        self._total_pages = 1
+        self._load_rows()
+        self._update_season_select()
+        self._update_buttons()
+
+    def _load_rows(self) -> None:
+        rows = _fetch_sim_summary(self.guild_id, self.current_season)
+        key_map = {"total": "total", "fw": "fw", "fl": "fl"}
+        sort_field = key_map.get(self.sort_key, "total")
+        self._rows = sorted(rows, key=lambda r: -safe_int(r.get(sort_field)))
+        self._total_pages = max(1, (len(self._rows) + SIMS_PAGE_SIZE - 1) // SIMS_PAGE_SIZE)
+
+    def _update_buttons(self) -> None:
+        self.prev_page_btn.disabled = self.page <= 1
+        self.next_page_btn.disabled = self.page >= self._total_pages
+
+    def _update_season_select(self) -> None:
+        if len(self.seasons) <= 1:
+            self.season_select.disabled = True
+        options = [
+            discord.SelectOption(
+                label=f"Season {s + 1}",
+                value=str(s),
+                default=(s == self.current_season),
+            )
+            for s in self.seasons
+        ] or [discord.SelectOption(label="Season 1", value="0", default=True)]
+        self.season_select.options = options[:25]
+
+    def _current_embed(self) -> discord.Embed:
+        return _build_sims_embed(self._rows, self.sort_key, self.page, self._total_pages, self.current_season)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who ran `/sims` can use these controls.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.select(placeholder="Select Season", row=0, options=[
+        discord.SelectOption(label="Season 1", value="0", default=True),
+    ])
+    async def season_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.current_season = int(select.values[0])
+        self.page = 1
+        self._load_rows()
+        self._update_season_select()
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._current_embed(), view=self)
+
+    @discord.ui.button(label="By Total", style=discord.ButtonStyle.secondary, row=1)
+    async def sort_total(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.sort_key = "total"
+        self.page = 1
+        self._load_rows()
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._current_embed(), view=self)
+
+    @discord.ui.button(label="By FW", style=discord.ButtonStyle.secondary, row=1)
+    async def sort_fw(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.sort_key = "fw"
+        self.page = 1
+        self._load_rows()
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._current_embed(), view=self)
+
+    @discord.ui.button(label="By FL", style=discord.ButtonStyle.secondary, row=1)
+    async def sort_fl(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.sort_key = "fl"
+        self.page = 1
+        self._load_rows()
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._current_embed(), view=self)
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=2)
+    async def prev_page_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if self.page > 1:
+            self.page -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._current_embed(), view=self)
+
+    @discord.ui.button(label="▶ Next", style=discord.ButtonStyle.primary, row=2)
+    async def next_page_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if self.page < self._total_pages:
+            self.page += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._current_embed(), view=self)
+
+
+@bot.tree.command(name="sims", description="Show sim tracker — FW/FL/FS counts per user per season.")
+async def sims(interaction: discord.Interaction):
+    guild_id = guild_id_from_interaction(interaction)
+    await interaction.response.defer(ephemeral=False)
+
+    seasons = await asyncio.to_thread(_fetch_sim_seasons, guild_id)
+    if not seasons:
+        # No seasons yet — still show an empty embed for season 0
+        seasons = [0]
+
+    current_season = seasons[0]
+    rows = await asyncio.to_thread(_fetch_sim_summary, guild_id, current_season)
+    if not rows:
+        embed = discord.Embed(
+            title=f"📋 Sim Tracker — Season {current_season + 1}",
+            description="No sims recorded yet.",
+            color=0xE67E22,
+        )
+        await interaction.followup.send(embed=embed)
+        return
+
+    sort_field = "total"
+    sorted_rows = sorted(rows, key=lambda r: -safe_int(r.get(sort_field)))
+    total_pages = max(1, (len(sorted_rows) + SIMS_PAGE_SIZE - 1) // SIMS_PAGE_SIZE)
+    embed = _build_sims_embed(sorted_rows, sort_field, 1, total_pages, current_season)
+    view = SimsView(guild_id, seasons, interaction.user.id)
+    await interaction.followup.send(embed=embed, view=view)
+
+
+@bot.tree.command(name="recordsim", description="Admin: Record a sim result for a user.")
+@admin_only()
+@app_commands.describe(
+    game_id="The game ID this sim is associated with (optional)",
+    user="The Discord user being recorded",
+    result="Sim result: Force Win (FW), Force Loss (FL), or Fair Sim (FS)",
+)
+@app_commands.choices(result=[
+    app_commands.Choice(name="Force Win (FW)", value="FW"),
+    app_commands.Choice(name="Force Loss (FL)", value="FL"),
+    app_commands.Choice(name="Fair Sim (FS)", value="FS"),
+])
+async def recordsim(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    result: str,
+    game_id: Optional[int] = None,
+):
+    guild_id = guild_id_from_interaction(interaction)
+
+    try:
+        season_index = await asyncio.to_thread(get_current_season_index)
+    except Exception:
+        season_index = 0
+
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bot_sims (guild_id, discord_user_id, game_id, result, season_index, week_index, recorded_by)
+                    VALUES (%s, %s, %s, %s, %s, 0, %s)
+                    """,
+                    (guild_id, int(user.id), game_id, result, season_index, int(interaction.user.id)),
+                )
+            conn.commit()
+    except Exception as exc:
+        await interaction.response.send_message(f"❌ Failed to record sim: {exc}", ephemeral=True)
+        return
+
+    label = SIMS_RESULT_LABELS.get(result, result)
+    await interaction.response.send_message(
+        f"✅ Recorded **{label}** for {user.mention} in Season {season_index + 1}.",
+        ephemeral=True,
+    )
+    await send_log_message(
+        f"📋 SIM: {interaction.user.mention} recorded **{label}** for {user.mention} "
+        f"(game_id={game_id}, season={season_index + 1}).",
+        guild_id=guild_id,
+    )
 
 
 @bot.tree.command(name="statleaders", description="Show live stat leaders from Nexus Exporter.")
@@ -5996,6 +6449,7 @@ async def post_weekly_news_article(
     phase="Optional phase override. Leave empty to auto-detect the current phase.",
     category_name="Optional category name to create/use",
     auto_news="Optional override for posting the weekly news article",
+    private="If True, only the two matched users + admins can see each channel (default: False)",
 )
 @app_commands.choices(phase=[
     app_commands.Choice(name="Auto Detect", value="auto"),
@@ -6012,6 +6466,7 @@ async def create_week_channels(
     phase: Optional[str] = None,
     category_name: Optional[str] = None,
     auto_news: Optional[bool] = None,
+    private: Optional[bool] = False,
 ):
     if interaction.guild is None:
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
@@ -6046,6 +6501,17 @@ async def create_week_channels(
     scored_games.sort(key=lambda item: item[1], reverse=True)
     gotw_game_ids = {game["game_id"] for game, _score in scored_games[:2]}
 
+    # Upgrade 5: Pre-fetch standings records for notification messages
+    _game_records: dict[str, str] = {}
+    try:
+        _standing_rows = await asyncio.to_thread(fetch_standings_rows_for_guild, guild.id)
+        for _sr in _standing_rows:
+            _tn = safe_text(_sr.get("team_name") or _sr.get("team") or _sr.get("name"), "")
+            if _tn:
+                _game_records[_tn.lower()] = _standings_record_text(_sr)
+    except Exception:
+        pass
+
     created_channels = []
     skipped_channels = []
     gotw_created = []
@@ -6072,7 +6538,23 @@ async def create_week_channels(
         away_member = find_member_for_team(guild, away_team_name)
         home_member = find_member_for_team(guild, home_team_name)
 
-        channel = await guild.create_text_channel(
+        # Upgrade 4: Build permission overwrites for private channels
+        overwrites = None
+        if private:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(read_messages=False, send_messages=False),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            }
+            # Grant access to matched Discord users
+            for member in (away_member, home_member):
+                if member is not None:
+                    overwrites[member] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+            # Grant access to any role with Administrator permission
+            for role in guild.roles:
+                if role.permissions.administrator:
+                    overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+        channel_kwargs: dict = dict(
             name=channel_name,
             category=existing_category,
             topic=(
@@ -6080,6 +6562,10 @@ async def create_week_channels(
                 f"Stage {stage_display_name(game_stage_index)} ({game_stage_index}) | Status {status}"
             ),
         )
+        if overwrites is not None:
+            channel_kwargs["overwrites"] = overwrites
+
+        channel = await guild.create_text_channel(**channel_kwargs)
 
         mention_parts = []
         if away_member is not None:
@@ -6108,6 +6594,25 @@ async def create_week_channels(
         ])
 
         await channel.send("\n".join(message_lines))
+
+        # Upgrade 5: Post notification message with emoji reactions
+        try:
+            away_record = _game_records.get(away_team_name.lower())
+            home_record = _game_records.get(home_team_name.lower())
+            away_label = f"{away_member.mention} ({away_record})" if away_member and away_record else (away_member.mention if away_member else f"{away_team_name} ({away_record})" if away_record else away_team_name)
+            home_label = f"{home_member.mention} ({home_record})" if home_member and home_record else (home_member.mention if home_member else f"{home_team_name} ({home_record})" if home_record else home_team_name)
+            notification_text = (
+                f"{away_label} at {home_label}\n"
+                "Time to schedule your game! React with ⏰ when scheduled, 🏆 when done, or ⏭️ to request a sim."
+            )
+            notif_msg = await channel.send(notification_text)
+            for emoji in ("⏰", "🏆", "🏠", "✈️", "⏭️"):
+                try:
+                    await notif_msg.add_reaction(emoji)
+                except Exception:
+                    pass
+        except Exception as exc:
+            print(f"[create_week_channels] Notification message failed for {channel_name}: {exc}")
 
         try:
             weekly_rivalries = generate_weekly_rivalries(game_stage_index, game_week) if game_stage_index == 1 else []
@@ -6150,6 +6655,8 @@ async def create_week_channels(
             print(f"Weekly news auto-post failed for {week_label}: {exc}")
 
     summary_lines = [f"Created {len(created_channels)} channel(s) in **{category_title}** for **{week_label}**."]
+    if private:
+        summary_lines.append("🔒 Channels created as **private** (only matched users + admins can see).")
     if created_channels:
         summary_lines.append("Created:\n" + "\n".join(f"• {name}" for name in created_channels[:20]))
     if skipped_channels:
@@ -7125,6 +7632,23 @@ def init_extra_feature_tables():
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_sportsbook_bets_lookup ON bot_sportsbook_bets(season_index, stage_index, week, game_id)")
+            # Upgrade 3: Sim tracker table
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_sims (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    discord_user_id BIGINT NOT NULL,
+                    game_id BIGINT,
+                    result TEXT NOT NULL,
+                    season_index INTEGER NOT NULL DEFAULT 0,
+                    week_index INTEGER NOT NULL DEFAULT 0,
+                    recorded_by BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_sims_guild ON bot_sims(guild_id, season_index)")
         conn.commit()
 
 
