@@ -9858,34 +9858,31 @@ if not BOT_TOKEN:
 
 init_extra_feature_tables()
 
-if _CONTENT_PIPELINE_AVAILABLE:
-    try:
-        _content_db = _ContentDB(DATABASE_URL)
-        _content_db.ensure_tables()
-        _openai_key = os.getenv("OPENAI_API_KEY", "")
-        _openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        _content_generator = _ContentGenerator(_openai_key, _openai_model) if _openai_key else None
-        _event_scanner = _EventScanner(_content_db)
-        _content_scheduler = _ContentScheduler(bot, _content_db, _content_generator, _event_scanner)
-        asyncio.get_event_loop().run_until_complete(
-            bot.add_cog(ContentPipelineCog(bot, _content_db, _content_generator, _event_scanner, _content_scheduler))
-        )
-
-        if os.getenv("AUTO_GENERATE_CONTENT", "false").lower() in {"1", "true", "yes", "on"}:
-            _original_on_ready = getattr(bot, "_content_pipeline_ready_registered", False)
-            if not _original_on_ready:
-                bot._content_pipeline_ready_registered = True
-
-                @bot.listen("on_ready")
-                async def _content_pipeline_on_ready():
-                    asyncio.create_task(_content_scheduler.start())
-
-        print("[ContentPipeline] v1 ready.")
-    except Exception as _cp_exc:
-        print(f"[ContentPipeline] Failed to initialize: {_cp_exc}")
-
-
 async def main():
+    if _CONTENT_PIPELINE_AVAILABLE:
+        try:
+            _content_db = _ContentDB(DATABASE_URL)
+            _content_db.ensure_tables()
+            _openai_key = os.getenv("OPENAI_API_KEY", "")
+            _openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            _content_generator = _ContentGenerator(_openai_key, _openai_model) if _openai_key else None
+            _event_scanner = _EventScanner(_content_db)
+            _content_scheduler = _ContentScheduler(bot, _content_db, _content_generator, _event_scanner)
+            await bot.add_cog(ContentPipelineCog(bot, _content_db, _content_generator, _event_scanner, _content_scheduler))
+
+            if os.getenv("AUTO_GENERATE_CONTENT", "false").lower() in {"1", "true", "yes", "on"}:
+                _original_on_ready = getattr(bot, "_content_pipeline_ready_registered", False)
+                if not _original_on_ready:
+                    bot._content_pipeline_ready_registered = True
+
+                    @bot.listen("on_ready")
+                    async def _content_pipeline_on_ready():
+                        asyncio.create_task(_content_scheduler.start())
+
+            print("[ContentPipeline] v1 ready.")
+        except Exception as _cp_exc:
+            print(f"[ContentPipeline] Failed to initialize: {_cp_exc}")
+
     async with bot:
         await asyncio.gather(
             bot.start(BOT_TOKEN),
@@ -9893,4 +9890,5 @@ async def main():
         )
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
