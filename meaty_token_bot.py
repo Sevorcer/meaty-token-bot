@@ -1395,6 +1395,17 @@ def _resolve_stage_index_from_week_type(week_type: str) -> Optional[int]:
     return WEEK_TYPE_STAGE_INDEX_MAP.get(key)
 
 
+def _validate_duplicate_export_path(request: web.Request) -> None:
+    platform = safe_text(request.match_info.get("platform"), "").strip().lower()
+    platform2 = safe_text(request.match_info.get("platform2"), "").strip().lower()
+    league_id = safe_text(request.match_info.get("league_id"), "").strip()
+    league_id2 = safe_text(request.match_info.get("league_id2"), "").strip()
+    if platform and platform2 and platform != platform2:
+        raise ValueError(f"Platform mismatch in URL path: {platform} != {platform2}")
+    if league_id and league_id2 and league_id != league_id2:
+        raise ValueError(f"League ID mismatch in URL path: {league_id} != {league_id2}")
+
+
 def _refresh_table_rows(table_name: str, rows: list[dict], preferred_columns: Optional[list[str]] = None, use_delete: bool = False) -> int:
     table_columns = get_table_columns(table_name)
     if not table_columns:
@@ -1567,6 +1578,9 @@ async def _ingest_companion_upsert_export(
 async def handle_team_roster_export(request: web.Request) -> web.Response:
     team_id = safe_int(request.match_info.get("team_id"))
     try:
+        _validate_duplicate_export_path(request)
+        if team_id <= 0:
+            raise ValueError(f"Invalid team_id: {request.match_info.get('team_id')}")
         payload = await request.json()
         rows = _extract_companion_rows(payload, ["rosterInfoList", "players", "roster"])
         inserted = await asyncio.to_thread(_replace_team_roster_rows, team_id, rows)
@@ -1577,12 +1591,17 @@ async def handle_team_roster_export(request: web.Request) -> web.Response:
 
 
 async def handle_freeagents_roster_export(request: web.Request) -> web.Response:
-    print("[Export] freeagents roster: ignored")
+    try:
+        _validate_duplicate_export_path(request)
+        print("[Export] freeagents roster: ignored")
+    except Exception as exc:
+        print(f"[Export] freeagents roster ignored with path warning: {exc}")
     return _export_ok_response()
 
 
 async def handle_leagueteams_export(request: web.Request) -> web.Response:
     try:
+        _validate_duplicate_export_path(request)
         payload = await request.json()
         inserted = await _ingest_companion_export(
             "leagueteams",
@@ -1600,6 +1619,7 @@ async def handle_leagueteams_export(request: web.Request) -> web.Response:
 
 async def handle_standings_export(request: web.Request) -> web.Response:
     try:
+        _validate_duplicate_export_path(request)
         payload = await request.json()
         inserted = await _ingest_companion_export(
             "standings",
@@ -1629,6 +1649,7 @@ async def handle_week_stats_export(request: web.Request) -> web.Response:
     def enrich_row(row: dict) -> dict:
         enriched = dict(row or {})
         if week_num > 0:
+            # Madden URL weeks are 1-based; DB week/week_index fields are stored as 0-based.
             if "week" not in enriched:
                 enriched["week"] = week_num - 1
             if "weekIndex" not in enriched and "week_index" not in enriched:
@@ -1638,6 +1659,9 @@ async def handle_week_stats_export(request: web.Request) -> web.Response:
         return enriched
 
     try:
+        _validate_duplicate_export_path(request)
+        if week_num <= 0:
+            raise ValueError(f"Invalid week_num: {request.match_info.get('week_num')}")
         payload = await request.json()
         if stat_type == "team":
             inserted = await _ingest_companion_export(
