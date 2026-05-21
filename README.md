@@ -60,7 +60,7 @@ The command finds all text channels whose names match the pattern used by `/crea
 | `/statleaders` | Show live stat leaders. |
 | `/seasonleaders` | Show current season stat leaders. |
 | `/player name` | Look up a player card. |
-| `/roster team` | Show live roster data. |
+| `/rosters team` | Show live roster data. |
 | `/team name` | Show a team summary. |
 | `/openteams` | Browse all open franchise teams. |
 | `/assignteam` | **Admin** — Assign or unassign a franchise team. |
