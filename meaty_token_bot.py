@@ -118,7 +118,7 @@ DEV_TRAIT_COLORS = {
     3: 0xE74C3C,
 }
 
-ROSTER_PAGE_SIZE = 15
+ROSTER_PAGE_SIZE = 20
 POSITION_SORT_ORDER = {
     "QB": 1,
     "HB": 2,
@@ -1263,6 +1263,10 @@ def normalize_team_name(value: str) -> str:
     value = value.replace("&", "and")
     value = re.sub(r"[^a-z0-9]+", "", value)
     return value
+
+
+def escape_like_pattern(value: str) -> str:
+    return (value or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _name_words(value: str) -> set[str]:
@@ -3107,14 +3111,35 @@ class OpenTeamsPaginationView(discord.ui.View):
 async def rosters(interaction: discord.Interaction, team: str):
     await interaction.response.defer()
 
-    team_row = await asyncio.to_thread(resolve_team_row, team)
-    if not team_row:
+    team_matches = await asyncio.to_thread(fetch_teams_by_name_match, team, 8)
+    if not team_matches:
         all_teams = await asyncio.to_thread(fetch_all_team_rows)
         team_list = ", ".join(
             safe_text(t.get("team_name"), "Unknown") for t in all_teams[:32]
         )
         await interaction.followup.send(
             f"Could not find a team matching **{team}**.\n\nAvailable teams: {team_list}",
+            ephemeral=True,
+        )
+        return
+
+    team_input = (team or "").strip().lower()
+    exact_match = next(
+        (
+            row
+            for row in team_matches
+            if safe_text(row.get("team_name"), "").strip().lower() == team_input
+        ),
+        None,
+    )
+    if exact_match:
+        team_row = exact_match
+    elif len(team_matches) == 1:
+        team_row = team_matches[0]
+    else:
+        options = ", ".join(safe_text(row.get("team_name"), "Unknown") for row in team_matches[:5])
+        await interaction.followup.send(
+            f"Multiple teams match **{team}**. Please be more specific.\n\nClosest matches: {options}",
             ephemeral=True,
         )
         return
@@ -5068,6 +5093,40 @@ def fetch_all_team_rows() -> list[dict]:
             return [record_to_dict(row) for row in cur.fetchall()]
 
 
+def fetch_teams_by_name_match(team_name: str, limit: int = 8) -> list[dict]:
+    query = (team_name or "").strip()
+    if not query:
+        return []
+    escaped_query = escape_like_pattern(query)
+    wildcard = f"%{escaped_query}%"
+    prefix = f"{escaped_query}%"
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    team_id,
+                    team_name,
+                    conference_name,
+                    division_name,
+                    team_ovr
+                FROM teams
+                WHERE team_name ILIKE %s ESCAPE '\\'
+                ORDER BY
+                    CASE
+                        WHEN LOWER(team_name) = LOWER(%s) THEN 0
+                        WHEN team_name ILIKE %s ESCAPE '\\' THEN 1
+                        ELSE 2
+                    END,
+                    ABS(LENGTH(team_name) - LENGTH(%s)),
+                    team_name ASC
+                LIMIT %s
+                """,
+                (wildcard, query, prefix, query, max(1, int(limit))),
+            )
+            return [record_to_dict(row) for row in cur.fetchall()]
+
+
 def fetch_open_team_rows_for_guild(guild: discord.Guild) -> list[dict]:
     teams = fetch_all_team_rows()
     open_rows: list[dict] = []
@@ -5261,29 +5320,24 @@ def fetch_player_search_results(name: str, limit: int = 10) -> list[dict]:
 
 
 def fetch_team_roster_rows(team_id: int) -> list[dict]:
-    # Dynamically check for season/week snapshot columns so we only return
-    # the most recent export and never show stale historical rows.
-    season_col = pick_existing_column("players", ["season_index"])
-    week_col = pick_existing_column("players", ["week_index", "week"])
-
-    where_parts = ["p.team_id = %s"]
-    if season_col and week_col:
-        where_parts.append(
-            f"p.{season_col} = (SELECT MAX({season_col}) FROM players)"
-            f" AND p.{week_col} = (SELECT MAX({week_col}) FROM players"
-            f" WHERE {season_col} = (SELECT MAX({season_col}) FROM players))"
-        )
-    elif season_col:
-        where_parts.append(
-            f"p.{season_col} = (SELECT MAX({season_col}) FROM players)"
-        )
-
-    where_clause = " AND ".join(where_parts)
-
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"""
+                """
+                WITH players_for_team AS (
+                    SELECT
+                        p.*,
+                        COALESCE(NULLIF(TRIM(p.full_name), ''), CONCAT_WS(' ', p.first_name, p.last_name)) AS dedupe_name
+                    FROM players p
+                    WHERE p.team_id = %s
+                ),
+                latest_players AS (
+                    SELECT DISTINCT ON (p.dedupe_name) p.*
+                    FROM players_for_team p
+                    ORDER BY
+                        p.dedupe_name,
+                        COALESCE(p.roster_id, 0) DESC
+                )
                 SELECT
                     p.*,
                     t.team_name,
@@ -5297,9 +5351,8 @@ def fetch_team_roster_rows(team_id: int) -> list[dict]:
                             ELSE 'Unknown'
                         END
                     ) AS resolved_dev_trait_label
-                FROM players p
+                FROM latest_players p
                 LEFT JOIN teams t ON t.team_id = p.team_id
-                WHERE {where_clause}
                 ORDER BY
                     COALESCE(NULLIF(p.overall_rating, 0), p.player_best_ovr, 0) DESC,
                     p.full_name ASC
@@ -5780,7 +5833,7 @@ def build_roster_embed(team_row: dict, roster_rows: list[dict], page: int) -> di
         for idx, row in enumerate(chunk, start=start + 1):
             dev_label = dev_trait_to_label(row.get("dev_trait"), row.get("resolved_dev_trait_label") or row.get("dev_trait_label"))
             lines.append(
-                f"**{idx}.** {safe_text(row.get('full_name'))} — {safe_text(row.get('position'))} | "
+                f"{idx}. {safe_text(row.get('full_name'))} — {safe_text(row.get('position'))} | "
                 f"{resolve_display_overall(row)} OVR | {dev_label}"
             )
         description = "\n".join(lines)
@@ -5806,7 +5859,10 @@ def build_roster_embed(team_row: dict, roster_rows: list[dict], page: int) -> di
         ),
         inline=False,
     )
-    embed.set_footer(text=f"Page {page}/{total_pages} • 12 players per page")
+    footer_parts = [f"Page {page}/{total_pages}"]
+    if record_bits:
+        footer_parts.insert(0, " • ".join(record_bits))
+    embed.set_footer(text=" • ".join(footer_parts))
     return embed
 
 
