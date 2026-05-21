@@ -1269,19 +1269,27 @@ def _name_words(value: str) -> set[str]:
     return {part for part in re.split(r"[^a-z0-9]+", value.casefold()) if part}
 
 
-def find_discord_member_for_username(madden_username: str, members) -> Optional[discord.Member]:
+def find_discord_member_for_username(
+    madden_username: str,
+    members: list[discord.Member],
+) -> Optional[discord.Member]:
     username = safe_text(madden_username, "").strip()
     if not username:
         return None
     username_folded = username.casefold()
     username_words = _name_words(username)
+    name_getters = (
+        lambda member: member.nick or "",
+        lambda member: member.display_name or "",
+        lambda member: member.name or "",
+    )
+    cached_names: dict[int, tuple[str, str, str]] = {}
 
-    def possible_names(member: discord.Member) -> list[str]:
-        return [
-            member.nick or "",
-            member.display_name or "",
-            member.name or "",
-        ]
+    def possible_names(member: discord.Member) -> tuple[str, str, str]:
+        member_key = id(member)
+        if member_key not in cached_names:
+            cached_names[member_key] = tuple(getter(member) for getter in name_getters)
+        return cached_names[member_key]
 
     def match_exact(member_value: str) -> bool:
         return bool(member_value) and member_value == username
@@ -1301,17 +1309,12 @@ def find_discord_member_for_username(madden_username: str, members) -> Optional[
         member_words = _name_words(member_value)
         return bool(username_words and member_words and username_words & member_words)
 
-    member_names = [(member, possible_names(member)) for member in members]
-    if not member_names:
-        return None
-    name_count = len(member_names[0][1])
-
     for matcher in (match_exact, match_case_insensitive, match_contains, match_word_level):
-        for name_index in range(name_count):
+        for name_index, _ in enumerate(name_getters):
             matches = [
                 member
-                for member, names in member_names
-                if matcher(names[name_index])
+                for member in members
+                if matcher(possible_names(member)[name_index])
             ]
             if len(matches) == 1:
                 return matches[0]
