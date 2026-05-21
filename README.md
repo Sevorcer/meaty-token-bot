@@ -117,8 +117,19 @@ Set the following environment variables before running:
 |----------|----------|-------------|
 | `DISCORD_BOT_TOKEN` | ✅ | Discord bot token |
 | `DATABASE_URL` | ✅ | PostgreSQL connection string |
+| `PORT` | | HTTP port for Madden Companion exports (defaults to `8080`) |
 | `GUILD_IDS` | | Comma-separated guild IDs for guild-scoped command sync |
 | `LOG_CHANNEL_ID` | | Channel ID for bot log messages |
 | `OPENAI_API_KEY` | | OpenAI key for AI-assisted content generation |
 
 See the source for the full list of optional environment variables.
+
+### Madden Companion export endpoints
+
+The bot also runs a small in-process HTTP server for Madden Companion App exports:
+
+- `POST /{league_id}/leaguemembers`
+- `POST /{league_id}/standings`
+- `POST /{league_id}/schedules`
+- `POST /{league_id}/teamstats`
+- `POST /{league_id}/teams`

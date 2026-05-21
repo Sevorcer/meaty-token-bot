@@ -11,6 +11,7 @@ from urllib import request as urllib_request
 
 import discord
 import psycopg
+from aiohttp import web
 from psycopg import sql
 from psycopg.rows import dict_row
 from discord import app_commands
@@ -71,6 +72,7 @@ DEFAULT_XP_BLACKLIST_CHANNEL_IDS_TEXT = os.getenv("XP_BLACKLIST_CHANNEL_IDS", ""
 DEFAULT_ADMIN_ROLE_NAMES_TEXT = os.getenv("ADMIN_ROLE_NAMES", "Commissioner,Admin,COMMISH")
 DEFAULT_API_KEY = os.getenv("API_KEY", "")
 NEXUS_EXPORTER_URL = (os.getenv("NEXUS_EXPORTER_URL", "") or "").strip()
+EXPORT_SERVER_PORT = _env_int("PORT", 8080)
 
 STAGE_LABELS = {
     0: "Preseason",
@@ -1205,6 +1207,284 @@ def get_pg_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set.")
     return psycopg.connect(DATABASE_URL, row_factory=dict_row, client_encoding="utf8")
+
+
+PLAYER_EXPORT_COLUMNS = [
+    "roster_id",
+    "team_id",
+    "first_name",
+    "last_name",
+    "full_name",
+    "position",
+    "age",
+    "overall_rating",
+    "jersey_num",
+    "years_pro",
+    "height",
+    "weight",
+    "college",
+    "player_best_ovr",
+    "contract_salary",
+    "contract_years_left",
+    "is_free_agent",
+    "injury_rating",
+    "speed_rating",
+    "acceleration_rating",
+    "agility_rating",
+    "strength_rating",
+    "awareness_rating",
+    "throw_power_rating",
+    "short_accuracy_rating",
+    "medium_accuracy_rating",
+    "deep_accuracy_rating",
+    "throw_on_run_rating",
+    "play_action_rating",
+    "break_sack_rating",
+    "break_tackle_rating",
+    "carrying_rating",
+    "trucking_rating",
+    "change_of_direction_rating",
+    "juke_move_rating",
+    "spin_move_rating",
+    "stiff_arm_rating",
+    "catch_rating",
+    "catch_in_traffic_rating",
+    "spectacular_catch_rating",
+    "release_rating",
+    "jump_rating",
+    "short_route_running_rating",
+    "medium_route_running_rating",
+    "deep_route_running_rating",
+    "man_cover_rating",
+    "zone_cover_rating",
+    "press_rating",
+    "play_recognition_rating",
+    "hit_power_rating",
+    "tackle_rating",
+    "pursuit_rating",
+    "block_shedding_rating",
+    "power_moves_rating",
+    "finesse_moves_rating",
+    "pass_block_rating",
+    "pass_block_power_rating",
+    "pass_block_finesse_rating",
+    "run_block_rating",
+    "run_block_power_rating",
+    "run_block_finesse_rating",
+    "impact_block_rating",
+    "dev_trait",
+    "dev_trait_label",
+    "signature_abilities",
+    "rookie_year",
+]
+
+TEAM_EXPORT_COLUMNS = [
+    "team_id",
+    "team_name",
+    "conference_name",
+    "division_name",
+    "team_ovr",
+]
+
+_export_server_runner: Optional[web.AppRunner] = None
+
+
+def camel_to_snake(value: str) -> str:
+    text = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", value or "")
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
+    text = re.sub(r"[^a-z0-9_]+", "_", text)
+    return re.sub(r"_+", "_", text).strip("_").lower()
+
+
+def _normalize_export_scalar(column_name: str, value):
+    if value == "":
+        return None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    if column_name == "is_free_agent":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return value
+
+
+def _snake_case_export_row(row: dict) -> dict:
+    normalized: dict[str, object] = {}
+    for key, value in (row or {}).items():
+        normalized[camel_to_snake(str(key))] = value
+    return normalized
+
+
+def _extract_companion_rows(payload: dict | list | None, preferred_keys: list[str]) -> list[dict]:
+    rows = _extract_exporter_rows(payload, preferred_keys)
+    if rows:
+        return rows
+    if isinstance(payload, dict):
+        list_values = [value for value in payload.values() if isinstance(value, list)]
+        if len(list_values) == 1:
+            return [item for item in list_values[0] if isinstance(item, dict)]
+    return []
+
+
+def _refresh_table_rows(table_name: str, rows: list[dict], preferred_columns: Optional[list[str]] = None, use_delete: bool = False) -> int:
+    table_columns = get_table_columns(table_name)
+    if not table_columns:
+        raise RuntimeError(f"Table '{table_name}' does not exist.")
+
+    normalized_rows = [_snake_case_export_row(row) for row in rows]
+    if preferred_columns:
+        selected_columns = [column for column in preferred_columns if column in table_columns]
+    else:
+        selected_columns = [column for column in sorted(table_columns) if any(column in row for row in normalized_rows)]
+
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            if use_delete:
+                cur.execute(sql.SQL("DELETE FROM {}").format(sql.Identifier(table_name)))
+            else:
+                cur.execute(sql.SQL("TRUNCATE TABLE {}").format(sql.Identifier(table_name)))
+            if normalized_rows and selected_columns:
+                insert_query = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+                    sql.Identifier(table_name),
+                    sql.SQL(", ").join(sql.Identifier(column) for column in selected_columns),
+                    sql.SQL(", ").join(sql.Placeholder() for _ in selected_columns),
+                )
+                cur.executemany(
+                    insert_query,
+                    [
+                        [_normalize_export_scalar(column, row.get(column)) for column in selected_columns]
+                        for row in normalized_rows
+                    ],
+                )
+        conn.commit()
+    return len(normalized_rows)
+
+
+async def _ingest_companion_export(
+    export_name: str,
+    payload: dict | list | None,
+    *,
+    table_name: str,
+    preferred_keys: list[str],
+    preferred_columns: Optional[list[str]] = None,
+    use_delete: bool = False,
+    item_label: str = "rows",
+) -> int:
+    rows = _extract_companion_rows(payload, preferred_keys)
+    inserted = await asyncio.to_thread(
+        _refresh_table_rows,
+        table_name,
+        rows,
+        preferred_columns,
+        use_delete,
+    )
+    print(f"[Export] Received {export_name}: {inserted} {item_label}")
+    return inserted
+
+
+async def handle_leaguemembers_export(request: web.Request) -> web.Response:
+    payload = await request.json()
+    inserted = await _ingest_companion_export(
+        "leaguemembers",
+        payload,
+        table_name="players",
+        preferred_keys=["rosterInfoList", "players", "roster"],
+        preferred_columns=PLAYER_EXPORT_COLUMNS,
+        use_delete=True,
+        item_label="players",
+    )
+    return web.json_response({"ok": True, "inserted": inserted})
+
+
+async def handle_standings_export(request: web.Request) -> web.Response:
+    payload = await request.json()
+    inserted = await _ingest_companion_export(
+        "standings",
+        payload,
+        table_name="standings",
+        preferred_keys=["standingsInfoList", "teamStandingsInfoList", "standings", "teamStandings", "teams"],
+        item_label="rows",
+    )
+    return web.json_response({"ok": True, "inserted": inserted})
+
+
+async def handle_schedules_export(request: web.Request) -> web.Response:
+    payload = await request.json()
+    inserted = await _ingest_companion_export(
+        "schedules",
+        payload,
+        table_name="games",
+        preferred_keys=["scheduleInfoList", "gameScheduleInfoList", "schedules", "schedule", "games"],
+        item_label="games",
+    )
+    return web.json_response({"ok": True, "inserted": inserted})
+
+
+async def handle_teamstats_export(request: web.Request) -> web.Response:
+    payload = await request.json()
+    inserted = await _ingest_companion_export(
+        "teamstats",
+        payload,
+        table_name="teams",
+        preferred_keys=["teamStats", "teamStatsList", "teamStatsInfoList", "teamInfoList", "teams"],
+        preferred_columns=TEAM_EXPORT_COLUMNS,
+        item_label="teams",
+    )
+    return web.json_response({"ok": True, "inserted": inserted})
+
+
+async def handle_teams_export(request: web.Request) -> web.Response:
+    payload = await request.json()
+    inserted = await _ingest_companion_export(
+        "teams",
+        payload,
+        table_name="teams",
+        preferred_keys=["teamStats", "teamStatsList", "teamStatsInfoList", "teamInfoList", "teams"],
+        preferred_columns=TEAM_EXPORT_COLUMNS,
+        item_label="teams",
+    )
+    return web.json_response({"ok": True, "inserted": inserted})
+
+
+async def handle_export_error(request: web.Request, error: Exception) -> web.Response:
+    print(f"[Export] Failed {request.method} {request.path}: {error}")
+    return web.json_response({"ok": False, "error": str(error)}, status=500)
+
+
+def create_export_app() -> web.Application:
+    app = web.Application(middlewares=[web.normalize_path_middleware(append_slash=False, remove_slash=True), _export_error_middleware])
+    app.router.add_post("/{league_id}/leaguemembers", handle_leaguemembers_export)
+    app.router.add_post("/{league_id}/standings", handle_standings_export)
+    app.router.add_post("/{league_id}/schedules", handle_schedules_export)
+    app.router.add_post("/{league_id}/teamstats", handle_teamstats_export)
+    app.router.add_post("/{league_id}/teams", handle_teams_export)
+    return app
+
+
+async def ensure_export_server_started() -> None:
+    global _export_server_runner
+    if _export_server_runner is not None:
+        return
+    app = create_export_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=EXPORT_SERVER_PORT)
+    await site.start()
+    _export_server_runner = runner
+    print(f"[Export] Listening on 0.0.0.0:{EXPORT_SERVER_PORT}")
+
+
+@web.middleware
+async def _export_error_middleware(request: web.Request, handler) -> web.StreamResponse:
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        return await handle_export_error(request, exc)
 
 
 def fetch_standings_rows():
@@ -2567,6 +2847,10 @@ async def on_ready():
     print(f"DATABASE_URL set: {'yes' if DATABASE_URL else 'no'}")
     print(f"DEFAULT_LEVEL_UP_CHANNEL_ID: {DEFAULT_LEVEL_UP_CHANNEL_ID}")
     bot.add_view(TradeReviewView())
+    try:
+        await ensure_export_server_started()
+    except Exception as exc:
+        print(f"[Export] Failed to start server: {exc}")
     try:
         if GUILD_IDS:
             for guild_id in GUILD_IDS:
