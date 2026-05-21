@@ -2804,7 +2804,7 @@ def _build_standings_embed(
         color=0x5865F2,
     )
     start = (page - 1) * STANDINGS_PAGE_SIZE
-    page_rows = rows[start: start + STANDINGS_PAGE_SIZE]
+    page_rows = rows[start:start + STANDINGS_PAGE_SIZE]
     for idx, row in enumerate(page_rows, start=start + 1):
         team_name = safe_text(row.get("team_name") or row.get("team") or row.get("name"), "Unknown Team")
         record = _standings_record_text(row)
@@ -3357,7 +3357,7 @@ def _build_sims_embed(
         color=0xE67E22,
     )
     start = (page - 1) * SIMS_PAGE_SIZE
-    page_rows = rows[start: start + SIMS_PAGE_SIZE]
+    page_rows = rows[start:start + SIMS_PAGE_SIZE]
     lines = []
     for idx, row in enumerate(page_rows, start=start + 1):
         uid = row.get("discord_user_id")
