@@ -1286,7 +1286,7 @@ def find_discord_member_for_username(
     cached_names: dict[int, tuple[str, str, str]] = {}
 
     def possible_names(member: discord.Member) -> tuple[str, str, str]:
-        member_key = id(member)
+        member_key = member.id
         if member_key not in cached_names:
             cached_names[member_key] = tuple(getter(member) for getter in name_getters)
         return cached_names[member_key]
@@ -1310,7 +1310,7 @@ def find_discord_member_for_username(
         return bool(username_words and member_words and username_words & member_words)
 
     for matcher in (match_exact, match_case_insensitive, match_contains, match_word_level):
-        for name_index, _ in enumerate(name_getters):
+        for name_index in range(len(name_getters)):
             matches = [
                 member
                 for member in members
