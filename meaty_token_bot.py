@@ -1265,41 +1265,57 @@ def normalize_team_name(value: str) -> str:
     return value
 
 
-def member_matches_team(member: discord.Member, team_name: str) -> bool:
-    team_norm = normalize_team_name(team_name)
-    possible_names = [
-        member.display_name or "",
-        member.name or "",
-        getattr(member, "global_name", "") or "",
-    ]
+def _name_words(value: str) -> set[str]:
+    return {part for part in re.split(r"[^a-z0-9]+", value.casefold()) if part}
 
-    for raw_name in possible_names:
-        raw_norm = normalize_team_name(raw_name)
-        if not raw_norm:
-            continue
-        if team_norm == raw_norm:
-            return True
-        if team_norm in raw_norm:
-            return True
 
-    return False
+def find_discord_member_for_username(madden_username: str, members) -> Optional[discord.Member]:
+    username = safe_text(madden_username, "").strip()
+    if not username:
+        return None
+
+    def possible_names(member: discord.Member) -> list[str]:
+        return [
+            member.nick or "",
+            member.display_name or "",
+            member.name or "",
+        ]
+
+    def match_exact(member_value: str) -> bool:
+        return bool(member_value) and member_value == username
+
+    def match_case_insensitive(member_value: str) -> bool:
+        return bool(member_value) and member_value.casefold() == username.casefold()
+
+    def match_contains(member_value: str) -> bool:
+        if not member_value:
+            return False
+        member_folded = member_value.casefold()
+        username_folded = username.casefold()
+        return username_folded in member_folded or member_folded in username_folded
+
+    def match_word_level(member_value: str) -> bool:
+        if not member_value:
+            return False
+        username_words = _name_words(username)
+        member_words = _name_words(member_value)
+        return bool(username_words and member_words and username_words & member_words)
+
+    for matcher in (match_exact, match_case_insensitive, match_contains, match_word_level):
+        for name_index in range(3):
+            matches = [
+                member
+                for member in members
+                if matcher(possible_names(member)[name_index])
+            ]
+            if len(matches) == 1:
+                return matches[0]
+
+    return None
 
 
 def find_member_for_team(guild: discord.Guild, team_name: str) -> Optional[discord.Member]:
-    matches = [member for member in guild.members if member_matches_team(member, team_name)]
-
-    if len(matches) == 1:
-        return matches[0]
-
-    exact_display_matches = [
-        member
-        for member in guild.members
-        if normalize_team_name(member.display_name or "") == normalize_team_name(team_name)
-    ]
-    if len(exact_display_matches) == 1:
-        return exact_display_matches[0]
-
-    return None
+    return find_discord_member_for_username(team_name, guild.members)
 
 
 def get_current_stage_indexes() -> set[int]:
@@ -3078,7 +3094,7 @@ class OpenTeamsPaginationView(discord.ui.View):
         await interaction.response.edit_message(embed=self._current_embed(), view=self)
 
 
-@bot.tree.command(name="roster", description="Show live roster data from Nexus Exporter.")
+@bot.tree.command(name="rosters", description="Show live roster data from Nexus Exporter.")
 @app_commands.describe(team="Optional team name")
 async def roster(interaction: discord.Interaction, team: Optional[str] = None):
     guild_id = guild_id_from_interaction(interaction)
