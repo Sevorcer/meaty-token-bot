@@ -3102,61 +3102,29 @@ class OpenTeamsPaginationView(discord.ui.View):
         await interaction.response.edit_message(embed=self._current_embed(), view=self)
 
 
-@bot.tree.command(name="rosters", description="Show live roster data from Nexus Exporter.")
-@app_commands.describe(team="Optional team name")
-async def rosters(interaction: discord.Interaction, team: Optional[str] = None):
+@bot.tree.command(name="rosters", description="Show roster data for a team.")
+@app_commands.describe(team="Team name, mascot, or abbreviation")
+async def rosters(interaction: discord.Interaction, team: str):
     guild_id = guild_id_from_interaction(interaction)
-    prereq_error = exporter_prereq_error(guild_id)
-    if prereq_error:
-        await interaction.response.send_message(prereq_error, ephemeral=True)
-        return
-
     await interaction.response.defer()
-    params = {"team": team} if team else None
-    payload = await fetch_from_exporter_any(guild_id, ["roster", "rosters"], params=params)
-    rows = _extract_exporter_rows(payload, ["roster", "rosters", "players"])
-    if not rows and isinstance(payload, dict) and isinstance(payload.get("teams"), list):
-        teams = [item for item in payload.get("teams") if isinstance(item, dict)]
-        if not teams:
-            await interaction.followup.send("No roster data yet. The exporter data may not be synced.", ephemeral=True)
-            return
-        embed = discord.Embed(title="📋 Team Roster Summary", color=0x5865F2)
-        for item in teams[:25]:
-            team_name = safe_text(item.get("team_name") or item.get("team") or item.get("name"), "Unknown Team")
-            player_count = safe_int(item.get("player_count") or len(item.get("players") or []))
-            embed.add_field(name=team_name, value=f"Players: {player_count}", inline=True)
-        await interaction.followup.send(embed=embed)
+
+    team_row = resolve_team_row(team)
+    if not team_row:
+        all_teams = fetch_all_team_rows()
+        team_list = ", ".join(safe_text(t.get("team_name"), "Unknown") for t in all_teams[:30])
+        await interaction.followup.send(
+            f"Could not find a team matching **{team}**.\n\nAvailable teams: {team_list}",
+            ephemeral=True,
+        )
         return
 
-    if not rows:
-        await interaction.followup.send("No roster data yet. The exporter data may not be synced.", ephemeral=True)
-        return
-
-    if team:
-        team_label = team
-        embed = discord.Embed(title=f"📋 {team_label} Roster", color=0x5865F2)
-        player_lines = []
-        for idx, row in enumerate(rows[:30], start=1):
-            player_name = safe_text(row.get("full_name") or row.get("player_name") or row.get("name"), "Unknown Player")
-            position = safe_text(row.get("position"), "N/A")
-            overall = safe_int(row.get("overall_rating") or row.get("overall"))
-            player_lines.append(f"**{idx}.** {player_name} — {position} ({overall if overall else 'N/A'} OVR)")
-        embed.description = "\n".join(player_lines)
-        await interaction.followup.send(embed=embed)
-        return
-
-    team_counts: dict[str, int] = {}
-    for row in rows:
-        team_name = safe_text(row.get("team_name") or row.get("team") or row.get("team_abbr"), "Unknown Team")
-        team_counts[team_name] = team_counts.get(team_name, 0) + 1
-    if not team_counts:
-        await interaction.followup.send("No roster data yet. The exporter data may not be synced.", ephemeral=True)
-        return
-
-    embed = discord.Embed(title="📋 Team Roster Summary", color=0x5865F2)
-    for team_name, count in sorted(team_counts.items(), key=lambda item: item[0])[:25]:
-        embed.add_field(name=team_name, value=f"Players: {count}", inline=True)
-    await interaction.followup.send(embed=embed)
+    team_id = safe_int(team_row.get("team_id"))
+    roster_rows = fetch_team_roster_rows(team_id)
+    standing_row = fetch_team_standing(team_id) or {}
+    merged_team = {**team_row, **standing_row}
+    embed = build_roster_embed(merged_team, roster_rows, 1)
+    view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, page=1)
+    await interaction.followup.send(embed=embed, view=view)
 
 
 @bot.tree.command(name="team", description="Show a team summary and its first roster page.")
