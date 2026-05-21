@@ -3103,7 +3103,7 @@ class OpenTeamsPaginationView(discord.ui.View):
 
 
 @bot.tree.command(name="rosters", description="Show roster data for a team.")
-@app_commands.describe(team="Team name or abbreviation")
+@app_commands.describe(team="Team name, mascot, or abbreviation")
 async def rosters(interaction: discord.Interaction, team: str):
     await interaction.response.defer()
 
@@ -3114,7 +3114,7 @@ async def rosters(interaction: discord.Interaction, team: str):
             safe_text(t.get("team_name"), "Unknown") for t in all_teams[:32]
         )
         await interaction.followup.send(
-            f"Could not find a team matching **{team}**.\nAvailable teams: {team_list}",
+            f"Could not find a team matching **{team}**.\n\nAvailable teams: {team_list}",
             ephemeral=True,
         )
         return
@@ -3123,7 +3123,6 @@ async def rosters(interaction: discord.Interaction, team: str):
     roster_rows = await asyncio.to_thread(fetch_team_roster_rows, team_id)
     standing_row = await asyncio.to_thread(fetch_team_standing, team_id) or {}
     merged_team = {**team_row, **standing_row}
-
     embed = build_roster_embed(merged_team, roster_rows, 1)
     view = RosterPaginationView(merged_team, roster_rows, interaction.user.id, page=1)
     await interaction.followup.send(embed=embed, view=view)
