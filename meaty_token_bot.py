@@ -1292,7 +1292,8 @@ _export_server_runner: Optional[web.AppRunner] = None
 def camel_to_snake(value: str) -> str:
     text = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", value or "")
     text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
-    return re.sub(r"[^a-z0-9_]+", "_", text).strip("_").lower()
+    text = re.sub(r"[^a-z0-9_]+", "_", text)
+    return re.sub(r"_+", "_", text).strip("_").lower()
 
 
 def _normalize_export_scalar(column_name: str, value):
@@ -1435,6 +1436,19 @@ async def handle_teamstats_export(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "inserted": inserted})
 
 
+async def handle_teams_export(request: web.Request) -> web.Response:
+    payload = await request.json()
+    inserted = await _ingest_companion_export(
+        "teams",
+        payload,
+        table_name="teams",
+        preferred_keys=["teamStats", "teamStatsList", "teamStatsInfoList", "teamInfoList", "teams"],
+        preferred_columns=TEAM_EXPORT_COLUMNS,
+        item_label="teams",
+    )
+    return web.json_response({"ok": True, "inserted": inserted})
+
+
 async def handle_export_error(request: web.Request, error: Exception) -> web.Response:
     print(f"[Export] Failed {request.method} {request.path}: {error}")
     return web.json_response({"ok": False, "error": str(error)}, status=500)
@@ -1446,7 +1460,7 @@ def create_export_app() -> web.Application:
     app.router.add_post("/{league_id}/standings", handle_standings_export)
     app.router.add_post("/{league_id}/schedules", handle_schedules_export)
     app.router.add_post("/{league_id}/teamstats", handle_teamstats_export)
-    app.router.add_post("/{league_id}/teams", handle_teamstats_export)
+    app.router.add_post("/{league_id}/teams", handle_teams_export)
     return app
 
 
@@ -1464,7 +1478,7 @@ async def ensure_export_server_started() -> None:
 
 
 @web.middleware
-async def _export_error_middleware(request: web.Request, handler):
+async def _export_error_middleware(request: web.Request, handler) -> web.StreamResponse:
     try:
         return await handler(request)
     except web.HTTPException:
