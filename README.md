@@ -128,8 +128,8 @@ See the source for the full list of optional environment variables.
 
 The bot also runs a small in-process HTTP server for Madden Companion App exports:
 
-- `POST /{league_id}/leaguemembers`
-- `POST /{league_id}/standings`
-- `POST /{league_id}/schedules`
-- `POST /{league_id}/teamstats`
-- `POST /{league_id}/teams`
+- `POST /{platform}/{league_id}/{platform2}/{league_id2}/team/{team_id}/roster`
+- `POST /{platform}/{league_id}/{platform2}/{league_id2}/freeagents/roster`
+- `POST /{platform}/{league_id}/{platform2}/{league_id2}/leagueteams`
+- `POST /{platform}/{league_id}/{platform2}/{league_id2}/standings`
+- `POST /{platform}/{league_id}/{platform2}/{league_id2}/week/{week_type}/{week_num}/{stat_type}`
