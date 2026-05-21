@@ -1286,6 +1286,63 @@ TEAM_EXPORT_COLUMNS = [
     "team_ovr",
 ]
 
+WEEK_TYPE_STAGE_INDEX_MAP = {
+    "pre": 0,
+    "preseason": 0,
+    "reg": 1,
+    "regular": 1,
+    "regularseason": 1,
+    "wc": 2,
+    "wildcard": 2,
+    "wild_card": 2,
+    "div": 3,
+    "divisional": 3,
+    "conf": 4,
+    "conference": 4,
+    "conferencechampionship": 4,
+    "sb": 5,
+    "superbowl": 5,
+}
+
+WEEK_STAT_TABLE_MAP = {
+    "passing": "player_passing_stats",
+    "rushing": "player_rushing_stats",
+    "receiving": "player_receiving_stats",
+    "defense": "player_defense_stats",
+    "schedules": "games",
+    "team": "teams",
+}
+
+UPSERT_KEY_CANDIDATES = {
+    "player_passing_stats": [
+        ["roster_id", "season_index", "stage_index", "week", "game_id"],
+        ["roster_id", "season_index", "stage_index", "week", "schedule_id"],
+        ["roster_id", "season_index", "stage_index", "week"],
+    ],
+    "player_rushing_stats": [
+        ["roster_id", "season_index", "stage_index", "week", "game_id"],
+        ["roster_id", "season_index", "stage_index", "week", "schedule_id"],
+        ["roster_id", "season_index", "stage_index", "week"],
+    ],
+    "player_receiving_stats": [
+        ["roster_id", "season_index", "stage_index", "week", "game_id"],
+        ["roster_id", "season_index", "stage_index", "week", "schedule_id"],
+        ["roster_id", "season_index", "stage_index", "week"],
+    ],
+    "player_defense_stats": [
+        ["roster_id", "season_index", "stage_index", "week", "game_id"],
+        ["roster_id", "season_index", "stage_index", "week", "schedule_id"],
+        ["roster_id", "season_index", "stage_index", "week"],
+    ],
+    "games": [
+        ["game_id"],
+        ["schedule_id"],
+    ],
+    "teams": [
+        ["team_id"],
+    ],
+}
+
 _export_server_runner: Optional[web.AppRunner] = None
 
 
@@ -1329,6 +1386,26 @@ def _extract_companion_rows(payload: dict | list | None, preferred_keys: list[st
     return []
 
 
+def _export_ok_response() -> web.Response:
+    return web.json_response({"status": "ok"})
+
+
+def _resolve_stage_index_from_week_type(week_type: str) -> Optional[int]:
+    key = re.sub(r"[^a-z]", "", (week_type or "").strip().lower())
+    return WEEK_TYPE_STAGE_INDEX_MAP.get(key)
+
+
+def _validate_duplicate_export_path(request: web.Request) -> None:
+    platform = safe_text(request.match_info.get("platform"), "").strip().lower()
+    platform2 = safe_text(request.match_info.get("platform2"), "").strip().lower()
+    league_id = safe_text(request.match_info.get("league_id"), "").strip()
+    league_id2 = safe_text(request.match_info.get("league_id2"), "").strip()
+    if platform and platform2 and platform != platform2:
+        raise ValueError(f"Platform mismatch in URL path: {platform} != {platform2}")
+    if league_id and league_id2 and league_id != league_id2:
+        raise ValueError(f"League ID mismatch in URL path: {league_id} != {league_id2}")
+
+
 def _refresh_table_rows(table_name: str, rows: list[dict], preferred_columns: Optional[list[str]] = None, use_delete: bool = False) -> int:
     table_columns = get_table_columns(table_name)
     if not table_columns:
@@ -1363,6 +1440,94 @@ def _refresh_table_rows(table_name: str, rows: list[dict], preferred_columns: Op
     return len(normalized_rows)
 
 
+def _replace_team_roster_rows(team_id: int, rows: list[dict]) -> int:
+    table_columns = get_table_columns("players")
+    if not table_columns:
+        raise RuntimeError("Table 'players' does not exist.")
+    normalized_rows = [_snake_case_export_row(row) for row in rows]
+    for row in normalized_rows:
+        row["team_id"] = team_id
+    selected_columns = [column for column in PLAYER_EXPORT_COLUMNS if column in table_columns]
+
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM players WHERE team_id = %s", (team_id,))
+            if normalized_rows and selected_columns:
+                insert_query = sql.SQL("INSERT INTO players ({}) VALUES ({})").format(
+                    sql.SQL(", ").join(sql.Identifier(column) for column in selected_columns),
+                    sql.SQL(", ").join(sql.Placeholder() for _ in selected_columns),
+                )
+                cur.executemany(
+                    insert_query,
+                    [
+                        [_normalize_export_scalar(column, row.get(column)) for column in selected_columns]
+                        for row in normalized_rows
+                    ],
+                )
+        conn.commit()
+    return len(normalized_rows)
+
+
+def _upsert_table_rows(
+    table_name: str,
+    rows: list[dict],
+    *,
+    preferred_columns: Optional[list[str]] = None,
+    key_candidates: Optional[list[list[str]]] = None,
+) -> int:
+    table_columns = get_table_columns(table_name)
+    if not table_columns:
+        raise RuntimeError(f"Table '{table_name}' does not exist.")
+    normalized_rows = [_snake_case_export_row(row) for row in rows]
+    if preferred_columns:
+        selected_columns = [column for column in preferred_columns if column in table_columns]
+    else:
+        selected_columns = [column for column in sorted(table_columns) if any(column in row for row in normalized_rows)]
+    if not normalized_rows or not selected_columns:
+        return 0
+
+    selected_column_set = set(selected_columns)
+    resolved_keys: list[str] = []
+    for candidate in (key_candidates or []):
+        if all(column in selected_column_set for column in candidate):
+            resolved_keys = candidate
+            break
+
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            if resolved_keys:
+                delete_query = sql.SQL("DELETE FROM {} WHERE {}").format(
+                    sql.Identifier(table_name),
+                    sql.SQL(" AND ").join(
+                        sql.SQL("{} = {}").format(sql.Identifier(column), sql.Placeholder()) for column in resolved_keys
+                    ),
+                )
+                key_values: set[tuple[object, ...]] = set()
+                for row in normalized_rows:
+                    if any(row.get(column) is None for column in resolved_keys):
+                        continue
+                    key_values.add(
+                        tuple(_normalize_export_scalar(column, row.get(column)) for column in resolved_keys)
+                    )
+                if key_values:
+                    cur.executemany(delete_query, list(key_values))
+
+            insert_query = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+                sql.Identifier(table_name),
+                sql.SQL(", ").join(sql.Identifier(column) for column in selected_columns),
+                sql.SQL(", ").join(sql.Placeholder() for _ in selected_columns),
+            )
+            cur.executemany(
+                insert_query,
+                [
+                    [_normalize_export_scalar(column, row.get(column)) for column in selected_columns]
+                    for row in normalized_rows
+                ],
+            )
+        conn.commit()
+    return len(normalized_rows)
+
+
 async def _ingest_companion_export(
     export_name: str,
     payload: dict | list | None,
@@ -1385,82 +1550,166 @@ async def _ingest_companion_export(
     return inserted
 
 
-async def handle_leaguemembers_export(request: web.Request) -> web.Response:
-    payload = await request.json()
-    inserted = await _ingest_companion_export(
-        "leaguemembers",
-        payload,
-        table_name="players",
-        preferred_keys=["rosterInfoList", "players", "roster"],
-        preferred_columns=PLAYER_EXPORT_COLUMNS,
-        use_delete=True,
-        item_label="players",
+async def _ingest_companion_upsert_export(
+    export_name: str,
+    payload: dict | list | None,
+    *,
+    table_name: str,
+    preferred_keys: list[str],
+    preferred_columns: Optional[list[str]] = None,
+    key_candidates: Optional[list[list[str]]] = None,
+    row_enricher=None,
+    item_label: str = "rows",
+) -> int:
+    rows = _extract_companion_rows(payload, preferred_keys)
+    if row_enricher:
+        rows = [row_enricher(dict(row or {})) for row in rows if isinstance(row, dict)]
+    inserted = await asyncio.to_thread(
+        _upsert_table_rows,
+        table_name,
+        rows,
+        preferred_columns=preferred_columns,
+        key_candidates=key_candidates,
     )
-    return web.json_response({"ok": True, "inserted": inserted})
+    print(f"[Export] Received {export_name}: {inserted} {item_label}")
+    return inserted
+
+
+async def handle_team_roster_export(request: web.Request) -> web.Response:
+    team_id = safe_int(request.match_info.get("team_id"))
+    try:
+        _validate_duplicate_export_path(request)
+        if team_id <= 0:
+            raise ValueError(f"Invalid team_id: {request.match_info.get('team_id')}")
+        payload = await request.json()
+        rows = _extract_companion_rows(payload, ["rosterInfoList", "players", "roster"])
+        inserted = await asyncio.to_thread(_replace_team_roster_rows, team_id, rows)
+        print(f"[Export] team {team_id} roster: {inserted} players written")
+    except Exception as exc:
+        print(f"[Export] team {team_id} roster write failed: {exc}")
+    return _export_ok_response()
+
+
+async def handle_freeagents_roster_export(request: web.Request) -> web.Response:
+    try:
+        _validate_duplicate_export_path(request)
+        print("[Export] freeagents roster: ignored")
+    except Exception as exc:
+        print(f"[Export] freeagents roster ignored with path warning: {exc}")
+    return _export_ok_response()
+
+
+async def handle_leagueteams_export(request: web.Request) -> web.Response:
+    try:
+        _validate_duplicate_export_path(request)
+        payload = await request.json()
+        inserted = await _ingest_companion_export(
+            "leagueteams",
+            payload,
+            table_name="teams",
+            preferred_keys=["teamStats", "teamStatsList", "teamStatsInfoList", "teamInfoList", "teams", "leagueTeams"],
+            preferred_columns=TEAM_EXPORT_COLUMNS,
+            item_label="teams",
+        )
+        print(f"[Export] leagueteams: {inserted} teams written")
+    except Exception as exc:
+        print(f"[Export] leagueteams write failed: {exc}")
+    return _export_ok_response()
 
 
 async def handle_standings_export(request: web.Request) -> web.Response:
-    payload = await request.json()
-    inserted = await _ingest_companion_export(
-        "standings",
-        payload,
-        table_name="standings",
-        preferred_keys=["standingsInfoList", "teamStandingsInfoList", "standings", "teamStandings", "teams"],
-        item_label="rows",
-    )
-    return web.json_response({"ok": True, "inserted": inserted})
+    try:
+        _validate_duplicate_export_path(request)
+        payload = await request.json()
+        inserted = await _ingest_companion_export(
+            "standings",
+            payload,
+            table_name="standings",
+            preferred_keys=["standingsInfoList", "teamStandingsInfoList", "standings", "teamStandings", "teams"],
+            item_label="rows",
+        )
+        print(f"[Export] standings: {inserted} rows written")
+    except Exception as exc:
+        print(f"[Export] standings write failed: {exc}")
+    return _export_ok_response()
 
 
-async def handle_schedules_export(request: web.Request) -> web.Response:
-    payload = await request.json()
-    inserted = await _ingest_companion_export(
-        "schedules",
-        payload,
-        table_name="games",
-        preferred_keys=["scheduleInfoList", "gameScheduleInfoList", "schedules", "schedule", "games"],
-        item_label="games",
-    )
-    return web.json_response({"ok": True, "inserted": inserted})
+async def handle_week_stats_export(request: web.Request) -> web.Response:
+    week_type = safe_text(request.match_info.get("week_type"), "")
+    week_num = safe_int(request.match_info.get("week_num"))
+    stat_type = safe_text(request.match_info.get("stat_type"), "").strip().lower()
 
+    table_name = WEEK_STAT_TABLE_MAP.get(stat_type)
+    if not table_name:
+        print(f"[Export] week/{week_type}/{week_num}/{stat_type}: unsupported stat type")
+        return _export_ok_response()
 
-async def handle_teamstats_export(request: web.Request) -> web.Response:
-    payload = await request.json()
-    inserted = await _ingest_companion_export(
-        "teamstats",
-        payload,
-        table_name="teams",
-        preferred_keys=["teamStats", "teamStatsList", "teamStatsInfoList", "teamInfoList", "teams"],
-        preferred_columns=TEAM_EXPORT_COLUMNS,
-        item_label="teams",
-    )
-    return web.json_response({"ok": True, "inserted": inserted})
+    stage_index = _resolve_stage_index_from_week_type(week_type)
 
+    def enrich_row(row: dict) -> dict:
+        enriched = dict(row or {})
+        if week_num > 0:
+            # Madden URL weeks are 1-based; DB week/week_index fields are stored as 0-based.
+            if "week" not in enriched:
+                enriched["week"] = week_num - 1
+            if "weekIndex" not in enriched and "week_index" not in enriched:
+                enriched["weekIndex"] = week_num - 1
+        if stage_index is not None and "stageIndex" not in enriched and "stage_index" not in enriched:
+            enriched["stageIndex"] = stage_index
+        return enriched
 
-async def handle_teams_export(request: web.Request) -> web.Response:
-    payload = await request.json()
-    inserted = await _ingest_companion_export(
-        "teams",
-        payload,
-        table_name="teams",
-        preferred_keys=["teamStats", "teamStatsList", "teamStatsInfoList", "teamInfoList", "teams"],
-        preferred_columns=TEAM_EXPORT_COLUMNS,
-        item_label="teams",
-    )
-    return web.json_response({"ok": True, "inserted": inserted})
+    try:
+        _validate_duplicate_export_path(request)
+        if week_num <= 0:
+            raise ValueError(f"Invalid week_num: {request.match_info.get('week_num')}")
+        payload = await request.json()
+        if stat_type == "team":
+            inserted = await _ingest_companion_export(
+                "week_team",
+                payload,
+                table_name="teams",
+                preferred_keys=["teamStats", "teamStatsList", "teamStatsInfoList", "teamInfoList", "teams"],
+                preferred_columns=TEAM_EXPORT_COLUMNS,
+                item_label="teams",
+            )
+            print(f"[Export] week/{week_type}/{week_num}/team: {inserted} teams written")
+            return _export_ok_response()
+
+        inserted = await _ingest_companion_upsert_export(
+            f"week_{stat_type}",
+            payload,
+            table_name=table_name,
+            preferred_keys=[
+                f"{stat_type}Stats",
+                f"{stat_type}StatsInfoList",
+                f"player{stat_type.capitalize()}Stats",
+                "stats",
+                "items",
+                "games",
+                "schedules",
+            ],
+            key_candidates=UPSERT_KEY_CANDIDATES.get(table_name),
+            row_enricher=enrich_row,
+            item_label="rows",
+        )
+        print(f"[Export] week/{week_type}/{week_num}/{stat_type}: {inserted} rows written")
+    except Exception as exc:
+        print(f"[Export] week/{week_type}/{week_num}/{stat_type} write failed: {exc}")
+    return _export_ok_response()
 
 
 async def handle_export_error(request: web.Request, error: Exception) -> web.Response:
     print(f"[Export] Failed {request.method} {request.path}: {error}")
-    return web.json_response({"ok": False, "error": str(error)}, status=500)
+    return _export_ok_response()
 
 
 def create_export_app() -> web.Application:
     app = web.Application(middlewares=[web.normalize_path_middleware(append_slash=False, remove_slash=True), _export_error_middleware])
-    app.router.add_post("/{league_id}/leaguemembers", handle_leaguemembers_export)
-    app.router.add_post("/{league_id}/standings", handle_standings_export)
-    app.router.add_post("/{league_id}/schedules", handle_schedules_export)
-    app.router.add_post("/{league_id}/teamstats", handle_teamstats_export)
-    app.router.add_post("/{league_id}/teams", handle_teams_export)
+    app.router.add_post("/{platform}/{league_id}/{platform2}/{league_id2}/team/{team_id}/roster", handle_team_roster_export)
+    app.router.add_post("/{platform}/{league_id}/{platform2}/{league_id2}/freeagents/roster", handle_freeagents_roster_export)
+    app.router.add_post("/{platform}/{league_id}/{platform2}/{league_id2}/leagueteams", handle_leagueteams_export)
+    app.router.add_post("/{platform}/{league_id}/{platform2}/{league_id2}/standings", handle_standings_export)
+    app.router.add_post("/{platform}/{league_id}/{platform2}/{league_id2}/week/{week_type}/{week_num}/{stat_type}", handle_week_stats_export)
     return app
 
 
