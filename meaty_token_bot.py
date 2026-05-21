@@ -1265,6 +1265,10 @@ def normalize_team_name(value: str) -> str:
     return value
 
 
+def escape_like_pattern(value: str) -> str:
+    return (value or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _name_words(value: str) -> set[str]:
     return {part for part in re.split(r"[^a-z0-9]+", value.casefold()) if part}
 
@@ -5093,8 +5097,9 @@ def fetch_teams_by_name_match(team_name: str, limit: int = 8) -> list[dict]:
     query = (team_name or "").strip()
     if not query:
         return []
-    wildcard = f"%{query}%"
-    prefix = f"{query}%"
+    escaped_query = escape_like_pattern(query)
+    wildcard = f"%{escaped_query}%"
+    prefix = f"{escaped_query}%"
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -5106,11 +5111,11 @@ def fetch_teams_by_name_match(team_name: str, limit: int = 8) -> list[dict]:
                     division_name,
                     team_ovr
                 FROM teams
-                WHERE team_name ILIKE %s
+                WHERE team_name ILIKE %s ESCAPE '\\'
                 ORDER BY
                     CASE
                         WHEN LOWER(team_name) = LOWER(%s) THEN 0
-                        WHEN team_name ILIKE %s THEN 1
+                        WHEN team_name ILIKE %s ESCAPE '\\' THEN 1
                         ELSE 2
                     END,
                     ABS(LENGTH(team_name) - LENGTH(%s)),
@@ -5319,14 +5324,18 @@ def fetch_team_roster_rows(team_id: int) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                WITH latest_players AS (
-                    SELECT DISTINCT ON (
-                        COALESCE(NULLIF(TRIM(p.full_name), ''), CONCAT_WS(' ', p.first_name, p.last_name))
-                    ) p.*
+                WITH players_for_team AS (
+                    SELECT
+                        p.*,
+                        COALESCE(NULLIF(TRIM(p.full_name), ''), CONCAT_WS(' ', p.first_name, p.last_name)) AS dedupe_name
                     FROM players p
                     WHERE p.team_id = %s
+                ),
+                latest_players AS (
+                    SELECT DISTINCT ON (p.dedupe_name) p.*
+                    FROM players_for_team p
                     ORDER BY
-                        COALESCE(NULLIF(TRIM(p.full_name), ''), CONCAT_WS(' ', p.first_name, p.last_name)),
+                        p.dedupe_name,
                         COALESCE(p.roster_id, 0) DESC
                 )
                 SELECT
