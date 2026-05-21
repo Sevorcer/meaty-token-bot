@@ -1302,9 +1302,12 @@ def find_discord_member_for_username(madden_username: str, members) -> Optional[
         return bool(username_words and member_words and username_words & member_words)
 
     member_names = [(member, possible_names(member)) for member in members]
+    if not member_names:
+        return None
+    name_count = len(member_names[0][1])
 
     for matcher in (match_exact, match_case_insensitive, match_contains, match_word_level):
-        for name_index in range(3):
+        for name_index in range(name_count):
             matches = [
                 member
                 for member, names in member_names
