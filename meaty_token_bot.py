@@ -16,6 +16,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from discord import app_commands
 from discord.ext import commands
+from madden_export_server import run_web_server
 
 # Content Pipeline v1
 try:
@@ -1703,8 +1704,14 @@ async def handle_export_error(request: web.Request, error: Exception) -> web.Res
     return _export_ok_response()
 
 
+async def handle_health_check(request: web.Request) -> web.Response:
+    return _export_ok_response()
+
+
 def create_export_app() -> web.Application:
     app = web.Application(middlewares=[web.normalize_path_middleware(append_slash=False, remove_slash=True), _export_error_middleware])
+    # Health check – the Madden Companion App sends GET /{platform}/{league_id}/
+    app.router.add_get("/{platform}/{league_id}", handle_health_check)
     app.router.add_post("/{platform}/{league_id}/{platform2}/{league_id2}/team/{team_id}/roster", handle_team_roster_export)
     app.router.add_post("/{platform}/{league_id}/{platform2}/{league_id2}/freeagents/roster", handle_freeagents_roster_export)
     app.router.add_post("/{platform}/{league_id}/{platform2}/{league_id2}/leagueteams", handle_leagueteams_export)
@@ -3096,10 +3103,6 @@ async def on_ready():
     print(f"DATABASE_URL set: {'yes' if DATABASE_URL else 'no'}")
     print(f"DEFAULT_LEVEL_UP_CHANNEL_ID: {DEFAULT_LEVEL_UP_CHANNEL_ID}")
     bot.add_view(TradeReviewView())
-    try:
-        await ensure_export_server_started()
-    except Exception as exc:
-        print(f"[Export] Failed to start server: {exc}")
     try:
         if GUILD_IDS:
             for guild_id in GUILD_IDS:
@@ -9881,4 +9884,13 @@ if _CONTENT_PIPELINE_AVAILABLE:
     except Exception as _cp_exc:
         print(f"[ContentPipeline] Failed to initialize: {_cp_exc}")
 
-bot.run(BOT_TOKEN)
+
+async def main():
+    async with bot:
+        await asyncio.gather(
+            bot.start(BOT_TOKEN),
+            run_web_server(),
+        )
+
+
+asyncio.run(main())
