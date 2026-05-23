@@ -6349,9 +6349,36 @@ def build_player_embed(row: dict) -> discord.Embed:
         )[:1024],
         inline=False,
     )
-    abilities = safe_text(row.get("signature_abilities"), "")
+    abilities = row.get("signature_abilities")
     if abilities:
-        embed.add_field(name="Abilities", value=abilities[:1024], inline=False)
+        if isinstance(abilities, str):
+            try:
+                abilities = json.loads(abilities)
+            except Exception:
+                abilities = []
+
+        rank_emojis = {
+            "ABILITY_BRONZE": "🥉",
+            "ABILITY_SILVER": "🥈",
+            "ABILITY_GOLD": "🥇",
+            "ABILITY_XFACTOR": "⚡",
+        }
+
+        lines = []
+        for slot in abilities if isinstance(abilities, list) else []:
+            if not isinstance(slot, dict) or slot.get("isEmpty"):
+                continue
+            sig = slot.get("signatureAbility", {})
+            if not isinstance(sig, dict):
+                sig = {}
+            title = safe_text(sig.get("signatureTitle"), "Unknown")
+            rank = safe_text(sig.get("rank"), "")
+            emoji = rank_emojis.get(rank, "•")
+            locked = " 🔒" if slot.get("locked") else ""
+            lines.append(f"{emoji} {title}{locked}")
+
+        abilities_str = "\n".join(lines) if lines else "None"
+        embed.add_field(name="Abilities", value=abilities_str[:1024], inline=False)
     return embed
 
 
