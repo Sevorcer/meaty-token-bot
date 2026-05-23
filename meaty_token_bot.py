@@ -6310,9 +6310,10 @@ def build_player_embed(row: dict) -> discord.Embed:
     if jersey:
         title += f" #{jersey}"
 
+    description = f"**{position}** • **{team_name}** • **{display_ovr} OVR** • **{dev_label}**"
     embed = build_embed(
-        title,
-        f"**{position}** • **{team_name}** • **{display_ovr} OVR** • **{dev_label}**",
+        title[:256],
+        description[:4096],
         0x5865F2,
     )
     embed.add_field(
@@ -6322,12 +6323,12 @@ def build_player_embed(row: dict) -> discord.Embed:
             f"Years Pro: {safe_int(row.get('years_pro'))}\n"
             f"Height / Weight: {format_height_inches(row.get('height'))} / {safe_int(row.get('weight'))} lbs\n"
             f"College: {safe_text(row.get('college'))}"
-        ),
+        )[:1024],
         inline=True,
     )
     embed.add_field(
         name="Key Ratings",
-        value=format_key_ratings(row, position, max_items=8),
+        value=format_key_ratings(row, position, max_items=8)[:1024],
         inline=True,
     )
     embed.add_field(
@@ -6336,7 +6337,7 @@ def build_player_embed(row: dict) -> discord.Embed:
             f"Score: {value_score}\n"
             f"Tier: {value_tier}\n"
             f"Best OVR: {safe_int(row.get('player_best_ovr'))}"
-        ),
+        )[:1024],
         inline=True,
     )
     embed.add_field(
@@ -6345,12 +6346,12 @@ def build_player_embed(row: dict) -> discord.Embed:
             f"Years Left: {safe_int(row.get('contract_years_left'))}\n"
             f"Salary: {format_currency_compact(row.get('contract_salary'))}\n"
             f"Rookie Year: {safe_int(row.get('rookie_year'))}"
-        ),
+        )[:1024],
         inline=False,
     )
     abilities = safe_text(row.get("signature_abilities"), "")
     if abilities:
-        embed.add_field(name="Abilities", value=abilities, inline=False)
+        embed.add_field(name="Abilities", value=abilities[:1024], inline=False)
     return embed
 
 
